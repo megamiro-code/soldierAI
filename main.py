@@ -1771,73 +1771,46 @@ try{
  const redStart=new THREE.Mesh(new THREE.PlaneGeometry(2,fieldSize),new THREE.MeshBasicMaterial({color:0xd94b4b,transparent:true,opacity:.16,side:THREE.DoubleSide})); redStart.rotation.x=-Math.PI/2; redStart.position.set(-half+1.0,.015,0); scene.add(redStart);
  const blueStart=new THREE.Mesh(new THREE.PlaneGeometry(2,fieldSize),new THREE.MeshBasicMaterial({color:0x4b7bd9,transparent:true,opacity:.16,side:THREE.DoubleSide})); blueStart.rotation.x=-Math.PI/2; blueStart.position.set(half-1.0,.016,0); scene.add(blueStart);
  const wallGeo=new THREE.BoxGeometry(1,.7,1), wallMat=new THREE.MeshStandardMaterial({color:0x777777}); for(const p of DATA.walls){const w=new THREE.Mesh(wallGeo,wallMat);w.position.set(p[0],.35,p[1]);scene.add(w);}
- const soldierGeo=new THREE.BoxGeometry(.22,.36,.22), redMat=new THREE.MeshStandardMaterial({color:0xd94b4b}), blueMat=new THREE.MeshStandardMaterial({color:0x4b7bd9});
- const redSoldiers=[],blueSoldiers=[]; for(let i=0;i<100;i++){const r=new THREE.Mesh(soldierGeo,redMat),b=new THREE.Mesh(soldierGeo,blueMat);scene.add(r,b);redSoldiers.push(r);blueSoldiers.push(b);}
- const cmdGeo=new THREE.BoxGeometry(.44,.8,.44), redCommander=new THREE.Mesh(cmdGeo,redMat), blueCommander=new THREE.Mesh(cmdGeo,blueMat); scene.add(redCommander,blueCommander);
- const crownGeo=new THREE.ConeGeometry(.22,.22,5), crownMat=new THREE.MeshStandardMaterial({color:0xffd83d}), redCrown=new THREE.Mesh(crownGeo,crownMat), blueCrown=new THREE.Mesh(crownGeo,crownMat); scene.add(redCrown,blueCrown);
- const attackGroup=new THREE.Group(); scene.add(attackGroup); const flashGeo=new THREE.SphereGeometry(.11,8,8), flashMat=new THREE.MeshBasicMaterial({color:0xffe66b,transparent:true,opacity:.95});
- const cooldownGeo=new THREE.TorusGeometry(.20,.035,8,20), cooldownMat=new THREE.MeshBasicMaterial({color:0xffff55,transparent:true,opacity:.9});
- function clearAttacks(){while(attackGroup.children.length){const o=attackGroup.children.pop();if(o.geometry)o.geometry.dispose();}}
- function nearestEnemy(idx,team,X,Z,A){const start=team===0?102:0,end=team===0?202:102;let best=-1,bestD2=.42*.42,ax=X[idx],az=Z[idx];for(let j=start;j<end;j++){if(!A[j])continue;const dx=X[j]-ax,dz=Z[j]-az,d2=dx*dx+dz*dz;if(d2<=bestD2){bestD2=d2;best=j;}}return best;}
- function addAttackEffects(i,alpha){
-  clearAttacks();
-  if(i>=DATA.steps)return{red:0,blue:0};
-  const X0=DATA.x[i], Z0=DATA.z[i], A=DATA.alive[i];
-  const X1=i<DATA.steps?DATA.x[i+1]:X0, Z1=i<DATA.steps?DATA.z[i+1]:Z0;
-  const px=k=>X0[k]+(X1[k]-X0[k])*alpha;
-  const pz=k=>Z0[k]+(Z1[k]-Z0[k])*alpha;
-  const cooldownSteps=Math.max(1,Math.ceil(DATA.attackCooldown/DATA.dt));
-  let rc=0,bc=0;
-  const teams=[{team:0,actions:DATA.redActions[i]},{team:1,actions:DATA.blueActions[i]}];
-  for(const e of teams){
-    if(!e.actions)continue;
-    const history=DATA[e.team===0?'redActions':'blueActions'];
-    for(let k=0;k<100;k++){
-      const idx=e.team===0?2+k:102+k;
-      if(!A[idx])continue;
-      const attackNow=e.actions[3*k+2]>.5;
-      if(attackNow){
-        const target=nearestEnemy(idx,e.team,X0,Z0,A);
-        const s=new THREE.Vector3(px(idx),.48,pz(idx));
-        const t=target>=0?new THREE.Vector3(px(target),.55,pz(target)):new THREE.Vector3(px(idx)+(e.team===0?.35:-.35),.48,pz(idx));
-        const g=new THREE.BufferGeometry().setFromPoints([s,t]);
-        const m=new THREE.LineBasicMaterial({color:0xffd83d,transparent:true,opacity:.45+.5*alpha});
-        attackGroup.add(new THREE.Line(g,m));
-        const f=new THREE.Mesh(flashGeo,flashMat);f.position.copy(s);attackGroup.add(f);
-        if(e.team===0)rc++;else bc++;
-      }
-      let cooldown=false;
-      for(let d=1;d<=cooldownSteps;d++){
-        const j=i-d;
-        if(j>=0 && history[j] && history[j][3*k+2]>.5){cooldown=true;break;}
-      }
-      if(cooldown){
-        const ring=new THREE.Mesh(cooldownGeo,cooldownMat);
-        ring.rotation.x=Math.PI/2;
-        ring.position.set(px(idx),.025,pz(idx));
-        attackGroup.add(ring);
-      }
-    }
-  }
-  return{red:rc,blue:bc};
-}
+ const soldierBodyGeo=new THREE.BoxGeometry(.22,.36,.22);
+ const soldierHeadGeo=new THREE.SphereGeometry(.105,12,12);
+ const redBodyMat=new THREE.MeshStandardMaterial({color:0xd94b4b});
+ const blueBodyMat=new THREE.MeshStandardMaterial({color:0x4b7bd9});
+ const redFaceMat=new THREE.MeshStandardMaterial({color:0xd94b4b,emissive:0x000000});
+ const blueFaceMat=new THREE.MeshStandardMaterial({color:0x4b7bd9,emissive:0x000000});
+ const attackFaceMat=new THREE.MeshStandardMaterial({color:0xffe13b,emissive:0x4a3a00,emissiveIntensity:.35});
+ const redEyeMat=new THREE.LineBasicMaterial({color:0xd94b4b});
+ const blueEyeMat=new THREE.LineBasicMaterial({color:0x4b7bd9});
+ const attackEyeMat=new THREE.LineBasicMaterial({color:0xffe13b});
+ const redSoldiers=[],blueSoldiers=[];
+ function makeSoldier(team){
+   const g=new THREE.Group();
+   const body=new THREE.Mesh(soldierBodyGeo,team===0?redBodyMat:blueBodyMat); body.position.y=.18;
+   const face=new THREE.Mesh(soldierHeadGeo,team===0?redFaceMat:blueFaceMat); face.position.set(0,.43,0);
+   const lineGeo=new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,.43,.06),new THREE.Vector3(0,.43,.34)]);
+   const eyeLine=new THREE.Line(lineGeo,team===0?redEyeMat:blueEyeMat);
+   g.add(body,face,eyeLine); scene.add(g);
+   return {team,group:g,body,face,eyeLine,baseFace:team===0?redFaceMat:blueFaceMat,baseEye:team===0?redEyeMat:blueEyeMat};
+ }
+ for(let i=0;i<100;i++) redSoldiers.push(makeSoldier(0));
+ for(let i=0;i<100;i++) blueSoldiers.push(makeSoldier(1));
+ const cmdGeo=new THREE.BoxGeometry(.44,.8,.44), redCommander=new THREE.Mesh(cmdGeo,redBodyMat), blueCommander=new THREE.Mesh(cmdGeo,blueBodyMat); scene.add(redCommander,blueCommander);
+ const crownGeo=new THREE.ConeGeometry(.22,.22,5), crownMat=new THREE.MeshStandardMaterial({color:0xffd83d}), redCrown=new THREE.Mesh(crownGeo,crownMat), blueCrown=new THREE.Mesh(crownGeo,crownMat);
+ redCommander.add(redCrown); blueCommander.add(blueCrown); redCrown.position.set(0,.51,0); blueCrown.position.set(0,.51,0);
+ function setSoldierVisual(s,attackNow){s.face.material=attackNow?attackFaceMat:s.baseFace;s.eyeLine.material=attackNow?attackEyeMat:s.baseEye;}
  function frameInfo(){const t=Math.max(0,Math.min(DATA.steps*DATA.dt,replayTime)),raw=t/DATA.dt,i=Math.min(Math.floor(raw),DATA.steps),a=i>=DATA.steps?0:raw-i;return{t,i,a};}
  function updateReplay(){const f=frameInfo(),i=f.i,a=f.a;timeline.value=String(i);const X0=DATA.x[i],Z0=DATA.z[i],A=DATA.alive[i],X1=i<DATA.steps?DATA.x[i+1]:X0,Z1=i<DATA.steps?DATA.z[i+1]:Z0,px=k=>X0[k]+(X1[k]-X0[k])*a,pz=k=>Z0[k]+(Z1[k]-Z0[k])*a;
-  function inCooldown(actions,k){
-   if(i<=0)return false;
-   for(let d=1;d<=3;d++){const j=i-d;if(j>=0 && actions[j] && actions[j][3*k+2]>.5)return true;}
-   return false;
-  }
+  const redActions=DATA.redActions[i]||null,blueActions=DATA.blueActions[i]||null;let redAttackCount=0,blueAttackCount=0;
   for(let k=0;k<100;k++){
-   const ridx=2+k,bidx=102+k;
-   // Replay the saved simulation coordinates exactly.
-   // Do not infer or reimplement cooldown movement here; the simulation
-   // already stored the true stopped positions in DATA.x / DATA.z.
-   redSoldiers[k].position.set(px(ridx),.18,pz(ridx));redSoldiers[k].visible=A[ridx]>0;
-   blueSoldiers[k].position.set(px(bidx),.18,pz(bidx));blueSoldiers[k].visible=A[bidx]>0;
+    const ridx=2+k,bidx=102+k;
+    const rAttack=!!redActions && redActions[3*k+2]>.5 && A[ridx]>0;
+    const bAttack=!!blueActions && blueActions[3*k+2]>.5 && A[bidx]>0;
+    redSoldiers[k].group.position.set(px(ridx),0,pz(ridx));redSoldiers[k].group.visible=A[ridx]>0;setSoldierVisual(redSoldiers[k],rAttack);if(rAttack)redAttackCount++;
+    blueSoldiers[k].group.position.set(px(bidx),0,pz(bidx));blueSoldiers[k].group.visible=A[bidx]>0;setSoldierVisual(blueSoldiers[k],bAttack);if(bAttack)blueAttackCount++;
   }
-  redCommander.position.set(px(0),.4,pz(0));redCommander.visible=A[0]>0;redCrown.position.set(px(0),.9,pz(0));redCrown.visible=A[0]>0;blueCommander.position.set(px(1),.4,pz(1));blueCommander.visible=A[1]>0;blueCrown.position.set(px(1),.9,pz(1));blueCrown.visible=A[1]>0;
-  const at=addAttackEffects(i,1-a);let ra=0,ba=0;for(let k=0;k<100;k++){ra+=A[2+k];ba+=A[102+k];}const verify=DATA.verificationPass?'<span class="pass">Replay verification: PASS</span>':'<span class="fail">Replay verification: FAIL</span><br>Max state error: '+DATA.maxStateError.toExponential(2);info.innerHTML='<b>Generation '+DATA.generation+'</b><br>Winner: <b>'+DATA.winnerLabel+'</b> ('+DATA.winnerSide+')<br>Battle time: '+DATA.winTime.toFixed(1)+' s<br>Replay time: '+f.t.toFixed(2)+' s<br>Step: '+i+' / '+DATA.steps+'<hr>Red soldiers: '+ra+'<br>Blue soldiers: '+ba+'<br>Red Commander HP: '+DATA.hp[i][0].toFixed(2)+'<br>Blue Commander HP: '+DATA.hp[i][1].toFixed(2)+'<hr><span class="attack">Red attacks: '+at.red+'</span><br><span class="attack">Blue attacks: '+at.blue+'</span><hr>Result: <b>'+DATA.resultText+'</b><br>'+verify;statusEl.textContent='Generation '+DATA.generation+' | Best Bout | '+f.t.toFixed(2)+' s';}
+  redCommander.position.set(px(0),0,pz(0));redCommander.visible=A[0]>0;redCrown.visible=A[0]>0;
+  blueCommander.position.set(px(1),0,pz(1));blueCommander.visible=A[1]>0;blueCrown.visible=A[1]>0;
+  const ra=Array.from(A.slice(2,102)).reduce((sum,v)=>sum+v,0),ba=Array.from(A.slice(102,202)).reduce((sum,v)=>sum+v,0);
+  const verify=DATA.verificationPass?'<span class="pass">Replay verification: PASS</span>':'<span class="fail">Replay verification: FAIL</span><br>Max state error: '+DATA.maxStateError.toExponential(2);info.innerHTML='<b>Generation '+DATA.generation+'</b><br>Winner: <b>'+DATA.winnerLabel+'</b> ('+DATA.winnerSide+')<br>Battle time: '+DATA.winTime.toFixed(1)+' s<br>Replay time: '+f.t.toFixed(2)+' s<br>Step: '+i+' / '+DATA.steps+'<hr>Red soldiers: '+ra+'<br>Blue soldiers: '+ba+'<br>Red Commander HP: '+DATA.hp[i][0].toFixed(2)+'<br>Blue Commander HP: '+DATA.hp[i][1].toFixed(2)+'<hr><span class="attack">Red attacks: '+redAttackCount+'</span><br><span class="attack">Blue attacks: '+blueAttackCount+'</span><hr>Result: <b>'+DATA.resultText+'</b><br>'+verify;statusEl.textContent='Generation '+DATA.generation+' | Best Bout | '+f.t.toFixed(2)+' s';}
  document.getElementById('play').onclick=()=>playing=true; document.getElementById('pause').onclick=()=>playing=false; document.getElementById('reset').onclick=()=>{playing=false;replayTime=0;updateReplay();}; document.querySelectorAll('button[data-speed]').forEach(b=>b.onclick=()=>speed=parseFloat(b.dataset.speed)); timeline.oninput=()=>{playing=false;replayTime=parseInt(timeline.value,10)*DATA.dt;updateReplay();};
  addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
  function animate(ts){requestAnimationFrame(animate);if(lastTs===null)lastTs=ts;const delta=Math.min(.05,(ts-lastTs)/1000);lastTs=ts;if(playing){replayTime+=delta*speed;if(replayTime>=DATA.steps*DATA.dt){replayTime=DATA.steps*DATA.dt;playing=false;}}updateReplay();controls.update();renderer.render(scene,camera);}
