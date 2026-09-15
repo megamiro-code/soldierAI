@@ -42,7 +42,9 @@ for d in (CHECKPOINT_DIR, ELITE_DIR, BOUT_DIR, REPLAY_DIR):
 # ============================================================
 
 N_ENVS = 32
-FIELD_SIZE = 10.0
+
+# 16 x 16 battlefield
+FIELD_SIZE = 16.0
 HALF_FIELD = FIELD_SIZE / 2.0
 
 N_SOLDIERS_PER_TEAM = 100
@@ -62,18 +64,19 @@ SOLDIER_RADIUS = 0.13
 COMMANDER_RADIUS = 0.22
 COMMANDER_EXTRA_MARGIN = 0.10
 
-SOLDIER_SPEED_MIN = 0.40
-SOLDIER_SPEED_MAX = 0.65
+# Fixed initial state:
+# every soldier starts at the same deterministic speed.
+INITIAL_SOLDIER_SPEED = 0.50
 
 N_FEATURES_PER_UNIT = 10
-TERRAIN_RES = 10
+TERRAIN_RES = 16
 
 OBS_SIZE = TERRAIN_RES * TERRAIN_RES + N_UNITS * N_FEATURES_PER_UNIT
 ACTION_SIZE = N_SOLDIERS_PER_TEAM * 3
 
 SHAPING_COEF = 0.005
 
-# Backward-compatible aliases (fix #1)
+# Backward-compatible aliases
 OBS_DIM = OBS_SIZE
 ACTION_DIM = ACTION_SIZE
 
@@ -84,31 +87,98 @@ RED_SOLDIER_END = 102
 BLUE_SOLDIER_START = 102
 BLUE_SOLDIER_END = 202
 
-ALL_SOLDIER_INDICES = jnp.arange(RED_SOLDIER_START, BLUE_SOLDIER_END)
-ALL_UNIT_INDICES = jnp.arange(N_UNITS)
+ALL_SOLDIER_INDICES = jnp.arange(
+    RED_SOLDIER_START,
+    BLUE_SOLDIER_END,
+)
+ALL_UNIT_INDICES = jnp.arange(
+    N_UNITS
+)
 
-walls = jnp.array([
-    [-4.5, -4.5], [-4.5, 4.5], [4.5, -4.5], [4.5, 4.5],
-    [-0.5, -0.5], [-0.5, 0.5], [0.5, -0.5], [0.5, 0.5],
-], dtype=jnp.float32)
+# ------------------------------------------------------------
+# Fixed wall layout for the 16 x 16 battlefield.
+#
+# The two outermost starting columns are intentionally kept
+# completely free of walls.
+# ------------------------------------------------------------
 
-WALL_LIST = [[-4.5, -4.5], [-4.5, 4.5], [4.5, -4.5], [4.5, 4.5],
-             [-0.5, -0.5], [-0.5, 0.5], [0.5, -0.5], [0.5, 0.5]]
+WALL_LIST = [
+    [-6.5, -6.5],
+    [-6.5,  6.5],
+    [ 6.5, -6.5],
+    [ 6.5,  6.5],
+
+    [-1.0, -1.0],
+    [-1.0,  1.0],
+    [ 1.0, -1.0],
+    [ 1.0,  1.0],
+]
+
+walls = jnp.array(
+    WALL_LIST,
+    dtype=jnp.float32,
+)
 
 
 def make_terrain():
-    xs = jnp.arange(TERRAIN_RES) - 4.5
-    zs = jnp.arange(TERRAIN_RES) - 4.5
-    xx, zz = jnp.meshgrid(xs, zs)
-    centers = jnp.stack([xx.reshape(-1), zz.reshape(-1)], axis=-1)
+    # Cell centers for a 16 x 16 battlefield:
+    # -7.5, -6.5, ..., 6.5, 7.5
+    centers_1d = (
+        jnp.arange(TERRAIN_RES, dtype=jnp.float32)
+        - HALF_FIELD
+        + 0.5
+    )
+
+    xx, zz = jnp.meshgrid(
+        centers_1d,
+        centers_1d,
+    )
+
+    centers = jnp.stack(
+        [
+            xx.reshape(-1),
+            zz.reshape(-1),
+        ],
+        axis=-1,
+    )
 
     def blocked(i):
         cell = centers[i]
-        d = jnp.abs(cell[None, :] - walls)
-        return jnp.any(jnp.all(d < 0.5, axis=1))
+        d = jnp.abs(
+            cell[None, :]
+            - walls
+        )
 
-    t = jax.vmap(blocked)(jnp.arange(TERRAIN_RES * TERRAIN_RES))
-    return t.astype(jnp.float32)
+        return jnp.any(
+            jnp.all(
+                d < 0.5,
+                axis=1,
+            )
+        )
+
+    t = jax.vmap(
+        blocked
+    )(
+        jnp.arange(
+            TERRAIN_RES * TERRAIN_RES
+        )
+    )
+
+    # Safety rule:
+    # the two outermost starting columns must remain free.
+    start_column = jnp.abs(
+        centers[:, 0]
+    ) > (HALF_FIELD - 1.0)
+
+    t = jnp.where(
+        start_column,
+        False,
+        t,
+    )
+
+    return t.astype(
+        jnp.float32
+    )
 
 
 terrain = make_terrain()
@@ -132,41 +202,209 @@ commander_mask = 1.0 - soldier_mask
 # ------------------------------------------------------------
 
 def reset_one(key):
-    k1, k2, k3, k4, k5 = random.split(key, 5)
+    """
+    Deterministic initial state.
 
-    x = jnp.zeros(N_UNITS, dtype=jnp.float32)
-    z = jnp.zeros(N_UNITS, dtype=jnp.float32)
-    vx = jnp.zeros(N_UNITS, dtype=jnp.float32)
-    vz = jnp.zeros(N_UNITS, dtype=jnp.float32)
-    hp = jnp.ones(N_UNITS, dtype=jnp.float32)
-    alive = jnp.ones(N_UNITS, dtype=jnp.float32)
-    attack_timer = jnp.zeros(N_UNITS, dtype=jnp.float32)
-    speed = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    Red:
+        starts from the leftmost column, which is farthest from
+        the Blue commander.
 
-    x = x.at[RED_COMMANDER_INDEX].set(-3.2)
-    x = x.at[BLUE_COMMANDER_INDEX].set(3.2)
-    speed = speed.at[RED_COMMANDER_INDEX].set(0.20)
-    speed = speed.at[BLUE_COMMANDER_INDEX].set(0.20)
+    Blue:
+        starts from the rightmost column, which is farthest from
+        the Red commander.
 
-    red_x = random.uniform(k1, (N_SOLDIERS_PER_TEAM,), minval=-4.3, maxval=-0.8)
-    red_z = random.uniform(k2, (N_SOLDIERS_PER_TEAM,), minval=-4.3, maxval=4.3)
-    blue_x = random.uniform(k3, (N_SOLDIERS_PER_TEAM,), minval=0.8, maxval=4.3)
-    blue_z = random.uniform(k4, (N_SOLDIERS_PER_TEAM,), minval=-4.3, maxval=4.3)
-    sp = random.uniform(k5, (N_SOLDIERS_TOTAL,),
-                        minval=SOLDIER_SPEED_MIN, maxval=SOLDIER_SPEED_MAX)
+    The 100 soldiers form a compact 10 x 10 formation:
+        - 10 soldiers in the first rank
+        - 10 ranks in depth
 
-    x = x.at[RED_SOLDIER_START:RED_SOLDIER_END].set(red_x)
-    z = z.at[RED_SOLDIER_START:RED_SOLDIER_END].set(red_z)
-    x = x.at[BLUE_SOLDIER_START:BLUE_SOLDIER_END].set(blue_x)
-    z = z.at[BLUE_SOLDIER_START:BLUE_SOLDIER_END].set(blue_z)
-    speed = speed.at[RED_SOLDIER_START:BLUE_SOLDIER_END].set(sp)
+    Spacing is 0.48, comfortably larger than the soldier diameter
+    (2 * SOLDIER_RADIUS = 0.26) while avoiding an excessively sparse
+    formation.
+
+    The outermost starting column is reserved for the formation;
+    no wall is placed there.
+    """
+
+    del key
+
+    x = jnp.zeros(
+        N_UNITS,
+        dtype=jnp.float32,
+    )
+
+    z = jnp.zeros(
+        N_UNITS,
+        dtype=jnp.float32,
+    )
+
+    vx = jnp.zeros(
+        N_UNITS,
+        dtype=jnp.float32,
+    )
+
+    vz = jnp.zeros(
+        N_UNITS,
+        dtype=jnp.float32,
+    )
+
+    hp = jnp.ones(
+        N_UNITS,
+        dtype=jnp.float32,
+    )
+
+    alive = jnp.ones(
+        N_UNITS,
+        dtype=jnp.float32,
+    )
+
+    attack_timer = jnp.zeros(
+        N_UNITS,
+        dtype=jnp.float32,
+    )
+
+    speed = jnp.zeros(
+        N_UNITS,
+        dtype=jnp.float32,
+    )
+
+    # --------------------------------------------------------
+    # Commanders
+    # --------------------------------------------------------
+
+    # Commanders sit just behind their own formation.
+    x = x.at[
+        RED_COMMANDER_INDEX
+    ].set(-6.60)
+
+    z = z.at[
+        RED_COMMANDER_INDEX
+    ].set(0.0)
+
+    x = x.at[
+        BLUE_COMMANDER_INDEX
+    ].set(6.60)
+
+    z = z.at[
+        BLUE_COMMANDER_INDEX
+    ].set(0.0)
+
+    speed = speed.at[
+        RED_COMMANDER_INDEX
+    ].set(0.20)
+
+    speed = speed.at[
+        BLUE_COMMANDER_INDEX
+    ].set(0.20)
+
+    # --------------------------------------------------------
+    # Fixed 10 x 10 soldier formation
+    # --------------------------------------------------------
+
+    spacing = 0.48
+
+    formation_side = 10
+
+    # z positions:
+    # -2.16, -1.68, ... , +2.16
+    z_positions = (
+        (
+            jnp.arange(
+                formation_side,
+                dtype=jnp.float32,
+            )
+            - 4.5
+        )
+        * spacing
+    )
+
+    # x positions start inside the outermost column and extend
+    # inward toward the commander.
+    red_x_positions = (
+        -7.30
+        + jnp.arange(
+            formation_side,
+            dtype=jnp.float32,
+        )
+        * spacing
+    )
+
+    blue_x_positions = (
+        7.30
+        - jnp.arange(
+            formation_side,
+            dtype=jnp.float32,
+        )
+        * spacing
+    )
+
+    red_x, red_z = jnp.meshgrid(
+        red_x_positions,
+        z_positions,
+    )
+
+    blue_x, blue_z = jnp.meshgrid(
+        blue_x_positions,
+        z_positions,
+    )
+
+    red_x = red_x.reshape(-1)
+    red_z = red_z.reshape(-1)
+
+    blue_x = blue_x.reshape(-1)
+    blue_z = blue_z.reshape(-1)
+
+    x = x.at[
+        RED_SOLDIER_START:
+        RED_SOLDIER_END
+    ].set(
+        red_x
+    )
+
+    z = z.at[
+        RED_SOLDIER_START:
+        RED_SOLDIER_END
+    ].set(
+        red_z
+    )
+
+    x = x.at[
+        BLUE_SOLDIER_START:
+        BLUE_SOLDIER_END
+    ].set(
+        blue_x
+    )
+
+    z = z.at[
+        BLUE_SOLDIER_START:
+        BLUE_SOLDIER_END
+    ].set(
+        blue_z
+    )
+
+    # Fixed speed: the entire reset state is deterministic.
+    speed = speed.at[
+        RED_SOLDIER_START:
+        BLUE_SOLDIER_END
+    ].set(
+        INITIAL_SOLDIER_SPEED
+    )
 
     return {
-        "x": x, "z": z, "vx": vx, "vz": vz,
-        "hp": hp, "alive": alive,
-        "attack_timer": attack_timer, "speed": speed,
-        "time": jnp.array(0.0, dtype=jnp.float32),
-        "done": jnp.array(False),
+        "x": x,
+        "z": z,
+        "vx": vx,
+        "vz": vz,
+        "hp": hp,
+        "alive": alive,
+        "attack_timer": attack_timer,
+        "speed": speed,
+        "time": jnp.array(
+            0.0,
+            dtype=jnp.float32,
+        ),
+        "done": jnp.array(
+            False
+        ),
     }
 
 
@@ -446,6 +684,13 @@ PPO_UPDATES_PER_GENERATION = 20
 N_GENERATIONS = 20
 EVAL_GAMES_PER_SIDE = 32
 EVAL_GAMES = EVAL_GAMES_PER_SIDE * 2
+
+# Elite evaluation uses deterministic starting-state variants.
+# Training/reset itself remains fully deterministic and unchanged.
+EVAL_Z_OFFSETS = jnp.array(
+    [-0.72, -0.48, -0.24, 0.00, 0.24, 0.48, 0.72, 0.00],
+    dtype=jnp.float32,
+)
 
 ANGLE_MEAN_IDX = jnp.arange(0, ACTION_SIZE, 3)
 ANGLE_LOGSTD_IDX = jnp.arange(1, ACTION_SIZE, 3)
@@ -749,6 +994,27 @@ def run_ppo_update(params, opt_state, state, key, global_update, total_updates):
 # PART 4 : EVALUATION  (fix #10, #13)
 # ============================================================
 
+def make_evaluation_states(base_states):
+    """Create deterministic, symmetric starting-state variants for Elite evaluation.
+
+    Every game is still fully reproducible. The entire battle (commanders and
+    soldiers) is shifted together in z, so Red/Blue symmetry is preserved.
+    Training environments keep the original fixed reset state.
+    """
+    n = base_states["x"].shape[0]
+    offsets = EVAL_Z_OFFSETS[jnp.arange(n) % EVAL_Z_OFFSETS.shape[0]]
+
+    def shift_axis(values, unit_mask):
+        return values + offsets[:, None] * unit_mask[None, :]
+
+    unit_mask = jnp.ones((N_UNITS,), dtype=jnp.float32)
+    z = shift_axis(base_states["z"], unit_mask)
+    return {
+        **base_states,
+        "z": z,
+    }
+
+
 @jax.jit
 def evaluate_match(params_red, params_blue, init_states):
     """
@@ -777,9 +1043,16 @@ def evaluate_match(params_red, params_blue, init_states):
         red_cmd = nxt["alive"][:, RED_COMMANDER_INDEX] > 0
         blue_cmd = nxt["alive"][:, BLUE_COMMANDER_INDEX] > 0
 
-        res_now = jnp.where(red_cmd & (~blue_cmd), 1,
-                    jnp.where(blue_cmd & (~red_cmd), 2,
-                      jnp.where((~red_cmd) & (~blue_cmd), 4, 3)))
+        res_now = jnp.where(
+            red_cmd & (~blue_cmd), 1,
+            jnp.where(
+                blue_cmd & (~red_cmd), 2,
+                jnp.where(
+                    (~red_cmd) & (~blue_cmd), 4,
+                    jnp.where(done, 3, 0),
+                ),
+            ),
+        )
 
         rs = jnp.sum(nxt["alive"][:, RED_SOLDIER_START:RED_SOLDIER_END], axis=1)
         bs = jnp.sum(nxt["alive"][:, BLUE_SOLDIER_START:BLUE_SOLDIER_END], axis=1)
@@ -802,6 +1075,12 @@ def evaluate_match(params_red, params_blue, init_states):
     (final_state, _, result, end_step, red_surv, blue_surv), _ = lax.scan(
         body, init, jnp.arange(MAX_STEPS))
 
+    # Every simulation reaches MAX_STEPS at the latest, because step_one
+    # declares timeout when time >= MAX_TIME. The fallback prevents an
+    # unresolved code 0 from silently entering the Elite comparison.
+    result = jnp.where(result == 0, 3, result)
+    end_step = jnp.where(result == 3, jnp.minimum(end_step, MAX_STEPS), end_step)
+
     return result, end_step, red_surv, blue_surv
 
 
@@ -809,7 +1088,7 @@ def evaluate_elite_match(candidate_params, elite_params, base_states, verbose=Tr
     """
     Side A : candidate = Red , elite = Blue   (games 0 .. E-1)
     Side B : elite = Red , candidate = Blue   (games E .. 2E-1)
-    Identical base states are used for both sides.
+    Deterministic evaluation variants are reused symmetrically for both sides.
     """
     E = base_states["x"].shape[0]
 
@@ -841,6 +1120,12 @@ def evaluate_elite_match(candidate_params, elite_params, base_states, verbose=Tr
     elite_wins = int(np.sum(elite_won))
     timeouts = int(np.sum(result == 3))
     draws = int(np.sum(result == 4))
+    unresolved = int(np.sum(result == 0))
+
+    if unresolved:
+        raise RuntimeError(
+            f"Elite evaluation produced {unresolved} unresolved game(s)."
+        )
 
     winner = 1 if candidate_wins > elite_wins else 2
 
@@ -857,6 +1142,7 @@ def evaluate_elite_match(candidate_params, elite_params, base_states, verbose=Tr
         "elite_wins": elite_wins,
         "timeouts": timeouts,
         "draws": draws,
+        "unresolved": unresolved,
         "avg_candidate_time": float(np.mean(win_time[candidate_won])) if candidate_wins else float("nan"),
         "avg_elite_time": float(np.mean(win_time[elite_won])) if elite_wins else float("nan"),
         "winner": winner,
@@ -887,9 +1173,16 @@ def record_bout(params_red, params_blue, initial_state):
         red_cmd = nxt["alive"][RED_COMMANDER_INDEX] > 0
         blue_cmd = nxt["alive"][BLUE_COMMANDER_INDEX] > 0
 
-        res_now = jnp.where(red_cmd & (~blue_cmd), 1,
-                    jnp.where(blue_cmd & (~red_cmd), 2,
-                      jnp.where((~red_cmd) & (~blue_cmd), 4, 3)))
+        res_now = jnp.where(
+            red_cmd & (~blue_cmd), 1,
+            jnp.where(
+                blue_cmd & (~red_cmd), 2,
+                jnp.where(
+                    (~red_cmd) & (~blue_cmd), 4,
+                    jnp.where(done, 3, 0),
+                ),
+            ),
+        )
 
         result = jnp.where(newly, res_now, result)
         end_step = jnp.where(newly, step_idx + 1, end_step)
@@ -905,6 +1198,8 @@ def record_bout(params_red, params_blue, initial_state):
 
     (final_state, _, result, end_step), traj = lax.scan(
         body, init, jnp.arange(MAX_STEPS))
+
+    result = jnp.where(result == 0, 3, result)
 
     xs, zs, hps, alives, red_actions, blue_actions = traj
 
@@ -972,6 +1267,10 @@ def save_best_bout(path, generation, match, best_idx, bout,
         "candidate_is_red": np.array(bool(match["candidate_is_red"][best_idx])),
         "candidate_wins": np.array(match["candidate_wins"], dtype=np.int32),
         "elite_wins": np.array(match["elite_wins"], dtype=np.int32),
+        "field_size": np.array(FIELD_SIZE, dtype=np.float32),
+        "terrain_res": np.array(TERRAIN_RES, dtype=np.int32),
+        "obs_size": np.array(OBS_SIZE, dtype=np.int32),
+        "action_size": np.array(ACTION_SIZE, dtype=np.int32),
 
         "start_x": np.asarray(bout["x"][0]),
         "start_z": np.asarray(bout["z"][0]),
@@ -1042,17 +1341,69 @@ def save_checkpoint(path, params, opt_state, generation, ppo_index,
     return path
 
 
+def policy_params_compatible(params):
+    """Return True only when a saved policy matches the current architecture."""
+    required_shapes = {
+        "W1": (OBS_SIZE, HIDDEN1),
+        "b1": (HIDDEN1,),
+        "W2": (HIDDEN1, HIDDEN2),
+        "b2": (HIDDEN2,),
+        "Wa": (HIDDEN2, ACTION_SIZE),
+        "ba": (ACTION_SIZE,),
+        "Wv": (HIDDEN2, 1),
+        "bv": (1,),
+    }
+    if set(params.keys()) != set(required_shapes.keys()):
+        return False
+    return all(tuple(np.asarray(params[k]).shape) == shape
+               for k, shape in required_shapes.items())
+
+
+def saved_policy_file_compatible(path):
+    """Check a saved Elite/checkpoint parameter block without loading Optax state."""
+    try:
+        with np.load(path, allow_pickle=False) as d:
+            params = {
+                k[len("param_"):]: d[k]
+                for k in d.files
+                if k.startswith("param_")
+            }
+        return policy_params_compatible(params)
+    except Exception:
+        return False
+
+
 def load_checkpoint(path):
     d = np.load(path, allow_pickle=False)
 
     params = {k[len("param_"):]: jnp.asarray(d[k])
               for k in d.files if k.startswith("param_")}
 
+    if not policy_params_compatible(params):
+        raise ValueError(
+            f"Incompatible checkpoint architecture: {path} "
+            f"(current OBS_SIZE={OBS_SIZE})"
+        )
+
     # Rebuild the optax state structure from a fresh init, then swap leaves in.
     template = optimizer.init(params)
+    template_leaves = jax.tree_util.tree_leaves(template)
     treedef = jax.tree_util.tree_structure(template)
     n = int(d["opt_n_leaves"])
-    leaves = [jnp.asarray(d[f"opt_{i}"]) for i in range(n)]
+    if n != len(template_leaves):
+        raise ValueError(
+            f"Incompatible optimizer state in checkpoint: {path}"
+        )
+
+    leaves = []
+    for i, template_leaf in enumerate(template_leaves):
+        leaf = jnp.asarray(d[f"opt_{i}"])
+        if tuple(leaf.shape) != tuple(template_leaf.shape):
+            raise ValueError(
+                f"Incompatible optimizer leaf {i} in checkpoint: {path}"
+            )
+        leaves.append(leaf)
+
     opt_state = jax.tree_util.tree_unflatten(treedef, leaves)
 
     generation = int(d["generation"])
@@ -1072,21 +1423,45 @@ def generation_number(path):
 
 def find_latest_elite():
     files = glob.glob(os.path.join(ELITE_DIR, "generation_*.npz"))
-    if not files:
+    compatible = [f for f in files if saved_policy_file_compatible(f)]
+    if not compatible:
+        if files:
+            print(
+                f"Ignoring {len(files)} incompatible Elite file(s) "
+                f"(current OBS_SIZE={OBS_SIZE})."
+            )
         return None
-    return sorted(files, key=generation_number)[-1]
+    return sorted(compatible, key=generation_number)[-1]
 
 
 def find_latest_checkpoint():
     files = glob.glob(os.path.join(CHECKPOINT_DIR, "checkpoint_*.npz"))
-    if not files:
+    compatible = []
+    incompatible = []
+
+    for path in files:
+        if saved_policy_file_compatible(path):
+            compatible.append(path)
+        else:
+            incompatible.append(path)
+
+    if incompatible:
+        print(
+            f"Ignoring {len(incompatible)} incompatible checkpoint(s) "
+            f"(current OBS_SIZE={OBS_SIZE})."
+        )
+
+    if not compatible:
         return None
-    return sorted(files, key=os.path.getmtime)[-1]
+
+    return sorted(compatible, key=os.path.getmtime)[-1]
 
 
 # ============================================================
 # PART 7 : TRAINING LOOP
 # ============================================================
+
+LAST_COMPLETED_GENERATION = None
 
 def train(n_generations=N_GENERATIONS, resume=True):
     master_key = random.key(int(time.time()) & 0x7FFFFFFF)
@@ -1098,16 +1473,23 @@ def train(n_generations=N_GENERATIONS, resume=True):
 
     ckpt = find_latest_checkpoint() if resume else None
     if ckpt is not None:
-        (resumed_params, resumed_opt, g, p, saved_elite, master_key) = load_checkpoint(ckpt)
-        start_generation = g
-        start_ppo_index = p + 1
-        if start_ppo_index > PPO_UPDATES_PER_GENERATION:
-            start_ppo_index = 1
-            start_generation += 1
+        try:
+            (resumed_params, resumed_opt, g, p, saved_elite, master_key) = load_checkpoint(ckpt)
+            start_generation = g
+            start_ppo_index = p + 1
+            if start_ppo_index > PPO_UPDATES_PER_GENERATION:
+                start_ppo_index = 1
+                start_generation += 1
+                resumed_params = None
+                resumed_opt = None
+            print(f"Resuming from checkpoint: generation {start_generation}, "
+                  f"PPO {start_ppo_index}/{PPO_UPDATES_PER_GENERATION}")
+        except (ValueError, KeyError, OSError, EOFError) as exc:
+            print(f"Checkpoint resume skipped: {exc}")
             resumed_params = None
             resumed_opt = None
-        print(f"Resuming from checkpoint: generation {start_generation}, "
-              f"PPO {start_ppo_index}/{PPO_UPDATES_PER_GENERATION}")
+            start_generation = 1
+            start_ppo_index = 1
 
     # ---- Generation 0 elite (fix #12 : random init fallback) ----
     latest_elite = find_latest_elite()
@@ -1202,11 +1584,12 @@ def train(n_generations=N_GENERATIONS, resume=True):
         # ---- Elite match ----
         master_key, evk = random.split(master_key)
         base_states = reset_batch(evk, EVAL_GAMES_PER_SIDE)
+        eval_states = make_evaluation_states(base_states)
 
         print("Elite match")
         print("------------------------------------------")
         t0 = time.time()
-        match = evaluate_elite_match(candidate_params, elite_params, base_states)
+        match = evaluate_elite_match(candidate_params, elite_params, eval_states)
         match_time = time.time() - t0
 
         print()
@@ -1216,6 +1599,7 @@ def train(n_generations=N_GENERATIONS, resume=True):
         print(f"Elite wins     : {match['elite_wins']}")
         print(f"Timeouts       : {match['timeouts']}")
         print(f"Draws          : {match['draws']}")
+        print(f"Unresolved     : {match['unresolved']}")
         if np.isfinite(match["avg_candidate_time"]):
             print(f"Candidate avg win time : {match['avg_candidate_time']:.2f} s")
         if np.isfinite(match["avg_elite_time"]):
@@ -1233,7 +1617,7 @@ def train(n_generations=N_GENERATIONS, resume=True):
         if best_idx is not None:
             cand_is_red = bool(match["candidate_is_red"][best_idx])
             base_idx = best_idx % match["games_per_side"]
-            init_state = tree_index(base_states, base_idx)
+            init_state = tree_index(eval_states, base_idx)
 
             params_red = candidate_params if cand_is_red else elite_params
             params_blue = elite_params if cand_is_red else candidate_params
@@ -1295,6 +1679,9 @@ def train(n_generations=N_GENERATIONS, resume=True):
         print(f"Best Bout     : {'SAVED' if best_bout_saved else 'NONE'}")
         print()
 
+        global LAST_COMPLETED_GENERATION
+        LAST_COMPLETED_GENERATION = generation
+
     return latest_elite
 
 
@@ -1311,286 +1698,1933 @@ RESULT_TEXT = {
 }
 
 
-def build_replay_html(bout_path, out_path=None):
-    d = np.load(bout_path, allow_pickle=False)
 
-    generation = int(d["generation"])
-    winner_label = str(d["winner_label"])          # fix #18 : real string
-    winner_team = int(d["winner_team"])
-    result_code = int(d["result_code"])
-    win_time = float(d["win_time"])                # fix #16 : matching key name
-    end_step = int(d["end_step"])
-    dt = float(d["dt"])                            # fix #21 : DT from data
-    verification_pass = bool(int(d["verification_pass"]))
-    max_state_error = float(d["max_state_error"])
+def build_replay_html(
+    bout_path,
+    out_path=None,
+):
+    """
+    Build a smooth 3D HTML replay.
 
-    x = d["x"].astype(np.float32)
-    z = d["z"].astype(np.float32)
-    hp = d["hp"].astype(np.float32)
-    alive = d["alive"].astype(np.float32)
+    Replay improvements:
+      - 16 x 16 battlefield
+      - smooth interpolation between simulation frames
+      - visible attack beams / flashes
+      - highlighted starting columns
+      - exact t=0 frame is shown
+      - walls are rendered from the saved Best Bout metadata
+    """
+
+    d = np.load(
+        bout_path,
+        allow_pickle=False,
+    )
+
+    generation = int(
+        d["generation"]
+    )
+
+    winner_label = str(
+        d["winner_label"]
+    )
+
+    winner_team = int(
+        d["winner_team"]
+    )
+
+    result_code = int(
+        d["result_code"]
+    )
+
+    win_time = float(
+        d["win_time"]
+    )
+
+    end_step = int(
+        d["end_step"]
+    )
+
+    dt = float(
+        d["dt"]
+    )
+
+    saved_field_size = float(d.get("field_size", FIELD_SIZE)) if hasattr(d, "get") else FIELD_SIZE
+    saved_terrain_res = int(d["terrain_res"]) if "terrain_res" in d else TERRAIN_RES
+    saved_obs_size = int(d["obs_size"]) if "obs_size" in d else OBS_SIZE
+
+    if abs(saved_field_size - FIELD_SIZE) > 1e-6:
+        raise ValueError(
+            f"Best Bout field size mismatch: saved={saved_field_size}, current={FIELD_SIZE}"
+        )
+    if saved_terrain_res != TERRAIN_RES or saved_obs_size != OBS_SIZE:
+        raise ValueError(
+            "Best Bout is from an incompatible environment "
+            f"(saved terrain={saved_terrain_res}, obs={saved_obs_size}; "
+            f"current terrain={TERRAIN_RES}, obs={OBS_SIZE})."
+        )
+
+    verification_pass = bool(
+        int(
+            d["verification_pass"]
+        )
+    )
+
+    max_state_error = float(
+        d["max_state_error"]
+    )
+
+    x = d[
+        "x"
+    ].astype(
+        np.float32
+    )
+
+    z = d[
+        "z"
+    ].astype(
+        np.float32
+    )
+
+    hp = d[
+        "hp"
+    ].astype(
+        np.float32
+    )
+
+    alive = d[
+        "alive"
+    ].astype(
+        np.float32
+    )
+
+    red_actions = (
+        d["red_actions"]
+        .astype(
+            np.float32
+        )
+    )
+
+    blue_actions = (
+        d["blue_actions"]
+        .astype(
+            np.float32
+        )
+    )
 
     n_frames = x.shape[0]
     n_units = x.shape[1]
-    if n_units != N_UNITS:
-        raise ValueError(f"Unexpected unit count: {n_units}")
-    if n_frames < 2:
-        raise ValueError("Best Bout contains no replay frames.")
 
-    payload = json.dumps({
-        "generation": generation,
-        "winnerLabel": winner_label,
-        "winnerTeam": winner_team,
-        "winnerSide": "Red" if winner_team == 0 else "Blue",
-        "resultText": RESULT_TEXT.get(result_code, "UNKNOWN"),
-        "winTime": win_time,
-        "endStep": end_step,
-        "dt": dt,
-        "frames": n_frames,
-        "steps": n_frames - 1,
-        "verificationPass": verification_pass,
-        "maxStateError": max_state_error,
-        "walls": WALL_LIST,
-        "x": np.round(x, 3).tolist(),
-        "z": np.round(z, 3).tolist(),
-        "hp": np.round(hp, 3).tolist(),
-        "alive": alive.astype(np.uint8).tolist(),
-    }, separators=(",", ":"))
+    if n_units != N_UNITS:
+        raise ValueError(
+            f"Unexpected unit count: {n_units}"
+        )
+
+    if n_frames < 2:
+        raise ValueError(
+            "Best Bout contains no replay frames."
+        )
+
+    if red_actions.shape[0] != end_step:
+        raise ValueError(
+            "Red action length does not match end_step."
+        )
+
+    if blue_actions.shape[0] != end_step:
+        raise ValueError(
+            "Blue action length does not match end_step."
+        )
+
+    # --------------------------------------------------------
+    # Replay metadata
+    # --------------------------------------------------------
+
+    payload = json.dumps(
+        {
+            "generation": generation,
+            "winnerLabel": winner_label,
+            "winnerTeam": winner_team,
+            "winnerSide": (
+                "Red"
+                if winner_team == 0
+                else "Blue"
+            ),
+            "resultText": RESULT_TEXT.get(
+                result_code,
+                "UNKNOWN",
+            ),
+            "winTime": win_time,
+            "endStep": end_step,
+            "dt": dt,
+            "frames": n_frames,
+            "steps": n_frames - 1,
+            "verificationPass":
+                verification_pass,
+            "maxStateError":
+                max_state_error,
+            "walls": WALL_LIST,
+            "fieldSize": FIELD_SIZE,
+            "x": np.round(
+                x,
+                4,
+            ).tolist(),
+            "z": np.round(
+                z,
+                4,
+            ).tolist(),
+            "hp": np.round(
+                hp,
+                3,
+            ).tolist(),
+            "alive": alive.astype(
+                np.uint8
+            ).tolist(),
+            "redActions": np.round(
+                red_actions,
+                3,
+            ).tolist(),
+            "blueActions": np.round(
+                blue_actions,
+                3,
+            ).tolist(),
+        },
+        separators=(
+            ",",
+            ":",
+        ),
+    )
+
+    # --------------------------------------------------------
+    # HTML
+    #
+    # Deliberately not an f-string so JavaScript braces are safe.
+    # --------------------------------------------------------
 
     html = """<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>RTS Best Bout Replay</title>
+<html>
+<head>
+<meta charset="utf-8">
+<title>RTS Best Bout Replay</title>
+
 <style>
-html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;
-  background:#101010;font-family:Arial,Helvetica,sans-serif;}
-#app{position:relative;width:100vw;height:100vh;}
-#info{position:absolute;left:14px;top:14px;z-index:10;padding:12px 15px;
-  background:rgba(0,0,0,.72);color:#fff;border-radius:8px;min-width:260px;
-  line-height:1.55;font-size:14px;}
-#controls{position:absolute;left:14px;bottom:14px;z-index:10;padding:10px 12px;
-  background:rgba(0,0,0,.72);border-radius:8px;color:#fff;}
-button{margin-right:5px;padding:5px 9px;border:0;border-radius:4px;cursor:pointer;}
-#timeline{width:440px;max-width:45vw;vertical-align:middle;}
-#status{margin-top:7px;font-size:12px;opacity:.85;}
-.pass{color:#5fd97a;font-weight:bold;}
-.fail{color:#ff6a6a;font-weight:bold;}
-hr{border:0;border-top:1px solid rgba(255,255,255,.25);margin:7px 0;}
-</style></head><body>
+html,body{
+    margin:0;
+    padding:0;
+    width:100%;
+    height:100%;
+    overflow:hidden;
+    background:#101010;
+    font-family:Arial,Helvetica,sans-serif;
+}
+
+#app{
+    position:relative;
+    width:100vw;
+    height:100vh;
+}
+
+#info{
+    position:absolute;
+    left:14px;
+    top:14px;
+    z-index:10;
+    padding:12px 15px;
+    background:rgba(0,0,0,.74);
+    color:#fff;
+    border-radius:8px;
+    min-width:290px;
+    line-height:1.48;
+    font-size:14px;
+}
+
+#controls{
+    position:absolute;
+    left:14px;
+    right:14px;
+    bottom:14px;
+    z-index:10;
+    padding:10px 12px;
+    background:rgba(0,0,0,.78);
+    border-radius:8px;
+    color:#fff;
+}
+
+button{
+    margin-right:5px;
+    padding:5px 9px;
+    border:0;
+    border-radius:4px;
+    cursor:pointer;
+}
+
+#timeline{
+    width:min(700px,70vw);
+    max-width:70vw;
+    vertical-align:middle;
+}
+
+#status{
+    margin-top:7px;
+    font-size:12px;
+    opacity:.88;
+}
+
+.pass{
+    color:#5fd97a;
+    font-weight:bold;
+}
+
+.fail{
+    color:#ff6a6a;
+    font-weight:bold;
+}
+
+.attack{
+    color:#ffd84a;
+    font-weight:bold;
+}
+
+.startzone{
+    color:#8ddcff;
+    font-weight:bold;
+}
+
+hr{
+    border:0;
+    border-top:1px solid rgba(255,255,255,.25);
+    margin:7px 0;
+}
+</style>
+</head>
+
+<body>
 <div id="app">
-  <div id="info"></div>
-  <div id="controls">
-    <button id="play">Play</button>
-    <button id="pause">Pause</button>
-    <button id="reset">Reset</button>
-    <button data-speed="0.25">0.25x</button>
-    <button data-speed="0.5">0.5x</button>
-    <button data-speed="1">1x</button>
-    <button data-speed="2">2x</button>
-    <br><br>
-    <input id="timeline" type="range" min="0" max="__MAXSTEP__" value="0">
-    <div id="status"></div>
-  </div>
+    <div id="info"></div>
+
+    <div id="controls">
+        <button id="play">Play</button>
+        <button id="pause">Pause</button>
+        <button id="reset">Reset</button>
+
+        <button data-speed="0.25">0.25x</button>
+        <button data-speed="0.5">0.5x</button>
+        <button data-speed="1">1x</button>
+        <button data-speed="2">2x</button>
+
+        <br><br>
+
+        <input
+            id="timeline"
+            type="range"
+            min="0"
+            max="__MAXSTEP__"
+            value="0"
+            step="1"
+        >
+
+        <div id="status"></div>
+    </div>
 </div>
 
-<script type="importmap">
-{"imports":{
-  "three":"https://unpkg.com/three@0.160.0/build/three.module.js",
-  "three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"
-}}
-</script>
 
-<script type="module">
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+
+
+<script>
+
+if (typeof THREE === "undefined") {
+    document.body.innerHTML =
+        '<div style="padding:20px;color:white;background:#111;font-family:Arial">' +
+        'Three.js could not be loaded.<br>Internet access to the CDN is required for this replay.' +
+        '</div>';
+    throw new Error("Three.js CDN load failed");
+}
 
 const DATA = __PAYLOAD__;
 
-const app = document.getElementById('app');
-const info = document.getElementById('info');
-const timeline = document.getElementById('timeline');
-const statusEl = document.getElementById('status');
+const app =
+    document.getElementById("app");
 
-let frame = 0, playing = false, speed = 1.0, last = null, acc = 0;
+const info =
+    document.getElementById("info");
 
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x101010);
+const timeline =
+    document.getElementById("timeline");
 
-const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 200);
-camera.position.set(0, 11, 10);
+const statusEl =
+    document.getElementById("status");
 
-const renderer = new THREE.WebGLRenderer({antialias:true});
-renderer.setPixelRatio(window.devicePixelRatio);
-renderer.setSize(window.innerWidth, window.innerHeight);
-app.appendChild(renderer.domElement);
 
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(0,0,0);
-controls.update();
+// ============================================================
+// Replay state
+// ============================================================
 
-scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2.0));
-const dir = new THREE.DirectionalLight(0xffffff, 1.3);
-dir.position.set(5,10,5);
-scene.add(dir);
+let replayTime = 0.0;
 
-const ground = new THREE.Mesh(
-  new THREE.PlaneGeometry(10,10),
-  new THREE.MeshStandardMaterial({color:0x303030}));
-ground.rotation.x = -Math.PI/2;
-ground.position.y = -0.02;
-scene.add(ground);
+let playing = false;
 
-const grid = new THREE.GridHelper(10,10,0x777777,0x444444);
-grid.position.y = 0.01;
-scene.add(grid);
+let speed = 1.0;
 
-const wallGeo = new THREE.BoxGeometry(1,0.7,1);
-const wallMat = new THREE.MeshStandardMaterial({color:0x777777});
-for (const p of DATA.walls){
-  const w = new THREE.Mesh(wallGeo, wallMat);
-  w.position.set(p[0], 0.35, p[1]);
-  scene.add(w);
+let lastTimestamp = null;
+
+const DT = DATA.dt;
+
+const FIELD_SIZE = DATA.fieldSize;
+
+const HALF_FIELD = FIELD_SIZE / 2.0;
+
+
+// ============================================================
+// Scene
+// ============================================================
+
+const scene =
+    new THREE.Scene();
+
+scene.background =
+    new THREE.Color(
+        0x101010
+    );
+
+
+const camera =
+    new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth /
+        window.innerHeight,
+        0.1,
+        300
+    );
+
+camera.position.set(
+    0,
+    18,
+    17
+);
+
+
+// ============================================================
+// Renderer
+// ============================================================
+
+const renderer =
+    new THREE.WebGLRenderer({
+        antialias:true
+    });
+
+renderer.setPixelRatio(
+    Math.min(
+        window.devicePixelRatio,
+        2
+    )
+);
+
+renderer.setSize(
+    window.innerWidth,
+    window.innerHeight
+);
+
+app.appendChild(
+    renderer.domElement
+);
+
+if (!renderer.getContext()) {
+    info.innerHTML = "WebGL initialization failed. Try a current Chrome/Edge with hardware acceleration enabled.";
+    throw new Error("WebGL initialization failed");
 }
 
-const soldierGeo = new THREE.BoxGeometry(0.22,0.36,0.22);
-const redMat = new THREE.MeshStandardMaterial({color:0xd94b4b});
-const blueMat = new THREE.MeshStandardMaterial({color:0x4b7bd9});
 
-const redSoldiers = [], blueSoldiers = [];
-for (let i=0;i<100;i++){
-  const r = new THREE.Mesh(soldierGeo, redMat); scene.add(r); redSoldiers.push(r);
-  const b = new THREE.Mesh(soldierGeo, blueMat); scene.add(b); blueSoldiers.push(b);
+// ============================================================
+// Controls (self-contained, no module/addon dependency)
+// ============================================================
+
+const cameraTarget = new THREE.Vector3(0, 0, 0);
+let cameraAzimuth = Math.atan2(17, 0);
+let cameraElevation = Math.atan2(18, Math.hypot(0, 17));
+let cameraDistance = Math.hypot(18, 17);
+let dragging = false;
+let lastPointerX = 0;
+let lastPointerY = 0;
+
+function updateCamera() {
+    const ce = Math.cos(cameraElevation);
+    camera.position.set(
+        cameraTarget.x + cameraDistance * ce * Math.sin(cameraAzimuth),
+        cameraTarget.y + cameraDistance * Math.sin(cameraElevation),
+        cameraTarget.z + cameraDistance * ce * Math.cos(cameraAzimuth)
+    );
+    camera.lookAt(cameraTarget);
 }
 
-const cmdGeo = new THREE.BoxGeometry(0.44,0.8,0.44);
-const redCommander = new THREE.Mesh(cmdGeo, redMat);
-const blueCommander = new THREE.Mesh(cmdGeo, blueMat);
-scene.add(redCommander); scene.add(blueCommander);
-
-const crownGeo = new THREE.ConeGeometry(0.22,0.22,5);
-const crownMat = new THREE.MeshStandardMaterial({color:0xffd83d});
-const redCrown = new THREE.Mesh(crownGeo, crownMat);
-const blueCrown = new THREE.Mesh(crownGeo, crownMat);
-scene.add(redCrown); scene.add(blueCrown);
-
-function updateFrame(i){
-  i = Math.max(0, Math.min(DATA.steps, i));
-  frame = i;
-  timeline.value = i;
-
-  const X = DATA.x[i], Z = DATA.z[i], A = DATA.alive[i];
-
-  for (let k=0;k<100;k++){
-    redSoldiers[k].position.set(X[2+k], 0.18, Z[2+k]);
-    redSoldiers[k].visible = A[2+k] > 0;
-    blueSoldiers[k].position.set(X[102+k], 0.18, Z[102+k]);
-    blueSoldiers[k].visible = A[102+k] > 0;
-  }
-
-  redCommander.position.set(X[0], 0.4, Z[0]);
-  redCommander.visible = A[0] > 0;
-  redCrown.position.set(X[0], 0.9, Z[0]);
-  redCrown.visible = A[0] > 0;
-
-  blueCommander.position.set(X[1], 0.4, Z[1]);
-  blueCommander.visible = A[1] > 0;
-  blueCrown.position.set(X[1], 0.9, Z[1]);
-  blueCrown.visible = A[1] > 0;
-
-  updateInfo();
-}
-
-function updateInfo(){
-  const t = frame * DATA.dt;
-  const A = DATA.alive[frame];
-  let ra=0, ba=0;
-  for (let k=0;k<100;k++){ ra += A[2+k]; ba += A[102+k]; }
-
-  const verify = DATA.verificationPass
-    ? '<span class="pass">Replay verification: PASS</span>'
-    : '<span class="fail">Replay verification: FAIL</span><br>' +
-      'Max state error: ' + DATA.maxStateError.toExponential(2);
-
-  info.innerHTML =
-    '<b>Generation ' + DATA.generation + '</b><br>' +
-    'Elite vs Candidate<br>' +
-    'Winner: <b>' + DATA.winnerLabel + '</b> (' + DATA.winnerSide + ')<br>' +
-    'Battle time: ' + DATA.winTime.toFixed(1) + ' s<br>' +
-    'Step: ' + frame + ' / ' + DATA.steps +
-    '<hr>' +
-    'Replay time: ' + t.toFixed(1) + ' s<br>' +
-    'Red soldiers: ' + ra.toFixed(0) + '<br>' +
-    'Blue soldiers: ' + ba.toFixed(0) + '<br>' +
-    'Red Commander HP: ' + DATA.hp[frame][0].toFixed(2) + '<br>' +
-    'Blue Commander HP: ' + DATA.hp[frame][1].toFixed(2) +
-    '<hr>' +
-    'Result: <b>' + DATA.resultText + '</b><br>' +
-    verify;
-
-  statusEl.textContent = 'Generation ' + DATA.generation +
-    ' | Best Bout | ' + t.toFixed(1) + ' s';
-}
-
-document.getElementById('play').onclick = () => { playing = true; };
-document.getElementById('pause').onclick = () => { playing = false; };
-document.getElementById('reset').onclick = () => { playing = false; updateFrame(0); };
-document.querySelectorAll('button[data-speed]').forEach(b => {
-  b.onclick = () => { speed = parseFloat(b.dataset.speed); };
+renderer.domElement.addEventListener("pointerdown", (event) => {
+    dragging = true;
+    lastPointerX = event.clientX;
+    lastPointerY = event.clientY;
+    renderer.domElement.setPointerCapture(event.pointerId);
 });
-timeline.oninput = () => { playing = false; updateFrame(parseInt(timeline.value)); };
 
-function animate(ts){
-  requestAnimationFrame(animate);
-  if (last === null) last = ts;
-  const d = (ts - last)/1000.0;
-  last = ts;
-  if (playing){
-    acc += d * speed;
-    while (acc >= DATA.dt){
-      acc -= DATA.dt;
-      if (frame >= DATA.steps){ playing = false; break; }
-      updateFrame(frame + 1);
-    }
-  }
-  renderer.render(scene, camera);
+renderer.domElement.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    const dx = event.clientX - lastPointerX;
+    const dy = event.clientY - lastPointerY;
+    lastPointerX = event.clientX;
+    lastPointerY = event.clientY;
+    cameraAzimuth -= dx * 0.008;
+    cameraElevation = Math.max(0.18, Math.min(1.35, cameraElevation + dy * 0.006));
+    updateCamera();
+});
+
+renderer.domElement.addEventListener("pointerup", (event) => {
+    dragging = false;
+    try { renderer.domElement.releasePointerCapture(event.pointerId); } catch (_) {}
+});
+
+renderer.domElement.addEventListener("pointercancel", () => {
+    dragging = false;
+});
+
+renderer.domElement.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    const factor = Math.exp(event.deltaY * 0.001);
+    cameraDistance = Math.max(7, Math.min(45, cameraDistance * factor));
+    updateCamera();
+}, { passive:false });
+
+updateCamera();
+
+
+// ============================================================
+// Lighting
+// ============================================================
+
+scene.add(
+    new THREE.HemisphereLight(
+        0xffffff,
+        0x444444,
+        2.0
+    )
+);
+
+const directional =
+    new THREE.DirectionalLight(
+        0xffffff,
+        1.4
+    );
+
+directional.position.set(
+    6,
+    16,
+    7
+);
+
+scene.add(
+    directional
+);
+
+
+// ============================================================
+// Ground
+// ============================================================
+
+const ground =
+    new THREE.Mesh(
+        new THREE.PlaneGeometry(
+            FIELD_SIZE,
+            FIELD_SIZE
+        ),
+
+        new THREE.MeshStandardMaterial({
+            color:0x303030,
+            roughness:1.0
+        })
+    );
+
+ground.rotation.x =
+    -Math.PI / 2;
+
+ground.position.y =
+    -0.02;
+
+scene.add(
+    ground
+);
+
+
+// ============================================================
+// Grid
+// ============================================================
+
+const grid =
+    new THREE.GridHelper(
+        FIELD_SIZE,
+        16,
+        0x777777,
+        0x444444
+    );
+
+grid.position.y =
+    0.01;
+
+scene.add(
+    grid
+);
+
+
+// ============================================================
+// Starting columns
+// ============================================================
+//
+// One cell at each outer edge.
+// These are intentionally free of walls.
+//
+// Red starting column : x = -7.5
+// Blue starting column: x = +7.5
+// ============================================================
+
+const startZoneRed =
+    new THREE.Mesh(
+        new THREE.PlaneGeometry(
+            1.0,
+            FIELD_SIZE
+        ),
+
+        new THREE.MeshBasicMaterial({
+            color:0xb83d4b,
+            transparent:true,
+            opacity:0.12,
+            side:THREE.DoubleSide
+        })
+    );
+
+startZoneRed.rotation.x =
+    -Math.PI / 2;
+
+startZoneRed.position.set(
+    -HALF_FIELD + 0.5,
+    0.006,
+    0
+);
+
+scene.add(
+    startZoneRed
+);
+
+
+const startZoneBlue =
+    new THREE.Mesh(
+        new THREE.PlaneGeometry(
+            1.0,
+            FIELD_SIZE
+        ),
+
+        new THREE.MeshBasicMaterial({
+            color:0x447bd8,
+            transparent:true,
+            opacity:0.12,
+            side:THREE.DoubleSide
+        })
+    );
+
+startZoneBlue.rotation.x =
+    -Math.PI / 2;
+
+startZoneBlue.position.set(
+    HALF_FIELD - 0.5,
+    0.006,
+    0
+);
+
+scene.add(
+    startZoneBlue
+);
+
+
+// ============================================================
+// Walls
+// ============================================================
+
+const wallGeo =
+    new THREE.BoxGeometry(
+        1.0,
+        0.7,
+        1.0
+    );
+
+const wallMat =
+    new THREE.MeshStandardMaterial({
+        color:0x777777
+    });
+
+for (
+    const p of DATA.walls
+) {
+
+    const wall =
+        new THREE.Mesh(
+            wallGeo,
+            wallMat
+        );
+
+    wall.position.set(
+        p[0],
+        0.35,
+        p[1]
+    );
+
+    scene.add(
+        wall
+    );
 }
 
-window.onresize = () => {
-  camera.aspect = window.innerWidth/window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
+
+// ============================================================
+// Units
+// ============================================================
+
+const soldierGeo =
+    new THREE.BoxGeometry(
+        0.22,
+        0.36,
+        0.22
+    );
+
+const redMat =
+    new THREE.MeshStandardMaterial({
+        color:0xd94b4b
+    });
+
+const blueMat =
+    new THREE.MeshStandardMaterial({
+        color:0x4b7bd9
+    });
+
+
+const redSoldiers = [];
+
+const blueSoldiers = [];
+
+
+for (
+    let i = 0;
+    i < 100;
+    i++
+) {
+
+    const red =
+        new THREE.Mesh(
+            soldierGeo,
+            redMat
+        );
+
+    scene.add(
+        red
+    );
+
+    redSoldiers.push(
+        red
+    );
+
+
+    const blue =
+        new THREE.Mesh(
+            soldierGeo,
+            blueMat
+        );
+
+    scene.add(
+        blue
+    );
+
+    blueSoldiers.push(
+        blue
+    );
+}
+
+
+// ============================================================
+// Commanders
+// ============================================================
+
+const commanderGeo =
+    new THREE.BoxGeometry(
+        0.44,
+        0.8,
+        0.44
+    );
+
+const redCommander =
+    new THREE.Mesh(
+        commanderGeo,
+        redMat
+    );
+
+const blueCommander =
+    new THREE.Mesh(
+        commanderGeo,
+        blueMat
+    );
+
+scene.add(
+    redCommander
+);
+
+scene.add(
+    blueCommander
+);
+
+
+// ============================================================
+// Crowns
+// ============================================================
+
+const crownGeo =
+    new THREE.ConeGeometry(
+        0.22,
+        0.22,
+        5
+    );
+
+const crownMat =
+    new THREE.MeshStandardMaterial({
+        color:0xffd83d
+    });
+
+const redCrown =
+    new THREE.Mesh(
+        crownGeo,
+        crownMat
+    );
+
+const blueCrown =
+    new THREE.Mesh(
+        crownGeo,
+        crownMat
+    );
+
+scene.add(
+    redCrown
+);
+
+scene.add(
+    blueCrown
+);
+
+
+// ============================================================
+// Attack visualization
+// ============================================================
+//
+// A bright line is drawn from each attacking soldier to the
+// nearest enemy inside ATTACK_RANGE.
+//
+// In addition, a small yellow sphere flashes at the attacker.
+// This makes attacks visible even when units are close together.
+// ============================================================
+
+const ATTACK_RANGE =
+    0.42;
+
+
+const redAttackMaterial =
+    new THREE.LineBasicMaterial({
+        color:0xffc857,
+        transparent:true,
+        opacity:0.9
+    });
+
+const blueAttackMaterial =
+    new THREE.LineBasicMaterial({
+        color:0xffc857,
+        transparent:true,
+        opacity:0.9
+    });
+
+
+const redAttackGeometry =
+    new THREE.BufferGeometry();
+
+const blueAttackGeometry =
+    new THREE.BufferGeometry();
+
+
+const redAttackLines =
+    new THREE.LineSegments(
+        redAttackGeometry,
+        redAttackMaterial
+    );
+
+const blueAttackLines =
+    new THREE.LineSegments(
+        blueAttackGeometry,
+        blueAttackMaterial
+    );
+
+scene.add(
+    redAttackLines
+);
+
+scene.add(
+    blueAttackLines
+);
+
+
+const flashGeo =
+    new THREE.SphereGeometry(
+        0.09,
+        8,
+        8
+    );
+
+const flashMat =
+    new THREE.MeshBasicMaterial({
+        color:0xffe36b,
+        transparent:true
+    });
+
+
+const redFlashes = [];
+
+const blueFlashes = [];
+
+
+for (
+    let i = 0;
+    i < 100;
+    i++
+) {
+
+    const rf =
+        new THREE.Mesh(
+            flashGeo,
+            flashMat
+        );
+
+    rf.visible = false;
+
+    scene.add(
+        rf
+    );
+
+    redFlashes.push(
+        rf
+    );
+
+
+    const bf =
+        new THREE.Mesh(
+            flashGeo,
+            flashMat
+        );
+
+    bf.visible = false;
+
+    scene.add(
+        bf
+    );
+
+    blueFlashes.push(
+        bf
+    );
+}
+
+
+// ============================================================
+// Helper: interpolate position
+// ============================================================
+
+function lerp(
+    a,
+    b,
+    t
+) {
+    return a + (b - a) * t;
+}
+
+
+function getReplayFrame() {
+
+    const clampedTime =
+        Math.max(
+            0,
+            Math.min(
+                DATA.steps * DT,
+                replayTime
+            )
+        );
+
+    const rawFrame =
+        clampedTime / DT;
+
+    const i =
+        Math.min(
+            Math.floor(
+                rawFrame
+            ),
+            DATA.steps
+        );
+
+    const alpha =
+        i >= DATA.steps
+            ? 0
+            : rawFrame - i;
+
+    return {
+        i,
+        alpha,
+        time:clampedTime
+    };
+}
+
+
+// ============================================================
+// Attack target search
+// ============================================================
+
+function nearestEnemy(
+    frame,
+    attackerIndex,
+    enemyStart,
+    enemyEnd
+) {
+
+    const ax =
+        frame.x[
+            attackerIndex
+        ];
+
+    const az =
+        frame.z[
+            attackerIndex
+        ];
+
+    let bestIndex = -1;
+
+    let bestDist2 =
+        ATTACK_RANGE
+        * ATTACK_RANGE;
+
+
+    for (
+        let j = enemyStart;
+        j < enemyEnd;
+        j++
+    ) {
+
+        if (
+            !frame.alive[j]
+        ) {
+            continue;
+        }
+
+        const dx =
+            frame.x[j] - ax;
+
+        const dz =
+            frame.z[j] - az;
+
+        const dist2 =
+            dx * dx + dz * dz;
+
+        if (
+            dist2 <= bestDist2
+        ) {
+
+            bestDist2 =
+                dist2;
+
+            bestIndex =
+                j;
+        }
+    }
+
+    return bestIndex;
+}
+
+
+// ============================================================
+// Attack visualization
+// ============================================================
+
+function updateAttackEffects(
+    stepIndex,
+    attackAlpha
+) {
+
+    if (
+        stepIndex
+        >= DATA.steps
+    ) {
+
+        redAttackGeometry.setAttribute(
+            "position",
+            new THREE.Float32BufferAttribute(
+                [],
+                3
+            )
+        );
+
+        blueAttackGeometry.setAttribute(
+            "position",
+            new THREE.Float32BufferAttribute(
+                [],
+                3
+            )
+        );
+
+        for (
+            const f of redFlashes
+        ) {
+            f.visible = false;
+        }
+
+        for (
+            const f of blueFlashes
+        ) {
+            f.visible = false;
+        }
+
+        return;
+    }
+
+
+    const frame = {
+        x:
+            DATA.x[
+                stepIndex
+            ],
+
+        z:
+            DATA.z[
+                stepIndex
+            ],
+
+        alive:
+            DATA.alive[
+                stepIndex
+            ]
+    };
+
+
+    const redAttack =
+        DATA.redActions[
+            stepIndex
+        ];
+
+    const blueAttack =
+        DATA.blueActions[
+            stepIndex
+        ];
+
+
+    const redPositions = [];
+
+    const bluePositions = [];
+
+
+    // --------------------------------------------------------
+    // Red attacks
+    // --------------------------------------------------------
+
+    for (
+        let i = 0;
+        i < 100;
+        i++
+    ) {
+
+        const attack =
+            redAttack[
+                3 * i + 2
+            ] > 0.5;
+
+        redFlashes[i].visible =
+            false;
+
+        if (
+            !attack
+            || !frame.alive[
+                2 + i
+            ]
+        ) {
+            continue;
+        }
+
+        const attacker =
+            2 + i;
+
+        const target =
+            nearestEnemy(
+                frame,
+                attacker,
+                102,
+                202
+            );
+
+        if (
+            target < 0
+        ) {
+            continue;
+        }
+
+        redPositions.push(
+            frame.x[attacker],
+            0.35,
+            frame.z[attacker],
+
+            frame.x[target],
+            0.35,
+            frame.z[target]
+        );
+
+        redFlashes[i].position.set(
+            frame.x[attacker],
+            0.38,
+            frame.z[attacker]
+        );
+
+        redFlashes[i].visible =
+            true;
+
+        redFlashes[i].scale.setScalar(
+            1.0
+            + 0.8 * attackAlpha
+        );
+    }
+
+
+    // --------------------------------------------------------
+    // Blue attacks
+    // --------------------------------------------------------
+
+    for (
+        let i = 0;
+        i < 100;
+        i++
+    ) {
+
+        const attack =
+            blueAttack[
+                3 * i + 2
+            ] > 0.5;
+
+        blueFlashes[i].visible =
+            false;
+
+        if (
+            !attack
+            || !frame.alive[
+                102 + i
+            ]
+        ) {
+            continue;
+        }
+
+        const attacker =
+            102 + i;
+
+        const target =
+            nearestEnemy(
+                frame,
+                attacker,
+                2,
+                102
+            );
+
+        if (
+            target < 0
+        ) {
+            continue;
+        }
+
+        bluePositions.push(
+            frame.x[attacker],
+            0.35,
+            frame.z[attacker],
+
+            frame.x[target],
+            0.35,
+            frame.z[target]
+        );
+
+        blueFlashes[i].position.set(
+            frame.x[attacker],
+            0.38,
+            frame.z[attacker]
+        );
+
+        blueFlashes[i].visible =
+            true;
+
+        blueFlashes[i].scale.setScalar(
+            1.0
+            + 0.8 * attackAlpha
+        );
+    }
+
+
+    redAttackGeometry.setAttribute(
+        "position",
+        new THREE.Float32BufferAttribute(
+            redPositions,
+            3
+        )
+    );
+
+    redAttackGeometry.computeBoundingSphere();
+
+    blueAttackGeometry.setAttribute(
+        "position",
+        new THREE.Float32BufferAttribute(
+            bluePositions,
+            3
+        )
+    );
+
+    blueAttackGeometry.computeBoundingSphere();
+
+
+    redAttackMaterial.opacity =
+        0.35
+        + 0.65 * attackAlpha;
+
+    blueAttackMaterial.opacity =
+        0.35
+        + 0.65 * attackAlpha;
+}
+
+
+// ============================================================
+// Update replay
+// ============================================================
+
+function updateReplay() {
+
+    const rf =
+        getReplayFrame();
+
+    const i =
+        rf.i;
+
+    const alpha =
+        rf.alpha;
+
+
+    timeline.value =
+        i;
+
+
+    const x0 =
+        DATA.x[i];
+
+    const z0 =
+        DATA.z[i];
+
+    const a0 =
+        DATA.alive[i];
+
+
+    const hasNext =
+        i < DATA.steps;
+
+
+    const x1 =
+        hasNext
+            ? DATA.x[i + 1]
+            : x0;
+
+    const z1 =
+        hasNext
+            ? DATA.z[i + 1]
+            : z0;
+
+    const a1 =
+        hasNext
+            ? DATA.alive[i + 1]
+            : a0;
+
+
+    // --------------------------------------------------------
+    // Soldiers
+    // --------------------------------------------------------
+
+    for (
+        let k = 0;
+        k < 100;
+        k++
+    ) {
+
+        const index =
+            2 + k;
+
+        const visible =
+            Boolean(
+                a0[index]
+            );
+
+        redSoldiers[k].visible =
+            visible;
+
+        if (
+            visible
+        ) {
+
+            redSoldiers[k].position.set(
+                lerp(
+                    x0[index],
+                    x1[index],
+                    alpha
+                ),
+                0.18,
+                lerp(
+                    z0[index],
+                    z1[index],
+                    alpha
+                )
+            );
+        }
+    }
+
+
+    for (
+        let k = 0;
+        k < 100;
+        k++
+    ) {
+
+        const index =
+            102 + k;
+
+        const visible =
+            Boolean(
+                a0[index]
+            );
+
+        blueSoldiers[k].visible =
+            visible;
+
+        if (
+            visible
+        ) {
+
+            blueSoldiers[k].position.set(
+                lerp(
+                    x0[index],
+                    x1[index],
+                    alpha
+                ),
+                0.18,
+                lerp(
+                    z0[index],
+                    z1[index],
+                    alpha
+                )
+            );
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // Commanders
+    // --------------------------------------------------------
+
+    redCommander.visible =
+        Boolean(
+            a0[0]
+        );
+
+    blueCommander.visible =
+        Boolean(
+            a0[1]
+        );
+
+
+    if (
+        redCommander.visible
+    ) {
+
+        redCommander.position.set(
+            lerp(
+                x0[0],
+                x1[0],
+                alpha
+            ),
+            0.4,
+            lerp(
+                z0[0],
+                z1[0],
+                alpha
+            )
+        );
+
+        redCrown.position.set(
+            redCommander.position.x,
+            0.9,
+            redCommander.position.z
+        );
+
+        redCrown.visible =
+            true;
+
+    } else {
+
+        redCrown.visible =
+            false;
+    }
+
+
+    if (
+        blueCommander.visible
+    ) {
+
+        blueCommander.position.set(
+            lerp(
+                x0[1],
+                x1[1],
+                alpha
+            ),
+            0.4,
+            lerp(
+                z0[1],
+                z1[1],
+                alpha
+            )
+        );
+
+        blueCrown.position.set(
+            blueCommander.position.x,
+            0.9,
+            blueCommander.position.z
+        );
+
+        blueCrown.visible =
+            true;
+
+    } else {
+
+        blueCrown.visible =
+            false;
+    }
+
+
+    // --------------------------------------------------------
+    // Attack effects
+    // --------------------------------------------------------
+
+    const attackAlpha =
+        hasNext
+            ? (
+                1.0
+                - alpha
+            )
+            : 0.0;
+
+    updateAttackEffects(
+        i,
+        attackAlpha
+    );
+
+
+    // --------------------------------------------------------
+    // Information
+    // --------------------------------------------------------
+
+    let redAlive =
+        0;
+
+    let blueAlive =
+        0;
+
+
+    for (
+        let k = 0;
+        k < 100;
+        k++
+    ) {
+
+        redAlive +=
+            a0[2 + k];
+
+        blueAlive +=
+            a0[102 + k];
+    }
+
+
+    let redAttacks = 0;
+
+    let blueAttacks = 0;
+
+
+    if (
+        i < DATA.steps
+    ) {
+
+        const ra =
+            DATA.redActions[i];
+
+        const ba =
+            DATA.blueActions[i];
+
+
+        for (
+            let k = 0;
+            k < 100;
+            k++
+        ) {
+
+            if (
+                ra[
+                    3 * k + 2
+                ] > 0.5
+            ) {
+                redAttacks++;
+            }
+
+
+            if (
+                ba[
+                    3 * k + 2
+                ] > 0.5
+            ) {
+                blueAttacks++;
+            }
+        }
+    }
+
+
+    const t =
+        rf.time;
+
+
+    const verify =
+        DATA.verificationPass
+            ? '<span class="pass">Replay verification: PASS</span>'
+            : '<span class="fail">Replay verification: FAIL</span><br>' +
+              'Max state error: ' +
+              DATA.maxStateError.toExponential(2);
+
+
+    info.innerHTML =
+        "<b>Generation " +
+        DATA.generation +
+        "</b><br>" +
+
+        "Winner: <b>" +
+        DATA.winnerLabel +
+        "</b> (" +
+        DATA.winnerSide +
+        ")<br>" +
+
+        "Battle time: " +
+        DATA.winTime.toFixed(1) +
+        " s<br>" +
+
+        "Replay time: " +
+        t.toFixed(2) +
+        " s<br>" +
+
+        "Step: " +
+        i +
+        " / " +
+        DATA.steps +
+
+        "<hr>" +
+
+        "Red soldiers: " +
+        redAlive.toFixed(0) +
+        "<br>" +
+
+        "Blue soldiers: " +
+        blueAlive.toFixed(0) +
+        "<br>" +
+
+        "Red Commander HP: " +
+        DATA.hp[i][0].toFixed(2) +
+        "<br>" +
+
+        "Blue Commander HP: " +
+        DATA.hp[i][1].toFixed(2) +
+
+        "<hr>" +
+
+        '<span class="attack">Red attacks: ' +
+        redAttacks +
+        "</span><br>" +
+
+        '<span class="attack">Blue attacks: ' +
+        blueAttacks +
+        "</span><br>" +
+
+        "<span class=\"startzone\">" +
+        "Starting columns: highlighted" +
+        "</span>" +
+
+        "<hr>" +
+
+        "Result: <b>" +
+        DATA.resultText +
+        "</b><br>" +
+
+        verify;
+
+
+    statusEl.textContent =
+        "Generation " +
+        DATA.generation +
+        " | Best Bout | " +
+        t.toFixed(2) +
+        " s";
+}
+
+
+// ============================================================
+// Controls
+// ============================================================
+
+document.getElementById(
+    "play"
+).onclick = () => {
+    playing = true;
 };
 
-updateFrame(0);
-requestAnimationFrame(animate);
-</script></body></html>
+
+document.getElementById(
+    "pause"
+).onclick = () => {
+    playing = false;
+};
+
+
+document.getElementById(
+    "reset"
+).onclick = () => {
+
+    playing = false;
+
+    replayTime = 0.0;
+
+    updateReplay();
+};
+
+
+document.querySelectorAll(
+    "button[data-speed]"
+).forEach(
+    button => {
+
+        button.onclick =
+            () => {
+
+                speed =
+                    parseFloat(
+                        button.dataset.speed
+                    );
+            };
+    }
+);
+
+
+timeline.oninput =
+    () => {
+
+        playing = false;
+
+        replayTime =
+            parseInt(
+                timeline.value
+            )
+            * DT;
+
+        updateReplay();
+    };
+
+
+// ============================================================
+// Animation
+// ============================================================
+
+function animate(
+    timestamp
+) {
+
+    requestAnimationFrame(
+        animate
+    );
+
+
+    if (
+        lastTimestamp === null
+    ) {
+
+        lastTimestamp =
+            timestamp;
+    }
+
+
+    const delta =
+        Math.min(
+            0.05,
+            (
+                timestamp
+                - lastTimestamp
+            )
+            / 1000.0
+        );
+
+
+    lastTimestamp =
+        timestamp;
+
+
+    if (
+        playing
+    ) {
+
+        replayTime +=
+            delta * speed;
+
+
+        const maxTime =
+            DATA.steps * DT;
+
+
+        if (
+            replayTime >= maxTime
+        ) {
+
+            replayTime =
+                maxTime;
+
+            playing =
+                false;
+        }
+    }
+
+
+    updateReplay();
+
+
+    renderer.render(
+        scene,
+        camera
+    );
+}
+
+
+// ============================================================
+// Resize
+// ============================================================
+
+window.addEventListener(
+    "resize",
+    () => {
+
+        camera.aspect =
+            window.innerWidth /
+            window.innerHeight;
+
+        camera.updateProjectionMatrix();
+
+        renderer.setSize(
+            window.innerWidth,
+            window.innerHeight
+        );
+    }
+);
+
+
+// ============================================================
+// Start
+// ============================================================
+
+updateReplay();
+
+requestAnimationFrame(
+    animate
+);
+
+</script>
+</body>
+</html>
 """
 
-    html = html.replace("__MAXSTEP__", str(n_frames - 1)).replace("__PAYLOAD__", payload)
+    html = (
+        html
+        .replace(
+            "__MAXSTEP__",
+            str(
+                n_frames - 1
+            ),
+        )
+        .replace(
+            "__PAYLOAD__",
+            payload,
+        )
+    )
 
     if out_path is None:
-        out_path = os.path.join(REPLAY_DIR,
-                                f"replay_generation_{generation:04d}.html")
+        out_path = os.path.join(
+            REPLAY_DIR,
+            (
+                f"replay_generation_"
+                f"{generation:04d}.html"
+            ),
+        )
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    with open(
+        out_path,
+        "w",
+        encoding="utf-8",
+    ) as f:
 
-    return out_path, html
+        f.write(
+            html
+        )
+
+    return (
+        out_path,
+        html,
+    )
+
+
+def _replay_file_compatible(path):
+    try:
+        with np.load(path, allow_pickle=False) as d:
+            if "field_size" not in d or "obs_size" not in d or "terrain_res" not in d:
+                return False
+            return (
+                abs(float(d["field_size"]) - FIELD_SIZE) < 1e-6
+                and int(d["obs_size"]) == OBS_SIZE
+                and int(d["terrain_res"]) == TERRAIN_RES
+            )
+    except Exception:
+        return False
 
 
 def show_replay(generation=None):
     """
-    generation=None -> latest saved Best Bout.
-    Writes an HTML file and, inside a notebook, displays it inline.
+    generation=None -> latest Best Bout compatible with the current environment.
     """
-    files = sorted(glob.glob(os.path.join(BOUT_DIR, "generation_*_best_bout.npz")),
-                   key=generation_number)
-    if not files:
-        raise FileNotFoundError(f"No Best Bout found in {os.path.abspath(BOUT_DIR)}")
+    files = sorted(
+        glob.glob(os.path.join(BOUT_DIR, "generation_*_best_bout.npz")),
+        key=generation_number,
+    )
+    compatible = [f for f in files if _replay_file_compatible(f)]
+    if not compatible:
+        raise FileNotFoundError(
+            f"No compatible Best Bout found in {os.path.abspath(BOUT_DIR)}"
+        )
 
     if generation is None:
-        bout_path = files[-1]
+        bout_path = compatible[-1]
     else:
-        bout_path = os.path.join(BOUT_DIR, f"generation_{generation:04d}_best_bout.npz")
+        bout_path = os.path.join(
+            BOUT_DIR,
+            f"generation_{generation:04d}_best_bout.npz",
+        )
         if not os.path.exists(bout_path):
             raise FileNotFoundError(bout_path)
+        if not _replay_file_compatible(bout_path):
+            raise ValueError(
+                f"Generation {generation} Best Bout is incompatible with the current environment."
+            )
 
     out_path, html = build_replay_html(bout_path)
 
@@ -1613,7 +3647,8 @@ def show_replay(generation=None):
 if __name__ == "__main__":
     latest = train(n_generations=N_GENERATIONS, resume=True)
     try:
-        path = show_replay()
+        replay_generation = LAST_COMPLETED_GENERATION
+        path = show_replay(replay_generation) if replay_generation is not None else show_replay()
         print("Replay written to:", os.path.abspath(path))
     except FileNotFoundError as e:
         print("Replay skipped:", e)
