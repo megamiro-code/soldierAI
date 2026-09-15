@@ -482,9 +482,10 @@ def step_one(state, red_action, blue_action):
     target = jnp.argmin(jnp.where(valid_target, dist2, 1e9), axis=1)
     has_target = jnp.any(valid_target, axis=1)
 
-    can_attack = ((move_at[ALL_SOLDIER_INDICES] > 0.5) & has_target &
-                  (attack_timer[ALL_SOLDIER_INDICES] <= 0) &
-                  (alive[ALL_SOLDIER_INDICES] > 0))
+    attack_attempt = ((move_at[ALL_SOLDIER_INDICES] > 0.5) &
+                      (attack_timer[ALL_SOLDIER_INDICES] <= 0) &
+                      (alive[ALL_SOLDIER_INDICES] > 0))
+    can_attack = attack_attempt & has_target
 
     damage_values = ATTACK_DAMAGE * can_attack.astype(jnp.float32)
 
@@ -503,7 +504,7 @@ def step_one(state, red_action, blue_action):
 
     old_t = attack_timer[ALL_SOLDIER_INDICES]
     attack_timer = attack_timer.at[ALL_SOLDIER_INDICES].set(
-        jnp.where(can_attack, ATTACK_COOLDOWN, old_t))
+        jnp.where(attack_attempt, ATTACK_COOLDOWN, old_t))
 
     new_time = state["time"] + DT
 
@@ -1242,6 +1243,7 @@ def save_best_bout(path, generation, match, best_idx, bout,
         "terrain_res": np.array(TERRAIN_RES, dtype=np.int32),
         "obs_size": np.array(OBS_SIZE, dtype=np.int32),
         "action_size": np.array(ACTION_SIZE, dtype=np.int32),
+        "attack_cooldown": np.array(ATTACK_COOLDOWN, dtype=np.float32),
 
         "start_x": np.asarray(bout["x"][0]),
         "start_z": np.asarray(bout["z"][0]),
@@ -1726,6 +1728,7 @@ def build_replay_html(bout_path, out_path=None):
         "alive": alive.astype(np.uint8).tolist(),
         "redActions": np.round(red_actions, 3).tolist(),
         "blueActions": np.round(blue_actions, 3).tolist(),
+        "attackCooldown": float(ATTACK_COOLDOWN),
     }, separators=(",", ":"))
 
     html = r'''<!DOCTYPE html>
@@ -1776,11 +1779,48 @@ try{
  const cooldownGeo=new THREE.TorusGeometry(.20,.035,8,20), cooldownMat=new THREE.MeshBasicMaterial({color:0xffff55,transparent:true,opacity:.9});
  function clearAttacks(){while(attackGroup.children.length){const o=attackGroup.children.pop();if(o.geometry)o.geometry.dispose();}}
  function nearestEnemy(idx,team,X,Z,A){const start=team===0?102:0,end=team===0?202:102;let best=-1,bestD2=.42*.42,ax=X[idx],az=Z[idx];for(let j=start;j<end;j++){if(!A[j])continue;const dx=X[j]-ax,dz=Z[j]-az,d2=dx*dx+dz*dz;if(d2<=bestD2){bestD2=d2;best=j;}}return best;}
- function addAttackEffects(i,alpha){clearAttacks();if(i>=DATA.steps)return{red:0,blue:0};const X=DATA.x[i],Z=DATA.z[i],A=DATA.alive[i];let rc=0,bc=0;const teams=[{team:0,actions:DATA.redActions[i],prev: i>0?DATA.redActions[i-1]:null},{team:1,actions:DATA.blueActions[i],prev:i>0?DATA.blueActions[i-1]:null}];for(const e of teams){if(!e.actions)continue;for(let k=0;k<100;k++){const idx=e.team===0?2+k:102+k;if(!A[idx])continue;const attackNow=e.actions[3*k+2]>.5;if(attackNow){const target=nearestEnemy(idx,e.team,X,Z,A);const s=new THREE.Vector3(X[idx],.48,Z[idx]);const t=target>=0?new THREE.Vector3(X[target],.55,Z[target]):new THREE.Vector3(X[idx]+(e.team===0?.35:-.35),.48,Z[idx]);const g=new THREE.BufferGeometry().setFromPoints([s,t]);const m=new THREE.LineBasicMaterial({color:0xffd83d,transparent:true,opacity:.45+.5*alpha});attackGroup.add(new THREE.Line(g,m));const f=new THREE.Mesh(flashGeo,flashMat);f.position.copy(s);attackGroup.add(f);if(e.team===0)rc++;else bc++;}
-    let cooldown=false;
-    for(let d=1;d<=3;d++){const j=i-d;if(j>=0 && DATA[e.team===0?'redActions':'blueActions'][j] && DATA[e.team===0?'redActions':'blueActions'][j][3*k+2]>.5){cooldown=true;break;}}
-    if(cooldown){const ring=new THREE.Mesh(cooldownGeo,cooldownMat);ring.rotation.x=Math.PI/2;ring.position.set(X[idx],.025,Z[idx]);attackGroup.add(ring);}
-  }}return{red:rc,blue:bc};}
+ function addAttackEffects(i,alpha){
+  clearAttacks();
+  if(i>=DATA.steps)return{red:0,blue:0};
+  const X0=DATA.x[i], Z0=DATA.z[i], A=DATA.alive[i];
+  const X1=i<DATA.steps?DATA.x[i+1]:X0, Z1=i<DATA.steps?DATA.z[i+1]:Z0;
+  const px=k=>X0[k]+(X1[k]-X0[k])*alpha;
+  const pz=k=>Z0[k]+(Z1[k]-Z0[k])*alpha;
+  const cooldownSteps=Math.max(1,Math.ceil(DATA.attackCooldown/DATA.dt));
+  let rc=0,bc=0;
+  const teams=[{team:0,actions:DATA.redActions[i]},{team:1,actions:DATA.blueActions[i]}];
+  for(const e of teams){
+    if(!e.actions)continue;
+    const history=DATA[e.team===0?'redActions':'blueActions'];
+    for(let k=0;k<100;k++){
+      const idx=e.team===0?2+k:102+k;
+      if(!A[idx])continue;
+      const attackNow=e.actions[3*k+2]>.5;
+      if(attackNow){
+        const target=nearestEnemy(idx,e.team,X0,Z0,A);
+        const s=new THREE.Vector3(px(idx),.48,pz(idx));
+        const t=target>=0?new THREE.Vector3(px(target),.55,pz(target)):new THREE.Vector3(px(idx)+(e.team===0?.35:-.35),.48,pz(idx));
+        const g=new THREE.BufferGeometry().setFromPoints([s,t]);
+        const m=new THREE.LineBasicMaterial({color:0xffd83d,transparent:true,opacity:.45+.5*alpha});
+        attackGroup.add(new THREE.Line(g,m));
+        const f=new THREE.Mesh(flashGeo,flashMat);f.position.copy(s);attackGroup.add(f);
+        if(e.team===0)rc++;else bc++;
+      }
+      let cooldown=false;
+      for(let d=1;d<=cooldownSteps;d++){
+        const j=i-d;
+        if(j>=0 && history[j] && history[j][3*k+2]>.5){cooldown=true;break;}
+      }
+      if(cooldown){
+        const ring=new THREE.Mesh(cooldownGeo,cooldownMat);
+        ring.rotation.x=Math.PI/2;
+        ring.position.set(px(idx),.025,pz(idx));
+        attackGroup.add(ring);
+      }
+    }
+  }
+  return{red:rc,blue:bc};
+}
  function frameInfo(){const t=Math.max(0,Math.min(DATA.steps*DATA.dt,replayTime)),raw=t/DATA.dt,i=Math.min(Math.floor(raw),DATA.steps),a=i>=DATA.steps?0:raw-i;return{t,i,a};}
  function updateReplay(){const f=frameInfo(),i=f.i,a=f.a;timeline.value=String(i);const X0=DATA.x[i],Z0=DATA.z[i],A=DATA.alive[i],X1=i<DATA.steps?DATA.x[i+1]:X0,Z1=i<DATA.steps?DATA.z[i+1]:Z0,px=k=>X0[k]+(X1[k]-X0[k])*a,pz=k=>Z0[k]+(Z1[k]-Z0[k])*a;
   function inCooldown(actions,k){
@@ -1793,12 +1833,8 @@ try{
    // Replay the saved simulation coordinates exactly.
    // Do not infer or reimplement cooldown movement here; the simulation
    // already stored the true stopped positions in DATA.x / DATA.z.
-   const redCooling = inCooldown(DATA.redActions,k);
-   const blueCooling = inCooldown(DATA.blueActions,k);
    redSoldiers[k].position.set(px(ridx),.18,pz(ridx));redSoldiers[k].visible=A[ridx]>0;
    blueSoldiers[k].position.set(px(bidx),.18,pz(bidx));blueSoldiers[k].visible=A[bidx]>0;
-   redSoldiers[k].scale.setScalar(redCooling?1.08:1.0);
-   blueSoldiers[k].scale.setScalar(blueCooling?1.08:1.0);
   }
   redCommander.position.set(px(0),.4,pz(0));redCommander.visible=A[0]>0;redCrown.position.set(px(0),.9,pz(0));redCrown.visible=A[0]>0;blueCommander.position.set(px(1),.4,pz(1));blueCommander.visible=A[1]>0;blueCrown.position.set(px(1),.9,pz(1));blueCrown.visible=A[1]>0;
   const at=addAttackEffects(i,1-a);let ra=0,ba=0;for(let k=0;k<100;k++){ra+=A[2+k];ba+=A[102+k];}const verify=DATA.verificationPass?'<span class="pass">Replay verification: PASS</span>':'<span class="fail">Replay verification: FAIL</span><br>Max state error: '+DATA.maxStateError.toExponential(2);info.innerHTML='<b>Generation '+DATA.generation+'</b><br>Winner: <b>'+DATA.winnerLabel+'</b> ('+DATA.winnerSide+')<br>Battle time: '+DATA.winTime.toFixed(1)+' s<br>Replay time: '+f.t.toFixed(2)+' s<br>Step: '+i+' / '+DATA.steps+'<hr>Red soldiers: '+ra+'<br>Blue soldiers: '+ba+'<br>Red Commander HP: '+DATA.hp[i][0].toFixed(2)+'<br>Blue Commander HP: '+DATA.hp[i][1].toFixed(2)+'<hr><span class="attack">Red attacks: '+at.red+'</span><br><span class="attack">Blue attacks: '+at.blue+'</span><hr>Result: <b>'+DATA.resultText+'</b><br>'+verify;statusEl.textContent='Generation '+DATA.generation+' | Best Bout | '+f.t.toFixed(2)+' s';}
