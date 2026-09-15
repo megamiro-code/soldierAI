@@ -103,10 +103,10 @@ ALL_UNIT_INDICES = jnp.arange(
 # ------------------------------------------------------------
 
 WALL_LIST = [
-    [-6.5, -6.5],
-    [-6.5,  6.5],
-    [ 6.5, -6.5],
-    [ 6.5,  6.5],
+    [-5.5, -6.5],
+    [-5.5,  6.5],
+    [ 5.5, -6.5],
+    [ 5.5,  6.5],
 
     [-1.0, -1.0],
     [-1.0,  1.0],
@@ -213,16 +213,12 @@ def reset_one(key):
         starts from the rightmost column, which is farthest from
         the Red commander.
 
-    The 100 soldiers form a compact 10 x 10 formation:
-        - 10 soldiers in the first rank
-        - 10 ranks in depth
+    The 100 soldiers occupy the two columns farthest from the enemy,
+    across 10 rows, with 5 soldiers inside each 1 x 1 cell:
+        2 columns x 10 rows x 5 soldiers = 100 soldiers.
 
-    Spacing is 0.48, comfortably larger than the soldier diameter
-    (2 * SOLDIER_RADIUS = 0.26) while avoiding an excessively sparse
-    formation.
-
-    The outermost starting column is reserved for the formation;
-    no wall is placed there.
+    Each group of five forms a compact regular pentagon inside its cell.
+    Both starting columns are reserved for the formation; no wall is placed there.
     """
 
     del key
@@ -271,115 +267,47 @@ def reset_one(key):
     # Commanders
     # --------------------------------------------------------
 
-    # Commanders sit just behind their own formation.
-    x = x.at[
-        RED_COMMANDER_INDEX
-    ].set(-6.60)
+    # Commanders sit just behind the two-column starting area.
+    x = x.at[RED_COMMANDER_INDEX].set(-5.80)
+    z = z.at[RED_COMMANDER_INDEX].set(0.0)
+    x = x.at[BLUE_COMMANDER_INDEX].set(5.80)
+    z = z.at[BLUE_COMMANDER_INDEX].set(0.0)
 
-    z = z.at[
-        RED_COMMANDER_INDEX
-    ].set(0.0)
-
-    x = x.at[
-        BLUE_COMMANDER_INDEX
-    ].set(6.60)
-
-    z = z.at[
-        BLUE_COMMANDER_INDEX
-    ].set(0.0)
-
-    speed = speed.at[
-        RED_COMMANDER_INDEX
-    ].set(0.20)
-
-    speed = speed.at[
-        BLUE_COMMANDER_INDEX
-    ].set(0.20)
+    speed = speed.at[RED_COMMANDER_INDEX].set(0.20)
+    speed = speed.at[BLUE_COMMANDER_INDEX].set(0.20)
 
     # --------------------------------------------------------
-    # Fixed 10 x 10 soldier formation
+    # Fixed 2 x 10 cell starting formation
     # --------------------------------------------------------
+    # Each side occupies the two columns farthest from the enemy:
+    #   Red  : x = -7.5, -6.5
+    #   Blue : x = +7.5, +6.5
+    # There are 10 rows (z = -4.5 ... +4.5), with 5 soldiers
+    # packed inside each 1 x 1 cell. Total: 2 x 10 x 5 = 100.
+    cell_x = jnp.array([-7.5, -6.5], dtype=jnp.float32)
+    row_z = jnp.arange(10, dtype=jnp.float32) - 4.5
 
-    spacing = 0.48
+    # Regular pentagon, radius 0.29.
+    # Nearest-neighbour spacing is about 0.34 > 2*SOLDIER_RADIUS.
+    angles = jnp.arange(5, dtype=jnp.float32) * (2.0 * jnp.pi / 5.0)
+    offsets_x = 0.29 * jnp.cos(angles)
+    offsets_z = 0.29 * jnp.sin(angles)
 
-    formation_side = 10
+    # 20 cells in row-major order, each repeated with 5 local offsets.
+    cx, rz = jnp.meshgrid(cell_x, row_z)
+    cx = cx.reshape(-1)
+    rz = rz.reshape(-1)
+    red_x = (cx[:, None] + offsets_x[None, :]).reshape(-1)
+    red_z = (rz[:, None] + offsets_z[None, :]).reshape(-1)
 
-    # z positions:
-    # -2.16, -1.68, ... , +2.16
-    z_positions = (
-        (
-            jnp.arange(
-                formation_side,
-                dtype=jnp.float32,
-            )
-            - 4.5
-        )
-        * spacing
-    )
+    # Blue mirrors Red across x=0.
+    blue_x = -red_x
+    blue_z = red_z
 
-    # x positions start inside the outermost column and extend
-    # inward toward the commander.
-    red_x_positions = (
-        -7.30
-        + jnp.arange(
-            formation_side,
-            dtype=jnp.float32,
-        )
-        * spacing
-    )
-
-    blue_x_positions = (
-        7.30
-        - jnp.arange(
-            formation_side,
-            dtype=jnp.float32,
-        )
-        * spacing
-    )
-
-    red_x, red_z = jnp.meshgrid(
-        red_x_positions,
-        z_positions,
-    )
-
-    blue_x, blue_z = jnp.meshgrid(
-        blue_x_positions,
-        z_positions,
-    )
-
-    red_x = red_x.reshape(-1)
-    red_z = red_z.reshape(-1)
-
-    blue_x = blue_x.reshape(-1)
-    blue_z = blue_z.reshape(-1)
-
-    x = x.at[
-        RED_SOLDIER_START:
-        RED_SOLDIER_END
-    ].set(
-        red_x
-    )
-
-    z = z.at[
-        RED_SOLDIER_START:
-        RED_SOLDIER_END
-    ].set(
-        red_z
-    )
-
-    x = x.at[
-        BLUE_SOLDIER_START:
-        BLUE_SOLDIER_END
-    ].set(
-        blue_x
-    )
-
-    z = z.at[
-        BLUE_SOLDIER_START:
-        BLUE_SOLDIER_END
-    ].set(
-        blue_z
-    )
+    x = x.at[RED_SOLDIER_START:RED_SOLDIER_END].set(red_x)
+    z = z.at[RED_SOLDIER_START:RED_SOLDIER_END].set(red_z)
+    x = x.at[BLUE_SOLDIER_START:BLUE_SOLDIER_END].set(blue_x)
+    z = z.at[BLUE_SOLDIER_START:BLUE_SOLDIER_END].set(blue_z)
 
     # Fixed speed: the entire reset state is deterministic.
     speed = speed.at[
@@ -445,7 +373,7 @@ def decode_actions(action):
     return raw_dx / norm, raw_dz / norm, (raw_attack > 0.5).astype(jnp.float32)
 
 
-def pairwise_separation(x, z, alive):
+def pairwise_separation(x, z, alive, movable=None):
     dx = x[:, None] - x[None, :]
     dz = z[:, None] - z[None, :]
     dist2 = dx * dx + dz * dz
@@ -466,6 +394,14 @@ def pairwise_separation(x, z, alive):
 
     push_x = jnp.where(commander_mask > 0, 0.0, push_x * 0.5)
     push_z = jnp.where(commander_mask > 0, 0.0, push_z * 0.5)
+
+    # Soldiers in attack cooldown are physically frozen.  Do not let the
+    # separation solver move them either; otherwise they can drift into a wall
+    # even though their commanded movement is zero.
+    if movable is not None:
+        push_x = jnp.where(movable, push_x, 0.0)
+        push_z = jnp.where(movable, push_z, 0.0)
+
     return push_x, push_z
 
 
@@ -513,9 +449,21 @@ def step_one(state, red_action, blue_action):
     vx = jnp.where(valid_move, move_dx, 0.0)
     vz = jnp.where(valid_move, move_dz, 0.0)
 
-    px, pz = pairwise_separation(nx, nz, alive)
-    nx = jnp.clip(nx + px, -HALF_FIELD + radius, HALF_FIELD - radius)
-    nz = jnp.clip(nz + pz, -HALF_FIELD + radius, HALF_FIELD - radius)
+    movable = (commander_mask > 0) | ((soldier_mask > 0) & can_move & (alive > 0))
+    px, pz = pairwise_separation(nx, nz, alive, movable)
+
+    # Apply separation only if the corrected position remains outside walls.
+    # If a separation push would move a unit into a wall, reject that push and
+    # keep the already wall-safe position from the movement stage. This is
+    # especially important for soldiers frozen by attack cooldown.
+    separated_x = nx + px
+    separated_z = nz + pz
+    separated_blocked = wall_blocked(separated_x, separated_z, radius)
+    nx = jnp.where(separated_blocked, nx, separated_x)
+    nz = jnp.where(separated_blocked, nz, separated_z)
+
+    nx = jnp.clip(nx, -HALF_FIELD + radius, HALF_FIELD - radius)
+    nz = jnp.clip(nz, -HALF_FIELD + radius, HALF_FIELD - radius)
 
     ax = nx[ALL_SOLDIER_INDICES]
     az = nz[ALL_SOLDIER_INDICES]
@@ -1725,8 +1673,8 @@ RESULT_TEXT = {
 }
 
 
-
 def build_replay_html(bout_path, out_path=None):
+    # Three.js replay based directly on the original working replay architecture.
     d = np.load(bout_path, allow_pickle=False)
     generation = int(d["generation"])
     winner_label = str(d["winner_label"])
@@ -1757,113 +1705,139 @@ def build_replay_html(bout_path, out_path=None):
         raise ValueError("Best Bout contains no replay frames.")
     if red_actions.shape[0] != end_step or blue_actions.shape[0] != end_step:
         raise ValueError("Action length does not match end_step.")
+
     payload = json.dumps({
-        "generation": generation, "winnerLabel": winner_label,
+        "generation": generation,
+        "winnerLabel": winner_label,
+        "winnerTeam": winner_team,
         "winnerSide": "Red" if winner_team == 0 else "Blue",
         "resultText": RESULT_TEXT.get(result_code, "UNKNOWN"),
-        "winTime": win_time, "endStep": end_step, "dt": dt,
-        "steps": n_frames - 1, "verificationPass": verification_pass,
-        "maxStateError": max_state_error, "fieldSize": FIELD_SIZE,
-        "walls": WALL_LIST, "x": np.round(x,4).tolist(),
-        "z": np.round(z,4).tolist(), "hp": np.round(hp,3).tolist(),
+        "winTime": win_time,
+        "endStep": end_step,
+        "dt": dt,
+        "steps": n_frames - 1,
+        "verificationPass": verification_pass,
+        "maxStateError": max_state_error,
+        "fieldSize": FIELD_SIZE,
+        "walls": WALL_LIST,
+        "x": np.round(x, 4).tolist(),
+        "z": np.round(z, 4).tolist(),
+        "hp": np.round(hp, 3).tolist(),
         "alive": alive.astype(np.uint8).tolist(),
-        "redActions": np.round(red_actions,3).tolist(),
-        "blueActions": np.round(blue_actions,3).tolist(),
+        "redActions": np.round(red_actions, 3).tolist(),
+        "blueActions": np.round(blue_actions, 3).tolist(),
     }, separators=(",", ":"))
-    html = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RTS Best Bout Replay</title>
+
+    html = r'''<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RTS Best Bout Replay</title>
 <style>
-html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#101216;font-family:Arial,sans-serif;color:#fff}
-#c{display:block;width:100vw;height:100vh;background:#101216;cursor:grab}#c.dragging{cursor:grabbing}
-#info{position:fixed;left:12px;top:12px;z-index:3;background:rgba(10,12,16,.86);padding:10px 13px;border-radius:8px;line-height:1.45;font-size:13px;min-width:270px;pointer-events:none}
-#panel{position:fixed;left:12px;right:12px;bottom:12px;z-index:3;background:rgba(10,12,16,.9);padding:9px 11px;border-radius:8px}
-button{margin-right:5px;padding:5px 9px;border:0;border-radius:4px;cursor:pointer}#timeline{width:min(760px,72vw);vertical-align:middle}#status{margin-top:5px;font-size:12px;opacity:.9}.attack{color:#ffd95a}.good{color:#62df80}.bad{color:#ff7979}
-</style></head><body><canvas id="c"></canvas><div id="info"></div><div id="panel">
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#101010;font-family:Arial,Helvetica,sans-serif;}
+#app{position:relative;width:100vw;height:100vh;}
+#info{position:absolute;left:14px;top:14px;z-index:10;padding:12px 15px;background:rgba(0,0,0,.74);color:#fff;border-radius:8px;min-width:280px;line-height:1.5;font-size:14px;pointer-events:none;}
+#controls{position:absolute;left:14px;bottom:14px;z-index:10;padding:10px 12px;background:rgba(0,0,0,.74);border-radius:8px;color:#fff;}
+button{margin-right:5px;padding:5px 9px;border:0;border-radius:4px;cursor:pointer;}
+#timeline{width:440px;max-width:45vw;vertical-align:middle;}#status{margin-top:7px;font-size:12px;opacity:.85;}
+.pass{color:#5fd97a;font-weight:bold}.fail{color:#ff6a6a;font-weight:bold}.attack{color:#ffd95a;font-weight:bold}
+hr{border:0;border-top:1px solid rgba(255,255,255,.25);margin:7px 0;}
+#error{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:30;display:none;max-width:75vw;padding:18px 22px;background:rgba(40,0,0,.92);color:#fff;border:1px solid #f66;border-radius:10px;font-family:Consolas,monospace;white-space:pre-wrap;}
+</style></head><body>
+<div id="app"><div id="info"></div><div id="error"></div>
+<div id="controls">
 <button id="play">Play</button><button id="pause">Pause</button><button id="reset">Reset</button>
-<button data-speed="0.25">0.25x</button><button data-speed="0.5">0.5x</button><button data-speed="1">1x</button><button data-speed="2">2x</button>
-<input id="timeline" type="range" min="0" max="__MAXSTEP__" value="0" step="1"><div id="status"></div></div>
-<script>
-(()=>{"use strict";
-const DATA=__PAYLOAD__;const canvas=document.getElementById("c");const ctx=canvas.getContext("2d");const info=document.getElementById("info");const timeline=document.getElementById("timeline");const status=document.getElementById("status");
-if(!ctx){info.innerHTML='<span class="bad">Canvas initialization failed.</span>';return;}
-const DT=DATA.dt,N=DATA.steps;let replayTime=0,playing=false,speed=1,lastTs=null,zoom=1,panX=0,panY=0,dragging=false,lastX=0,lastY=0;
-function resize(){const dpr=Math.min(devicePixelRatio||1,2);canvas.width=Math.floor(innerWidth*dpr);canvas.height=Math.floor(innerHeight*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);draw();}addEventListener("resize",resize);
-function iso(x,z,h=0){const s=34*zoom;return{x:innerWidth*.5+panX+(x-z)*s*.72,y:innerHeight*.51+panY+(x+z)*s*.38-h*s*.85};}
-function frameInfo(){const t=Math.max(0,Math.min(N*DT,replayTime)),rf=t/DT,i=Math.min(Math.floor(rf),N),a=i>=N?0:rf-i;return{t,i,a};}
-function lerp(a,b,t){return a+(b-a)*t;}
-function poly(p,fill,stroke){ctx.beginPath();p.forEach((q,k)=>k?ctx.lineTo(q.x,q.y):ctx.moveTo(q.x,q.y));ctx.closePath();if(fill){ctx.fillStyle=fill;ctx.fill();}if(stroke){ctx.strokeStyle=stroke;ctx.stroke();}}
-function box(x,z,h,col){const b=iso(x,z),t=iso(x,z,h),w=7*zoom;poly([{x:t.x-w,y:t.y+w*.45},{x:t.x,y:t.y},{x:t.x+w,y:t.y+w*.45},{x:b.x+w,y:b.y+w*.45},{x:b.x,y:b.y},{x:b.x-w,y:b.y+w*.45}],col);}
-function field(){ctx.clearRect(0,0,innerWidth,innerHeight);poly([iso(-8,-8),iso(-7,-8),iso(-7,8),iso(-8,8)],"rgba(190,65,75,.22)");poly([iso(7,-8),iso(8,-8),iso(8,8),iso(7,8)],"rgba(70,120,220,.22)");for(let i=-8;i<=8;i++){let a=iso(i,-8),b=iso(i,8),c=iso(-8,i),d=iso(8,i);ctx.strokeStyle="rgba(170,170,170,.20)";ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.beginPath();ctx.moveTo(c.x,c.y);ctx.lineTo(d.x,d.y);ctx.stroke();}for(const p of DATA.walls){const a=iso(p[0],p[1],0),b=iso(p[0],p[1],.75);ctx.strokeStyle="#aaa";ctx.lineWidth=10*zoom;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();}}
-function enemyRange(team){return team===0?[102,202]:[2,102];}
-function nearest(frame,idx,team){const r=enemyRange(team),ax=frame.x[idx],az=frame.z[idx];let best=-1,bd=.42*.42;for(let j=r[0];j<r[1];j++){if(!frame.alive[j])continue;const dx=frame.x[j]-ax,dz=frame.z[j]-az,d=dx*dx+dz*dz;if(d<=bd){bd=d;best=j;}}return best;}
-function attacks(frame,actions,team,alpha){let count=0;if(!actions)return 0;for(let k=0;k<100;k++){const idx=team===0?2+k:102+k;if(!frame.alive[idx]||actions[3*k+2]<=.5)continue;const e=nearest(frame,idx,team);const p=iso(frame.x[idx],frame.z[idx],.45),q=e>=0?iso(frame.x[e],frame.z[e],.55):iso(frame.x[idx]+(team===0?.35:-.35),frame.z[idx],.45);ctx.strokeStyle=`rgba(255,215,70,${.95*alpha})`;ctx.lineWidth=2.5*zoom;ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.lineTo(q.x,q.y);ctx.stroke();ctx.fillStyle=`rgba(255,235,120,${alpha})`;ctx.beginPath();ctx.arc(p.x,p.y,4*zoom,0,Math.PI*2);ctx.fill();count++;}return count;}
-function draw(){const r=frameInfo();field();const i=r.i,a=r.a,x0=DATA.x[i],z0=DATA.z[i],alive=DATA.alive[i],x1=i<N?DATA.x[i+1]:x0,z1=i<N?DATA.z[i+1]:z0;const pos=[];for(let u=0;u<202;u++)pos.push([lerp(x0[u],x1[u],a),lerp(z0[u],z1[u],a)]);const order=Array.from({length:202},(_,u)=>u).sort((u,v)=>(pos[u][0]+pos[u][1])-(pos[v][0]+pos[v][1]));for(const u of order){if(!alive[u])continue;const team=u<102?0:1,p=iso(pos[u][0],pos[u][1],.38),rr=team===0?"#e25555":"#5689e8";ctx.fillStyle=rr;ctx.strokeStyle="#111";ctx.lineWidth=1;ctx.beginPath();ctx.arc(p.x,p.y,5.2*zoom,0,Math.PI*2);ctx.fill();ctx.stroke();}for(const u of [0,1]){if(!alive[u])continue;const p=iso(pos[u][0],pos[u][1],1.05),cc=u===0?"#ff6767":"#6ea2ff";ctx.fillStyle=cc;ctx.strokeStyle="#fff";ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(p.x,p.y,10*zoom,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.fillStyle="#ffd83d";ctx.beginPath();ctx.moveTo(p.x,p.y-18*zoom);ctx.lineTo(p.x-6*zoom,p.y-8*zoom);ctx.lineTo(p.x+6*zoom,p.y-8*zoom);ctx.closePath();ctx.fill();}
-const redA=attacks({x:pos.map(p=>p[0]),z:pos.map(p=>p[1]),alive},DATA.redActions[i]||null,0,1-a),blueA=attacks({x:pos.map(p=>p[0]),z:pos.map(p=>p[1]),alive},DATA.blueActions[i]||null,1,1-a);let red=0,blue=0;for(let k=0;k<100;k++){red+=alive[2+k];blue+=alive[102+k];}info.innerHTML=`<b>Generation ${DATA.generation}</b><br>Winner: <b>${DATA.winnerLabel}</b> (${DATA.winnerSide})<br>Battle time: ${DATA.winTime.toFixed(1)} s<br>Replay time: ${r.t.toFixed(2)} s<br>Red soldiers: ${red}<br>Blue soldiers: ${blue}<br>Red Commander HP: ${DATA.hp[i][0].toFixed(2)}<br>Blue Commander HP: ${DATA.hp[i][1].toFixed(2)}<hr><span class="attack">Red attacks: ${redA}</span><br><span class="attack">Blue attacks: ${blueA}</span><br>Starting columns: highlighted<hr>Result: <b>${DATA.resultText}</b><br>${DATA.verificationPass?'<span class="good">Replay verification: PASS</span>':'<span class="bad">Replay verification: FAIL</span>'}`;timeline.value=String(i);status.textContent=`Generation ${DATA.generation} | ${r.t.toFixed(2)} s | step ${i}/${N}`;}
-function animate(ts){requestAnimationFrame(animate);if(lastTs===null)lastTs=ts;const d=Math.min(.05,(ts-lastTs)/1000);lastTs=ts;if(playing){replayTime+=d*speed;if(replayTime>=N*DT){replayTime=N*DT;playing=false;}}try{draw();}catch(e){playing=false;info.innerHTML='<span class="bad"><b>Replay error</b><br>'+String(e&&e.stack||e).replace(/</g,"&lt;")+'</span>';throw e;}}
-document.getElementById("play").onclick=()=>playing=true;document.getElementById("pause").onclick=()=>playing=false;document.getElementById("reset").onclick=()=>{playing=false;replayTime=0;draw();};document.querySelectorAll("button[data-speed]").forEach(b=>b.onclick=()=>speed=parseFloat(b.dataset.speed));timeline.oninput=()=>{playing=false;replayTime=parseInt(timeline.value,10)*DT;draw();};
-canvas.addEventListener("pointerdown",e=>{dragging=true;lastX=e.clientX;lastY=e.clientY;canvas.classList.add("dragging")});canvas.addEventListener("pointermove",e=>{if(!dragging)return;panX+=e.clientX-lastX;panY+=e.clientY-lastY;lastX=e.clientX;lastY=e.clientY;draw()});canvas.addEventListener("pointerup",()=>{dragging=false;canvas.classList.remove("dragging")});canvas.addEventListener("pointercancel",()=>{dragging=false;canvas.classList.remove("dragging")});canvas.addEventListener("wheel",e=>{e.preventDefault();zoom=Math.max(.45,Math.min(2.5,zoom*Math.exp(-e.deltaY*.001)));draw()},{passive:false});
-resize();draw();requestAnimationFrame(animate);
-})();
+<button data-speed="0.25">0.25x</button><button data-speed="0.5">0.5x</button><button data-speed="1">1x</button><button data-speed="2">2x</button><br><br>
+<input id="timeline" type="range" min="0" max="__MAXSTEP__" value="0" step="1"><div id="status"></div>
+</div></div>
+<script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+const DATA=__PAYLOAD__;
+const app=document.getElementById('app'), info=document.getElementById('info'), errorBox=document.getElementById('error'), timeline=document.getElementById('timeline'), statusEl=document.getElementById('status');
+let replayTime=0, playing=false, speed=1, lastTs=null;
+function showError(err){errorBox.style.display='block';errorBox.textContent=String(err&&err.stack?err.stack:err);}
+try{
+ const scene=new THREE.Scene(); scene.background=new THREE.Color(0x101010);
+ const camera=new THREE.PerspectiveCamera(45,innerWidth/innerHeight,.1,250); camera.position.set(0,18,17);
+ const renderer=new THREE.WebGLRenderer({antialias:true}); renderer.setPixelRatio(Math.min(devicePixelRatio||1,2)); renderer.setSize(innerWidth,innerHeight); app.appendChild(renderer.domElement);
+ const controls=new OrbitControls(camera,renderer.domElement); controls.target.set(0,0,0); controls.enableDamping=true; controls.dampingFactor=.08; controls.update();
+ scene.add(new THREE.HemisphereLight(0xffffff,0x444444,2.0)); const dir=new THREE.DirectionalLight(0xffffff,1.3); dir.position.set(6,14,8); scene.add(dir);
+ const fieldSize=DATA.fieldSize, half=fieldSize/2;
+ const ground=new THREE.Mesh(new THREE.PlaneGeometry(fieldSize,fieldSize),new THREE.MeshStandardMaterial({color:0x303030})); ground.rotation.x=-Math.PI/2; ground.position.y=-.02; scene.add(ground);
+ const grid=new THREE.GridHelper(fieldSize,fieldSize,0x777777,0x444444); grid.position.y=.01; scene.add(grid);
+ const redStart=new THREE.Mesh(new THREE.PlaneGeometry(2,fieldSize),new THREE.MeshBasicMaterial({color:0xd94b4b,transparent:true,opacity:.16,side:THREE.DoubleSide})); redStart.rotation.x=-Math.PI/2; redStart.position.set(-half+1.0,.015,0); scene.add(redStart);
+ const blueStart=new THREE.Mesh(new THREE.PlaneGeometry(2,fieldSize),new THREE.MeshBasicMaterial({color:0x4b7bd9,transparent:true,opacity:.16,side:THREE.DoubleSide})); blueStart.rotation.x=-Math.PI/2; blueStart.position.set(half-1.0,.016,0); scene.add(blueStart);
+ const wallGeo=new THREE.BoxGeometry(1,.7,1), wallMat=new THREE.MeshStandardMaterial({color:0x777777}); for(const p of DATA.walls){const w=new THREE.Mesh(wallGeo,wallMat);w.position.set(p[0],.35,p[1]);scene.add(w);}
+ const soldierGeo=new THREE.BoxGeometry(.22,.36,.22), redMat=new THREE.MeshStandardMaterial({color:0xd94b4b}), blueMat=new THREE.MeshStandardMaterial({color:0x4b7bd9});
+ const redSoldiers=[],blueSoldiers=[]; for(let i=0;i<100;i++){const r=new THREE.Mesh(soldierGeo,redMat),b=new THREE.Mesh(soldierGeo,blueMat);scene.add(r,b);redSoldiers.push(r);blueSoldiers.push(b);}
+ const cmdGeo=new THREE.BoxGeometry(.44,.8,.44), redCommander=new THREE.Mesh(cmdGeo,redMat), blueCommander=new THREE.Mesh(cmdGeo,blueMat); scene.add(redCommander,blueCommander);
+ const crownGeo=new THREE.ConeGeometry(.22,.22,5), crownMat=new THREE.MeshStandardMaterial({color:0xffd83d}), redCrown=new THREE.Mesh(crownGeo,crownMat), blueCrown=new THREE.Mesh(crownGeo,crownMat); scene.add(redCrown,blueCrown);
+ const attackGroup=new THREE.Group(); scene.add(attackGroup); const flashGeo=new THREE.SphereGeometry(.11,8,8), flashMat=new THREE.MeshBasicMaterial({color:0xffe66b,transparent:true,opacity:.95});
+ const cooldownGeo=new THREE.TorusGeometry(.20,.035,8,20), cooldownMat=new THREE.MeshBasicMaterial({color:0xffff55,transparent:true,opacity:.9});
+ function clearAttacks(){while(attackGroup.children.length){const o=attackGroup.children.pop();if(o.geometry)o.geometry.dispose();}}
+ function nearestEnemy(idx,team,X,Z,A){const start=team===0?102:0,end=team===0?202:102;let best=-1,bestD2=.42*.42,ax=X[idx],az=Z[idx];for(let j=start;j<end;j++){if(!A[j])continue;const dx=X[j]-ax,dz=Z[j]-az,d2=dx*dx+dz*dz;if(d2<=bestD2){bestD2=d2;best=j;}}return best;}
+ function addAttackEffects(i,alpha){clearAttacks();if(i>=DATA.steps)return{red:0,blue:0};const X=DATA.x[i],Z=DATA.z[i],A=DATA.alive[i];let rc=0,bc=0;const teams=[{team:0,actions:DATA.redActions[i],prev: i>0?DATA.redActions[i-1]:null},{team:1,actions:DATA.blueActions[i],prev:i>0?DATA.blueActions[i-1]:null}];for(const e of teams){if(!e.actions)continue;for(let k=0;k<100;k++){const idx=e.team===0?2+k:102+k;if(!A[idx])continue;const attackNow=e.actions[3*k+2]>.5;if(attackNow){const target=nearestEnemy(idx,e.team,X,Z,A);const s=new THREE.Vector3(X[idx],.48,Z[idx]);const t=target>=0?new THREE.Vector3(X[target],.55,Z[target]):new THREE.Vector3(X[idx]+(e.team===0?.35:-.35),.48,Z[idx]);const g=new THREE.BufferGeometry().setFromPoints([s,t]);const m=new THREE.LineBasicMaterial({color:0xffd83d,transparent:true,opacity:.45+.5*alpha});attackGroup.add(new THREE.Line(g,m));const f=new THREE.Mesh(flashGeo,flashMat);f.position.copy(s);attackGroup.add(f);if(e.team===0)rc++;else bc++;}
+    let cooldown=false;
+    for(let d=1;d<=3;d++){const j=i-d;if(j>=0 && DATA[e.team===0?'redActions':'blueActions'][j] && DATA[e.team===0?'redActions':'blueActions'][j][3*k+2]>.5){cooldown=true;break;}}
+    if(cooldown){const ring=new THREE.Mesh(cooldownGeo,cooldownMat);ring.rotation.x=Math.PI/2;ring.position.set(X[idx],.025,Z[idx]);attackGroup.add(ring);}
+  }}return{red:rc,blue:bc};}
+ function frameInfo(){const t=Math.max(0,Math.min(DATA.steps*DATA.dt,replayTime)),raw=t/DATA.dt,i=Math.min(Math.floor(raw),DATA.steps),a=i>=DATA.steps?0:raw-i;return{t,i,a};}
+ function updateReplay(){const f=frameInfo(),i=f.i,a=f.a;timeline.value=String(i);const X0=DATA.x[i],Z0=DATA.z[i],A=DATA.alive[i],X1=i<DATA.steps?DATA.x[i+1]:X0,Z1=i<DATA.steps?DATA.z[i+1]:Z0,px=k=>X0[k]+(X1[k]-X0[k])*a,pz=k=>Z0[k]+(Z1[k]-Z0[k])*a;
+  function inCooldown(actions,k){
+   if(i<=0)return false;
+   for(let d=1;d<=3;d++){const j=i-d;if(j>=0 && actions[j] && actions[j][3*k+2]>.5)return true;}
+   return false;
+  }
+  for(let k=0;k<100;k++){
+   const ridx=2+k,bidx=102+k;
+   // Replay the saved simulation coordinates exactly.
+   // Do not infer or reimplement cooldown movement here; the simulation
+   // already stored the true stopped positions in DATA.x / DATA.z.
+   const redCooling = inCooldown(DATA.redActions,k);
+   const blueCooling = inCooldown(DATA.blueActions,k);
+   redSoldiers[k].position.set(px(ridx),.18,pz(ridx));redSoldiers[k].visible=A[ridx]>0;
+   blueSoldiers[k].position.set(px(bidx),.18,pz(bidx));blueSoldiers[k].visible=A[bidx]>0;
+   redSoldiers[k].scale.setScalar(redCooling?1.08:1.0);
+   blueSoldiers[k].scale.setScalar(blueCooling?1.08:1.0);
+  }
+  redCommander.position.set(px(0),.4,pz(0));redCommander.visible=A[0]>0;redCrown.position.set(px(0),.9,pz(0));redCrown.visible=A[0]>0;blueCommander.position.set(px(1),.4,pz(1));blueCommander.visible=A[1]>0;blueCrown.position.set(px(1),.9,pz(1));blueCrown.visible=A[1]>0;
+  const at=addAttackEffects(i,1-a);let ra=0,ba=0;for(let k=0;k<100;k++){ra+=A[2+k];ba+=A[102+k];}const verify=DATA.verificationPass?'<span class="pass">Replay verification: PASS</span>':'<span class="fail">Replay verification: FAIL</span><br>Max state error: '+DATA.maxStateError.toExponential(2);info.innerHTML='<b>Generation '+DATA.generation+'</b><br>Winner: <b>'+DATA.winnerLabel+'</b> ('+DATA.winnerSide+')<br>Battle time: '+DATA.winTime.toFixed(1)+' s<br>Replay time: '+f.t.toFixed(2)+' s<br>Step: '+i+' / '+DATA.steps+'<hr>Red soldiers: '+ra+'<br>Blue soldiers: '+ba+'<br>Red Commander HP: '+DATA.hp[i][0].toFixed(2)+'<br>Blue Commander HP: '+DATA.hp[i][1].toFixed(2)+'<hr><span class="attack">Red attacks: '+at.red+'</span><br><span class="attack">Blue attacks: '+at.blue+'</span><hr>Result: <b>'+DATA.resultText+'</b><br>'+verify;statusEl.textContent='Generation '+DATA.generation+' | Best Bout | '+f.t.toFixed(2)+' s';}
+ document.getElementById('play').onclick=()=>playing=true; document.getElementById('pause').onclick=()=>playing=false; document.getElementById('reset').onclick=()=>{playing=false;replayTime=0;updateReplay();}; document.querySelectorAll('button[data-speed]').forEach(b=>b.onclick=()=>speed=parseFloat(b.dataset.speed)); timeline.oninput=()=>{playing=false;replayTime=parseInt(timeline.value,10)*DATA.dt;updateReplay();};
+ addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
+ function animate(ts){requestAnimationFrame(animate);if(lastTs===null)lastTs=ts;const delta=Math.min(.05,(ts-lastTs)/1000);lastTs=ts;if(playing){replayTime+=delta*speed;if(replayTime>=DATA.steps*DATA.dt){replayTime=DATA.steps*DATA.dt;playing=false;}}updateReplay();controls.update();renderer.render(scene,camera);}
+ updateReplay(); requestAnimationFrame(animate);
+}catch(err){showError(err);}
 </script></body></html>'''
-    html = html.replace("__MAXSTEP__", str(n_frames - 1)).replace("__PAYLOAD__", payload)
+    html=html.replace("__MAXSTEP__",str(n_frames-1)).replace("__PAYLOAD__",payload)
     if out_path is None:
-        out_path = os.path.join(REPLAY_DIR, f"replay_generation_{generation:04d}.html")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(html)
-    return out_path, html
+        out_path=os.path.join(REPLAY_DIR,f"replay_generation_{generation:04d}.html")
+    with open(out_path,"w",encoding="utf-8") as f:f.write(html)
+    return out_path,html
+
 
 def _replay_file_compatible(path):
     try:
-        with np.load(path, allow_pickle=False) as d:
-            if "field_size" not in d or "obs_size" not in d or "terrain_res" not in d:
-                return False
-            return (
-                abs(float(d["field_size"]) - FIELD_SIZE) < 1e-6
-                and int(d["obs_size"]) == OBS_SIZE
-                and int(d["terrain_res"]) == TERRAIN_RES
-            )
-    except Exception:
-        return False
+        with np.load(path,allow_pickle=False) as d:
+            if "field_size" not in d or "obs_size" not in d or "terrain_res" not in d:return False
+            return abs(float(d["field_size"])-FIELD_SIZE)<1e-6 and int(d["obs_size"])==OBS_SIZE and int(d["terrain_res"])==TERRAIN_RES
+    except Exception:return False
 
 
 def show_replay(generation=None):
-    """
-    generation=None -> latest Best Bout compatible with the current environment.
-    """
-    files = sorted(
-        glob.glob(os.path.join(BOUT_DIR, "generation_*_best_bout.npz")),
-        key=generation_number,
-    )
-    compatible = [f for f in files if _replay_file_compatible(f)]
-    if not compatible:
-        raise FileNotFoundError(
-            f"No compatible Best Bout found in {os.path.abspath(BOUT_DIR)}"
-        )
-
-    if generation is None:
-        bout_path = compatible[-1]
+    files=sorted(glob.glob(os.path.join(BOUT_DIR,"generation_*_best_bout.npz")),key=generation_number)
+    compatible=[f for f in files if _replay_file_compatible(f)]
+    if not compatible:raise FileNotFoundError(f"No compatible Best Bout found in {os.path.abspath(BOUT_DIR)}")
+    if generation is None:bout_path=compatible[-1]
     else:
-        bout_path = os.path.join(
-            BOUT_DIR,
-            f"generation_{generation:04d}_best_bout.npz",
-        )
-        if not os.path.exists(bout_path):
-            raise FileNotFoundError(bout_path)
-        if not _replay_file_compatible(bout_path):
-            raise ValueError(
-                f"Generation {generation} Best Bout is incompatible with the current environment."
-            )
-
-    out_path, html = build_replay_html(bout_path)
-
+        bout_path=os.path.join(BOUT_DIR,f"generation_{generation:04d}_best_bout.npz")
+        if not os.path.exists(bout_path):raise FileNotFoundError(bout_path)
+        if not _replay_file_compatible(bout_path):raise ValueError(f"Generation {generation} Best Bout is incompatible with the current environment.")
+    out_path,html=build_replay_html(bout_path)
     try:
-        from IPython.display import display, HTML, IFrame
-        try:
-            display(IFrame(src=os.path.relpath(out_path), width="100%", height=720))
-        except Exception:
-            display(HTML(html))
-    except ImportError:
-        pass
-
+        from IPython.display import display,HTML,IFrame
+        try:display(IFrame(src=os.path.relpath(out_path),width="100%",height=720))
+        except Exception:display(HTML(html))
+    except ImportError:pass
     return out_path
 
 
