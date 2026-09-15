@@ -432,8 +432,8 @@ CLIP_EPS = 0.20
 VALUE_COEF = 0.5
 LEARNING_RATE = 3e-4
 
-ENTROPY_START = 0.02
-ENTROPY_END = 0.002
+ENTROPY_START = 0.005
+ENTROPY_END = 0.0005
 
 PPO_EPOCHS = 4
 MINIBATCHES = 8
@@ -486,7 +486,7 @@ def wrap_angle(a):
 
 def action_logprob(action_output, local_action):
     angle_mean = action_output[:, ANGLE_MEAN_IDX]
-    logstd = jnp.clip(action_output[:, ANGLE_LOGSTD_IDX], -3.0, 0.5)
+    logstd = jnp.clip(action_output[:, ANGLE_LOGSTD_IDX], -3.0, 0.0)
     std = jnp.exp(logstd)
 
     dx = local_action[:, 0::3]
@@ -507,7 +507,7 @@ def action_logprob(action_output, local_action):
 
 
 def policy_entropy(action_output):
-    logstd = jnp.clip(action_output[:, ANGLE_LOGSTD_IDX], -3.0, 0.5)
+    logstd = jnp.clip(action_output[:, ANGLE_LOGSTD_IDX], -3.0, 0.0)
     e_angle = jnp.sum(logstd + 0.5 * jnp.log(2.0 * jnp.pi * jnp.e), axis=1)
 
     p = jax.nn.sigmoid(action_output[:, ATTACK_IDX])
@@ -522,7 +522,7 @@ def sample_action(params, obs, key):
     k_noise, k_attack = random.split(key)
 
     mean = action_output[:, ANGLE_MEAN_IDX]
-    logstd = jnp.clip(action_output[:, ANGLE_LOGSTD_IDX], -3.0, 0.5)
+    logstd = jnp.clip(action_output[:, ANGLE_LOGSTD_IDX], -3.0, 0.0)
     std = jnp.exp(logstd)
 
     angle = mean + std * random.normal(k_noise, (B, N_SOLDIERS_PER_TEAM))
