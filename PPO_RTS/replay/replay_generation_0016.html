@@ -71,8 +71,14 @@ try{
     const ridx=2+k,bidx=102+k;
     const rAttack=!!redActions && redActions[3*k+2]>.5 && A[ridx]>0;
     const bAttack=!!blueActions && blueActions[3*k+2]>.5 && A[bidx]>0;
-    redSoldiers[k].group.position.set(px(ridx),0,pz(ridx));redSoldiers[k].group.visible=A[ridx]>0;setSoldierVisual(redSoldiers[k],rAttack);if(rAttack)redAttackCount++;
-    blueSoldiers[k].group.position.set(px(bidx),0,pz(bidx));blueSoldiers[k].group.visible=A[bidx]>0;setSoldierVisual(blueSoldiers[k],bAttack);if(bAttack)blueAttackCount++;
+    const rdx=!!redActions ? redActions[3*k] : 0, rdz=!!redActions ? redActions[3*k+1] : 0;
+    const bdx=!!blueActions ? blueActions[3*k] : 0, bdz=!!blueActions ? blueActions[3*k+1] : 0;
+    redSoldiers[k].group.position.set(px(ridx),0,pz(ridx));
+    redSoldiers[k].group.rotation.y=(Math.abs(rdx)+Math.abs(rdz)>1e-6)?Math.atan2(rdx,rdz):redSoldiers[k].group.rotation.y;
+    redSoldiers[k].group.visible=A[ridx]>0;setSoldierVisual(redSoldiers[k],rAttack);if(rAttack)redAttackCount++;
+    blueSoldiers[k].group.position.set(px(bidx),0,pz(bidx));
+    blueSoldiers[k].group.rotation.y=(Math.abs(bdx)+Math.abs(bdz)>1e-6)?Math.atan2(bdx,bdz):blueSoldiers[k].group.rotation.y;
+    blueSoldiers[k].group.visible=A[bidx]>0;setSoldierVisual(blueSoldiers[k],bAttack);if(bAttack)blueAttackCount++;
   }
   redCommander.position.set(px(0),0,pz(0));redCommander.visible=A[0]>0;redCrown.visible=A[0]>0;
   blueCommander.position.set(px(1),0,pz(1));blueCommander.visible=A[1]>0;blueCrown.visible=A[1]>0;

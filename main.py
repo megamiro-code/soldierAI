@@ -58,7 +58,7 @@ MAX_STEPS = int(MAX_TIME / DT)
 
 ATTACK_RANGE = 0.42
 ATTACK_COOLDOWN = 0.55
-ATTACK_DAMAGE = 0.20
+ATTACK_DAMAGE = 0.30
 
 SOLDIER_RADIUS = 0.13
 COMMANDER_RADIUS = 0.22
@@ -108,10 +108,10 @@ WALL_LIST = [
     [ 5.5, -6.5],
     [ 5.5,  6.5],
 
-    [-1.0, -1.0],
-    [-1.0,  1.0],
-    [ 1.0, -1.0],
-    [ 1.0,  1.0],
+    [-0.5, -0.5],
+    [-0.5,  0.5],
+    [ 0.5, -0.5],
+    [ 0.5,  0.5],
 ]
 
 walls = jnp.array(
@@ -247,6 +247,8 @@ def reset_one(key):
         N_UNITS,
         dtype=jnp.float32,
     )
+    hp = hp.at[RED_COMMANDER_INDEX].set(0.30)
+    hp = hp.at[BLUE_COMMANDER_INDEX].set(0.30)
 
     alive = jnp.ones(
         N_UNITS,
@@ -1804,8 +1806,14 @@ try{
     const ridx=2+k,bidx=102+k;
     const rAttack=!!redActions && redActions[3*k+2]>.5 && A[ridx]>0;
     const bAttack=!!blueActions && blueActions[3*k+2]>.5 && A[bidx]>0;
-    redSoldiers[k].group.position.set(px(ridx),0,pz(ridx));redSoldiers[k].group.visible=A[ridx]>0;setSoldierVisual(redSoldiers[k],rAttack);if(rAttack)redAttackCount++;
-    blueSoldiers[k].group.position.set(px(bidx),0,pz(bidx));blueSoldiers[k].group.visible=A[bidx]>0;setSoldierVisual(blueSoldiers[k],bAttack);if(bAttack)blueAttackCount++;
+    const rdx=!!redActions ? redActions[3*k] : 0, rdz=!!redActions ? redActions[3*k+1] : 0;
+    const bdx=!!blueActions ? blueActions[3*k] : 0, bdz=!!blueActions ? blueActions[3*k+1] : 0;
+    redSoldiers[k].group.position.set(px(ridx),0,pz(ridx));
+    redSoldiers[k].group.rotation.y=(Math.abs(rdx)+Math.abs(rdz)>1e-6)?Math.atan2(rdx,rdz):redSoldiers[k].group.rotation.y;
+    redSoldiers[k].group.visible=A[ridx]>0;setSoldierVisual(redSoldiers[k],rAttack);if(rAttack)redAttackCount++;
+    blueSoldiers[k].group.position.set(px(bidx),0,pz(bidx));
+    blueSoldiers[k].group.rotation.y=(Math.abs(bdx)+Math.abs(bdz)>1e-6)?Math.atan2(bdx,bdz):blueSoldiers[k].group.rotation.y;
+    blueSoldiers[k].group.visible=A[bidx]>0;setSoldierVisual(blueSoldiers[k],bAttack);if(bAttack)blueAttackCount++;
   }
   redCommander.position.set(px(0),0,pz(0));redCommander.visible=A[0]>0;redCrown.visible=A[0]>0;
   blueCommander.position.set(px(1),0,pz(1));blueCommander.visible=A[1]>0;blueCrown.visible=A[1]>0;
