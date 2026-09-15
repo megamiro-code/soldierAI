@@ -108,10 +108,11 @@ WALL_LIST = [
     [ 5.5, -6.5],
     [ 5.5,  6.5],
 
-    [-0.5, -0.5],
-    [-0.5,  0.5],
-    [ 0.5, -0.5],
-    [ 0.5,  0.5],
+    [-1.0, -1.0],
+    [-1.0,  1.0],
+    [ 1.0, -1.0],
+    [ 1.0,  1.0],
+    [ 0.0,  0.0],
 ]
 
 walls = jnp.array(
@@ -642,7 +643,7 @@ BATCH_SIZE = ROLLOUT_STEPS * N_ENVS * 2
 MINIBATCH_SIZE = BATCH_SIZE // MINIBATCHES
 
 PPO_UPDATES_PER_GENERATION = 20
-N_GENERATIONS = 100
+N_GENERATIONS = 20
 EVAL_GAMES_PER_SIDE = 32
 EVAL_GAMES = EVAL_GAMES_PER_SIDE * 2
 
@@ -993,7 +994,8 @@ def make_evaluation_states(base_states):
 def evaluate_match(params_red, params_blue, init_states):
     """
     Deterministic head-to-head over a batch of games.
-    Records the FIRST termination of each game exactly.
+    Records the FIRST termination of each game exactly, together with
+    the cumulative per-team return up to and including termination.
 
     result codes:
         1 = Red won   (blue commander killed)
@@ -1005,14 +1007,21 @@ def evaluate_match(params_red, params_blue, init_states):
     E = init_states["x"].shape[0]
 
     def body(carry, step_idx):
-        st, finished, result, end_step, red_surv, blue_surv = carry
+        (st, finished, result, end_step, red_surv, blue_surv,
+         red_return, blue_return) = carry
 
         red_a = deterministic_world_action_batch(params_red, st, 0.0)
         blue_a = deterministic_world_action_batch(params_blue, st, 1.0)
 
-        nxt, rr, br, done = jax.vmap(step_one, in_axes=(0, 0, 0))(st, red_a, blue_a)
+        nxt, rr, br, done = jax.vmap(step_one, in_axes=(0, 0, 0))(
+            st, red_a, blue_a
+        )
 
-        newly = done & (~finished)
+        active = ~finished
+        red_return = red_return + jnp.where(active, rr, 0.0)
+        blue_return = blue_return + jnp.where(active, br, 0.0)
+
+        newly = done & active
 
         red_cmd = nxt["alive"][:, RED_COMMANDER_INDEX] > 0
         blue_cmd = nxt["alive"][:, BLUE_COMMANDER_INDEX] > 0
@@ -1037,25 +1046,34 @@ def evaluate_match(params_red, params_blue, init_states):
         blue_surv = jnp.where(newly, bs, blue_surv)
         finished = finished | done
 
-        return (nxt, finished, result, end_step, red_surv, blue_surv), None
+        return (
+            nxt, finished, result, end_step, red_surv, blue_surv,
+            red_return, blue_return,
+        ), None
 
-    init = (init_states,
-            jnp.zeros(E, dtype=bool),
-            jnp.zeros(E, dtype=jnp.int32),
-            jnp.full(E, MAX_STEPS, dtype=jnp.int32),
-            jnp.zeros(E, dtype=jnp.float32),
-            jnp.zeros(E, dtype=jnp.float32))
+    init = (
+        init_states,
+        jnp.zeros(E, dtype=bool),
+        jnp.zeros(E, dtype=jnp.int32),
+        jnp.full(E, MAX_STEPS, dtype=jnp.int32),
+        jnp.zeros(E, dtype=jnp.float32),
+        jnp.zeros(E, dtype=jnp.float32),
+        jnp.zeros(E, dtype=jnp.float32),
+        jnp.zeros(E, dtype=jnp.float32),
+    )
 
-    (final_state, _, result, end_step, red_surv, blue_surv), _ = lax.scan(
-        body, init, jnp.arange(MAX_STEPS))
+    (final_state, _, result, end_step, red_surv, blue_surv,
+     red_return, blue_return), _ = lax.scan(
+        body, init, jnp.arange(MAX_STEPS)
+    )
 
-    # Every simulation reaches MAX_STEPS at the latest, because step_one
-    # declares timeout when time >= MAX_TIME. The fallback prevents an
-    # unresolved code 0 from silently entering the Elite comparison.
     result = jnp.where(result == 0, 3, result)
     end_step = jnp.where(result == 3, jnp.minimum(end_step, MAX_STEPS), end_step)
 
-    return result, end_step, red_surv, blue_surv
+    return (
+        result, end_step, red_surv, blue_surv,
+        red_return, blue_return,
+    )
 
 
 def evaluate_elite_match(candidate_params, elite_params, base_states, verbose=True):
@@ -1068,16 +1086,18 @@ def evaluate_elite_match(candidate_params, elite_params, base_states, verbose=Tr
 
     if verbose:
         print(f"  Elite match: side A (candidate = Red)  {E} games ...")
-    rA, sA, redA, blueA = evaluate_match(candidate_params, elite_params, base_states)
+    rA, sA, redA, blueA, retRedA, retBlueA = evaluate_match(candidate_params, elite_params, base_states)
 
     if verbose:
         print(f"  Elite match: side B (candidate = Blue) {E} games ...")
-    rB, sB, redB, blueB = evaluate_match(elite_params, candidate_params, base_states)
+    rB, sB, redB, blueB, retRedB, retBlueB = evaluate_match(elite_params, candidate_params, base_states)
 
     result = np.concatenate([np.asarray(rA), np.asarray(rB)])
     end_step = np.concatenate([np.asarray(sA), np.asarray(sB)])
     red_surv = np.concatenate([np.asarray(redA), np.asarray(redB)])
     blue_surv = np.concatenate([np.asarray(blueA), np.asarray(blueB)])
+    red_return = np.concatenate([np.asarray(retRedA), np.asarray(retRedB)])
+    blue_return = np.concatenate([np.asarray(retBlueA), np.asarray(retBlueB)])
 
     # fix #10 : side determines which colour the candidate actually played
     candidate_is_red = np.concatenate([np.ones(E, dtype=bool), np.zeros(E, dtype=bool)])
@@ -1087,6 +1107,8 @@ def evaluate_elite_match(candidate_params, elite_params, base_states, verbose=Tr
 
     candidate_surv = np.where(candidate_is_red, red_surv, blue_surv)
     elite_surv = np.where(candidate_is_red, blue_surv, red_surv)
+    candidate_return = np.where(candidate_is_red, red_return, blue_return)
+    elite_return = np.where(candidate_is_red, blue_return, red_return)
 
     win_time = end_step.astype(np.float32) * DT
 
@@ -1112,6 +1134,8 @@ def evaluate_elite_match(candidate_params, elite_params, base_states, verbose=Tr
         "elite_won": elite_won,
         "candidate_surv": candidate_surv,
         "elite_surv": elite_surv,
+        "candidate_return": candidate_return,
+        "elite_return": elite_return,
         "candidate_wins": candidate_wins,
         "elite_wins": elite_wins,
         "timeouts": timeouts,
@@ -1209,17 +1233,17 @@ def verify_bout(initial_state, red_actions, blue_actions):
 
 
 def select_best_bout_index(match):
-    """
-    Winner-side victory, fastest first, then most survivors (tie-break).
-    """
+    """Select the highest-return victory among the overall winner's games."""
     winner = match["winner"]
     won = match["candidate_won"] if winner == 1 else match["elite_won"]
+    returns = match["candidate_return"] if winner == 1 else match["elite_return"]
+    surv = match["candidate_surv"] if winner == 1 else match["elite_surv"]
+
     idx = np.where(won)[0]
     if len(idx) == 0:
         return None
 
-    surv = match["candidate_surv"] if winner == 1 else match["elite_surv"]
-    order = np.lexsort((-surv[idx], match["end_step"][idx]))
+    order = np.lexsort((-surv[idx], match["end_step"][idx], -returns[idx]))
     return int(idx[order[0]])
 
 
@@ -1241,6 +1265,10 @@ def save_best_bout(path, generation, match, best_idx, bout,
         "candidate_is_red": np.array(bool(match["candidate_is_red"][best_idx])),
         "candidate_wins": np.array(match["candidate_wins"], dtype=np.int32),
         "elite_wins": np.array(match["elite_wins"], dtype=np.int32),
+        "best_return": np.array(
+            (match["candidate_return"] if match["winner"] == 1 else match["elite_return"])[best_idx],
+            dtype=np.float32,
+        ),
         "field_size": np.array(FIELD_SIZE, dtype=np.float32),
         "terrain_res": np.array(TERRAIN_RES, dtype=np.int32),
         "obs_size": np.array(OBS_SIZE, dtype=np.int32),
@@ -1432,6 +1460,21 @@ def find_latest_checkpoint():
     return sorted(compatible, key=os.path.getmtime)[-1]
 
 
+def prune_checkpoints(keep_path=None):
+    """Keep at most one resumable checkpoint; optionally keep the supplied path."""
+    keep = os.path.abspath(keep_path) if keep_path is not None else None
+    removed = 0
+    for path in glob.glob(os.path.join(CHECKPOINT_DIR, "checkpoint_*.npz")):
+        if keep is not None and os.path.abspath(path) == keep:
+            continue
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 # ============================================================
 # PART 7 : TRAINING LOOP
 # ============================================================
@@ -1536,11 +1579,16 @@ def train(n_generations=N_GENERATIONS, resume=True):
             for k in cum:
                 cum[k] += stats[k]
 
+            checkpoint_path = os.path.join(
+                CHECKPOINT_DIR,
+                f"checkpoint_g{generation:04d}_p{ppo_index:03d}.npz",
+            )
             save_checkpoint(
-                os.path.join(CHECKPOINT_DIR,
-                             f"checkpoint_g{generation:04d}_p{ppo_index:03d}.npz"),
+                checkpoint_path,
                 candidate_params, candidate_opt, generation, ppo_index,
                 latest_elite, master_key)
+            # Keep only the newest checkpoint while a generation is in progress.
+            prune_checkpoints(checkpoint_path)
 
             kills = cum["red_wins"] + cum["blue_wins"]
             print(f"Generation {generation} | "
@@ -1604,15 +1652,39 @@ def train(n_generations=N_GENERATIONS, resume=True):
             bout = record_bout(params_red, params_blue, init_state)
 
             steps = int(bout["end_step"])
-            vx_, vz_, va_ = verify_bout(init_state,
-                                        bout["red_actions"][:steps],
-                                        bout["blue_actions"][:steps])
+            vx_, vz_, va_ = verify_bout(
+                init_state,
+                bout["red_actions"][:steps],
+                bout["blue_actions"][:steps],
+            )
 
             err_x = float(jnp.max(jnp.abs(vx_ - bout["x"][:steps + 1])))
             err_z = float(jnp.max(jnp.abs(vz_ - bout["z"][:steps + 1])))
             err_a = float(jnp.max(jnp.abs(va_ - bout["alive"][:steps + 1])))
             max_err = max(err_x, err_z, err_a)
             verification_pass = max_err < 1e-4
+
+            expected_result = int(match["result"][best_idx])
+            replay_result = int(bout["result"])
+            final_alive = np.asarray(bout["final_state"]["alive"])
+
+            if expected_result == 1:
+                commander_outcome_pass = (
+                    final_alive[RED_COMMANDER_INDEX] > 0
+                    and final_alive[BLUE_COMMANDER_INDEX] <= 0
+                )
+            elif expected_result == 2:
+                commander_outcome_pass = (
+                    final_alive[BLUE_COMMANDER_INDEX] > 0
+                    and final_alive[RED_COMMANDER_INDEX] <= 0
+                )
+            else:
+                commander_outcome_pass = False
+
+            outcome_pass = (
+                replay_result == expected_result
+                and commander_outcome_pass
+            )
 
             if match["winner"] == 1:
                 winner_team = 0 if cand_is_red else 1
@@ -1621,29 +1693,46 @@ def train(n_generations=N_GENERATIONS, resume=True):
                 winner_team = 1 if cand_is_red else 0
                 winner_params = elite_params
 
-            surv = (match["candidate_surv"] if match["winner"] == 1
-                    else match["elite_surv"])[best_idx]
-
-            path = save_best_bout(
-                os.path.join(BOUT_DIR, f"generation_{generation:04d}_best_bout.npz"),
-                generation, match, best_idx, bout,
-                verification_pass, max_err,
-                winner_params, winner_label, winner_team)
-
-            best_bout_saved = True
+            surv = (
+                match["candidate_surv"] if match["winner"] == 1
+                else match["elite_surv"]
+            )[best_idx]
+            best_return = (
+                match["candidate_return"] if match["winner"] == 1
+                else match["elite_return"]
+            )[best_idx]
 
             print()
             print("Best Bout")
             print("------------------------------------------")
             print(f"Winner              : {winner_label} "
                   f"({'Red' if winner_team == 0 else 'Blue'})")
+            print(f"Return              : {float(best_return):.6f}")
             print(f"Win time            : {steps * DT:.2f} s  ({steps} steps)")
             print(f"Winner survivors    : {int(surv)}")
+            print(f"Evaluation result   : {expected_result}")
+            print(f"Replay result       : {replay_result}")
             print(f"Replay verification : "
                   f"{'PASS' if verification_pass else f'FAIL (err {max_err:.2e})'}")
-            print(f"Saved               : {path}")
+            print(f"Commander outcome   : {'PASS' if commander_outcome_pass else 'FAIL'}")
+
+            if verification_pass and outcome_pass:
+                path = save_best_bout(
+                    os.path.join(
+                        BOUT_DIR,
+                        f"generation_{generation:04d}_best_bout.npz",
+                    ),
+                    generation, match, best_idx, bout,
+                    verification_pass, max_err,
+                    winner_params, winner_label, winner_team,
+                )
+                best_bout_saved = True
+                print(f"Saved               : {path}")
+            else:
+                print("Saved               : NO (evaluation/replay outcome mismatch)")
 
         # ---- Elite update ----
+
         if elite_changed:
             latest_elite = save_params(
                 os.path.join(ELITE_DIR, f"generation_{generation:04d}.npz"),
@@ -1657,6 +1746,13 @@ def train(n_generations=N_GENERATIONS, resume=True):
         print(f"Current Elite : {os.path.basename(latest_elite)}")
         print(f"Best Bout     : {'SAVED' if best_bout_saved else 'NONE'}")
         print()
+
+        # Generation completed successfully. The PPO checkpoint is no longer needed.
+        removed_checkpoints = prune_checkpoints()
+        if removed_checkpoints:
+            print(f"Checkpoint cleanup: removed {removed_checkpoints} file(s) after Generation {generation} completion.")
+        else:
+            print(f"Checkpoint CLEARED after Generation {generation} (no checkpoint file remained).")
 
         global LAST_COMPLETED_GENERATION
         LAST_COMPLETED_GENERATION = generation
