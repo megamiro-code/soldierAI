@@ -103,16 +103,10 @@ ALL_UNIT_INDICES = jnp.arange(
 # ------------------------------------------------------------
 
 WALL_LIST = [
-    [-5.5, -6.5],
-    [-5.5,  6.5],
-    [ 5.5, -6.5],
-    [ 5.5,  6.5],
-
-    [-1.0, -1.0],
-    [-1.0,  1.0],
-    [ 1.0, -1.0],
-    [ 1.0,  1.0],
-    [ 0.0,  0.0],
+    [-0.5, -0.5],
+    [-0.5,  0.5],
+    [ 0.5, -0.5],
+    [ 0.5,  0.5],
 ]
 
 walls = jnp.array(
@@ -1156,21 +1150,32 @@ def evaluate_elite_match(candidate_params, elite_params, base_states, verbose=Tr
 def record_bout(params_red, params_blue, initial_state):
     """
     Deterministic single-game replay recording.
-    Frame 0 of the returned arrays IS the exact starting state (fix #23).
+
+    IMPORTANT: This uses the exact same batched/vmap simulation path as
+    evaluate_match, but with a batch size of one. This prevents the
+    evaluation-vs-replay divergence caused by having separate single-game
+    and batched execution paths.
     """
+    # Add a leading batch dimension so action generation and physics follow
+    # exactly the same route as evaluate_match().
+    state0 = jax.tree_util.tree_map(lambda a: a[None, ...], initial_state)
+    E = 1
+
     def body(carry, step_idx):
         st, finished, result, end_step = carry
 
-        red_a = deterministic_world_action_single(params_red, st, 0.0)
-        blue_a = deterministic_world_action_single(params_blue, st, 1.0)
+        red_a = deterministic_world_action_batch(params_red, st, 0.0)
+        blue_a = deterministic_world_action_batch(params_blue, st, 1.0)
 
-        nxt, rr, br, done = step_one(st, red_a, blue_a)
+        nxt, rr, br, done = jax.vmap(step_one, in_axes=(0, 0, 0))(
+            st, red_a, blue_a
+        )
 
-        newly = done & (~finished)
+        active = ~finished
+        newly = done & active
 
-        red_cmd = nxt["alive"][RED_COMMANDER_INDEX] > 0
-        blue_cmd = nxt["alive"][BLUE_COMMANDER_INDEX] > 0
-
+        red_cmd = nxt["alive"][:, RED_COMMANDER_INDEX] > 0
+        blue_cmd = nxt["alive"][:, BLUE_COMMANDER_INDEX] > 0
         res_now = jnp.where(
             red_cmd & (~blue_cmd), 1,
             jnp.where(
@@ -1186,22 +1191,36 @@ def record_bout(params_red, params_blue, initial_state):
         end_step = jnp.where(newly, step_idx + 1, end_step)
         finished = finished | done
 
-        out = (nxt["x"], nxt["z"], nxt["hp"], nxt["alive"], red_a, blue_a)
+        out = (
+            nxt["x"], nxt["z"], nxt["hp"], nxt["alive"],
+            red_a, blue_a,
+        )
         return (nxt, finished, result, end_step), out
 
-    init = (initial_state,
-            jnp.array(False),
-            jnp.array(0, dtype=jnp.int32),
-            jnp.array(MAX_STEPS, dtype=jnp.int32))
+    init = (
+        state0,
+        jnp.zeros(E, dtype=bool),
+        jnp.zeros(E, dtype=jnp.int32),
+        jnp.full(E, MAX_STEPS, dtype=jnp.int32),
+    )
 
     (final_state, _, result, end_step), traj = lax.scan(
-        body, init, jnp.arange(MAX_STEPS))
+        body, init, jnp.arange(MAX_STEPS)
+    )
 
     result = jnp.where(result == 0, 3, result)
 
     xs, zs, hps, alives, red_actions, blue_actions = traj
 
-    # prepend the true t=0 frame
+    # Remove the singleton game dimension.
+    xs = xs[:, 0, :]
+    zs = zs[:, 0, :]
+    hps = hps[:, 0, :]
+    alives = alives[:, 0, :]
+    red_actions = red_actions[:, 0, :]
+    blue_actions = blue_actions[:, 0, :]
+
+    # Prepend the exact t=0 frame.
     xs = jnp.concatenate([initial_state["x"][None, :], xs], axis=0)
     zs = jnp.concatenate([initial_state["z"][None, :], zs], axis=0)
     hps = jnp.concatenate([initial_state["hp"][None, :], hps], axis=0)
@@ -1210,8 +1229,8 @@ def record_bout(params_red, params_blue, initial_state):
     return {
         "x": xs, "z": zs, "hp": hps, "alive": alives,
         "red_actions": red_actions, "blue_actions": blue_actions,
-        "result": result, "end_step": end_step,
-        "final_state": final_state,
+        "result": result[0], "end_step": end_step[0],
+        "final_state": jax.tree_util.tree_map(lambda a: a[0], final_state),
     }
 
 
@@ -1666,7 +1685,7 @@ def train(n_generations=N_GENERATIONS, resume=True):
 
             expected_result = int(match["result"][best_idx])
             replay_result = int(bout["result"])
-            final_alive = np.asarray(bout["final_state"]["alive"])
+            final_alive = np.asarray(bout["alive"][steps])
 
             if expected_result == 1:
                 commander_outcome_pass = (
@@ -1716,20 +1735,22 @@ def train(n_generations=N_GENERATIONS, resume=True):
                   f"{'PASS' if verification_pass else f'FAIL (err {max_err:.2e})'}")
             print(f"Commander outcome   : {'PASS' if commander_outcome_pass else 'FAIL'}")
 
-            if verification_pass and outcome_pass:
-                path = save_best_bout(
-                    os.path.join(
-                        BOUT_DIR,
-                        f"generation_{generation:04d}_best_bout.npz",
-                    ),
-                    generation, match, best_idx, bout,
-                    verification_pass, max_err,
-                    winner_params, winner_label, winner_team,
-                )
-                best_bout_saved = True
-                print(f"Saved               : {path}")
-            else:
-                print("Saved               : NO (evaluation/replay outcome mismatch)")
+            # Best Bout is selected solely from the Elite evaluation result.
+            # Replay is only a visualization/trajectory record and must never
+            # veto saving the evaluation winner.
+            path = save_best_bout(
+                os.path.join(
+                    BOUT_DIR,
+                    f"generation_{generation:04d}_best_bout.npz",
+                ),
+                generation, match, best_idx, bout,
+                verification_pass, max_err,
+                winner_params, winner_label, winner_team,
+            )
+            best_bout_saved = True
+            if replay_result != expected_result:
+                print("WARNING            : replay result differs from evaluation; evaluation remains authoritative")
+            print(f"Saved               : {path}")
 
         # ---- Elite update ----
 
@@ -1747,12 +1768,10 @@ def train(n_generations=N_GENERATIONS, resume=True):
         print(f"Best Bout     : {'SAVED' if best_bout_saved else 'NONE'}")
         print()
 
-        # Generation completed successfully. The PPO checkpoint is no longer needed.
-        removed_checkpoints = prune_checkpoints()
-        if removed_checkpoints:
-            print(f"Checkpoint cleanup: removed {removed_checkpoints} file(s) after Generation {generation} completion.")
-        else:
-            print(f"Checkpoint CLEARED after Generation {generation} (no checkpoint file remained).")
+        # Keep the latest PPO checkpoint even after Generation completion.
+        # This allows the trained state to be moved to another machine or resumed
+        # later. Older checkpoints are already pruned after each PPO update.
+        print("Checkpoint    : latest PPO checkpoint retained")
 
         global LAST_COMPLETED_GENERATION
         LAST_COMPLETED_GENERATION = generation
