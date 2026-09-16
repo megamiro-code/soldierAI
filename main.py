@@ -23,7 +23,12 @@ print("Devices     :", jax.devices())
 # PATHS
 # ============================================================
 
-BASE_DIR = os.environ.get("RTS_BASE_DIR", "./PPO_RTS")
+# スクリプト（a.txtなど）が存在するディレクトリの絶対パスを取得
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# どこから実行しても、必ずスクリプトと同じ階層（soldierAIの中）にPPO_RTSを作る
+BASE_DIR = os.environ.get("RTS_BASE_DIR", os.path.join(SCRIPT_DIR, "PPO_RTS"))
+
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
 ELITE_DIR = os.path.join(BASE_DIR, "elite")
 BOUT_DIR = os.path.join(BASE_DIR, "elite_bouts")
@@ -1903,7 +1908,7 @@ MINIBATCH_SIZE = (
 )
 
 PPO_UPDATES_PER_GENERATION = 20
-N_GENERATIONS = 20
+N_GENERATIONS = 100
 
 EVAL_GAMES_PER_SIDE = 32
 EVAL_GAMES = (
