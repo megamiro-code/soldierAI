@@ -7,16 +7,34 @@
 import argparse
 import glob
 import os
+import re
 
-from main import show_replay, BOUT_DIR, generation_number
+from main import show_replay, BOUT_DIR
+
+
+# Best Bout 専用の世代番号解析。
+# main.py の generation_number() は
+#   generation_0035_best_bout.npz
+# のような Best Bout ファイル名には対応していないため、
+# replay.py 側では専用の正規表現で安全に世代番号だけを取得する。
+def best_bout_generation_number(path):
+    name = os.path.basename(path)
+    match = re.fullmatch(r"generation_(\d+)_best_bout\.npz", name)
+    if match is None:
+        return -1
+    return int(match.group(1))
+
+
+def list_best_bout_files():
+    files = glob.glob(
+        os.path.join(BOUT_DIR, "generation_*_best_bout.npz")
+    )
+    return sorted(files, key=best_bout_generation_number)
 
 
 def list_available_generations():
-    files = sorted(
-        glob.glob(os.path.join(BOUT_DIR, "generation_*_best_bout.npz")),
-        key=generation_number,
-    )
-    return [generation_number(f) for f in files]
+    files = list_best_bout_files()
+    return [best_bout_generation_number(f) for f in files]
 
 
 def main():
