@@ -1627,10 +1627,20 @@ def record_bout(params_red, params_blue, initial_state):
         red_a = deterministic_world_action_batch(params_red, st, 0.0)
         blue_a = deterministic_world_action_batch(params_blue, st, 1.0)
 
-        nxt, rr, br, done = jax.vmap(step_one, in_axes=(0, 0, 0))(
-            st, red_a, blue_a
+        # This is a single recorded bout (E=1). Use the exact same scalar
+        # step_one path as verify_bout instead of vmap(step_one). This makes the
+        # stored trajectory and replay verification follow the identical physics
+        # execution path and prevents false position mismatches from batch/scalar
+        # floating-point differences on GPU.
+        st_scalar = jax.tree_util.tree_map(lambda a: a[0], st)
+        red_a_scalar = red_a[0]
+        blue_a_scalar = blue_a[0]
+        nxt_scalar, rr, br, done_scalar = step_one(
+            st_scalar, red_a_scalar, blue_a_scalar
         )
         del rr, br
+        nxt = jax.tree_util.tree_map(lambda a: a[None, ...], nxt_scalar)
+        done = done_scalar[None]
 
         active = ~finished
 
