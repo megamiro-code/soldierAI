@@ -72,7 +72,9 @@ N_FEATURES_PER_UNIT = 10
 TERRAIN_RES = 16
 
 OBS_SIZE = TERRAIN_RES * TERRAIN_RES + N_UNITS * N_FEATURES_PER_UNIT
-ACTION_SIZE = N_SOLDIERS_PER_TEAM * 3
+SOLDIER_ACTION_SIZE = N_SOLDIERS_PER_TEAM * 3
+COMMANDER_ACTION_SIZE = 2
+ACTION_SIZE = SOLDIER_ACTION_SIZE + COMMANDER_ACTION_SIZE
 
 SHAPING_COEF = 0.005
 
@@ -270,8 +272,8 @@ def reset_one(key):
     x = x.at[BLUE_COMMANDER_INDEX].set(5.80)
     z = z.at[BLUE_COMMANDER_INDEX].set(0.0)
 
-    speed = speed.at[RED_COMMANDER_INDEX].set(0.20)
-    speed = speed.at[BLUE_COMMANDER_INDEX].set(0.20)
+    speed = speed.at[RED_COMMANDER_INDEX].set(INITIAL_SOLDIER_SPEED * 0.5)
+    speed = speed.at[BLUE_COMMANDER_INDEX].set(INITIAL_SOLDIER_SPEED * 0.5)
 
     # --------------------------------------------------------
     # Fixed 2 x 10 cell starting formation
@@ -364,10 +366,25 @@ def tree_index(tree, i):
 # ------------------------------------------------------------
 
 def decode_actions(action):
-    action = action.reshape(N_SOLDIERS_PER_TEAM, 3)
-    raw_dx, raw_dz, raw_attack = action[:, 0], action[:, 1], action[:, 2]
+    # Layout: 300 soldier values (dx, dz, attack) + 2 commander movement values (dx, dz).
+    soldier_action = action[:SOLDIER_ACTION_SIZE].reshape(N_SOLDIERS_PER_TEAM, 3)
+    raw_dx = soldier_action[:, 0]
+    raw_dz = soldier_action[:, 1]
+    raw_attack = soldier_action[:, 2]
     norm = jnp.sqrt(raw_dx * raw_dx + raw_dz * raw_dz + 1e-8)
-    return raw_dx / norm, raw_dz / norm, (raw_attack > 0.5).astype(jnp.float32)
+    soldier_dx = raw_dx / norm
+    soldier_dz = raw_dz / norm
+
+    cmd_dx = action[SOLDIER_ACTION_SIZE]
+    cmd_dz = action[SOLDIER_ACTION_SIZE + 1]
+    cmd_norm = jnp.sqrt(cmd_dx * cmd_dx + cmd_dz * cmd_dz + 1e-8)
+    return (
+        soldier_dx,
+        soldier_dz,
+        (raw_attack > 0.5).astype(jnp.float32),
+        cmd_dx / cmd_norm,
+        cmd_dz / cmd_norm,
+    )
 
 
 def pairwise_separation(x, z, alive, movable=None):
@@ -416,13 +433,17 @@ def step_one(state, red_action, blue_action):
     hp, alive = state["hp"], state["alive"]
     attack_timer, speed = state["attack_timer"], state["speed"]
 
-    red_dx, red_dz, red_at = decode_actions(red_action)
-    blue_dx, blue_dz, blue_at = decode_actions(blue_action)
+    red_dx, red_dz, red_at, red_cmd_dx, red_cmd_dz = decode_actions(red_action)
+    blue_dx, blue_dz, blue_at, blue_cmd_dx, blue_cmd_dz = decode_actions(blue_action)
 
     move_dx = jnp.zeros(N_UNITS, dtype=jnp.float32)
     move_dz = jnp.zeros(N_UNITS, dtype=jnp.float32)
     move_at = jnp.zeros(N_UNITS, dtype=jnp.float32)
 
+    move_dx = move_dx.at[RED_COMMANDER_INDEX].set(red_cmd_dx)
+    move_dz = move_dz.at[RED_COMMANDER_INDEX].set(red_cmd_dz)
+    move_dx = move_dx.at[BLUE_COMMANDER_INDEX].set(blue_cmd_dx)
+    move_dz = move_dz.at[BLUE_COMMANDER_INDEX].set(blue_cmd_dz)
     move_dx = move_dx.at[ALL_SOLDIER_INDICES].set(jnp.concatenate([red_dx, blue_dx]))
     move_dz = move_dz.at[ALL_SOLDIER_INDICES].set(jnp.concatenate([red_dz, blue_dz]))
     move_at = move_at.at[ALL_SOLDIER_INDICES].set(jnp.concatenate([red_at, blue_at]))
@@ -583,16 +604,22 @@ make_observation_batch_jit = jax.jit(make_observation_batch)
 
 def local_to_world_action(action, perspective_team):
     blue = (perspective_team == 1.0)
-    ldx = action[..., 0::3]
-    ldz = action[..., 1::3]
-    at = action[..., 2::3]
+    soldier_action = action[..., :SOLDIER_ACTION_SIZE]
+    ldx = soldier_action[..., 0::3]
+    ldz = soldier_action[..., 1::3]
+    at = soldier_action[..., 2::3]
+    cmd_dx = action[..., SOLDIER_ACTION_SIZE]
+    cmd_dz = action[..., SOLDIER_ACTION_SIZE + 1]
 
     wdx = jnp.where(blue, -ldx, ldx)
+    wcmd_dx = jnp.where(blue, -cmd_dx, cmd_dx)
 
     out = jnp.zeros_like(action)
-    out = out.at[..., 0::3].set(wdx)
-    out = out.at[..., 1::3].set(ldz)
-    out = out.at[..., 2::3].set(at)
+    out = out.at[..., 0:SOLDIER_ACTION_SIZE:3].set(wdx)
+    out = out.at[..., 1:SOLDIER_ACTION_SIZE:3].set(ldz)
+    out = out.at[..., 2:SOLDIER_ACTION_SIZE:3].set(at)
+    out = out.at[..., SOLDIER_ACTION_SIZE].set(wcmd_dx)
+    out = out.at[..., SOLDIER_ACTION_SIZE + 1].set(cmd_dz)
     return out
 
 
@@ -648,9 +675,11 @@ EVAL_Z_OFFSETS = jnp.array(
     dtype=jnp.float32,
 )
 
-ANGLE_MEAN_IDX = jnp.arange(0, ACTION_SIZE, 3)
-ANGLE_LOGSTD_IDX = jnp.arange(1, ACTION_SIZE, 3)
-ATTACK_IDX = jnp.arange(2, ACTION_SIZE, 3)
+ANGLE_MEAN_IDX = jnp.arange(0, SOLDIER_ACTION_SIZE, 3)
+ANGLE_LOGSTD_IDX = jnp.arange(1, SOLDIER_ACTION_SIZE, 3)
+ATTACK_IDX = jnp.arange(2, SOLDIER_ACTION_SIZE, 3)
+COMMANDER_MEAN_IDX = SOLDIER_ACTION_SIZE
+COMMANDER_LOGSTD_IDX = SOLDIER_ACTION_SIZE + 1
 
 
 def init_policy(key):
@@ -666,7 +695,8 @@ def init_policy(key):
         "Wv": random.normal(k4, (HIDDEN2, 1)) * 0.01,
         "bv": jnp.zeros((1,)),
     }
-    p["ba"] = p["ba"].at[1::3].set(LOGSTD_INIT)
+    p["ba"] = p["ba"].at[ANGLE_LOGSTD_IDX].set(LOGSTD_INIT)
+    p["ba"] = p["ba"].at[COMMANDER_LOGSTD_IDX].set(LOGSTD_INIT)
     return p
 
 
@@ -690,8 +720,9 @@ def action_logprob(action_output, local_action):
     logstd = jnp.clip(action_output[:, ANGLE_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX)
     std = jnp.exp(logstd)
 
-    dx = local_action[:, 0::3]
-    dz = local_action[:, 1::3]
+    soldier_action = local_action[:, :SOLDIER_ACTION_SIZE]
+    dx = soldier_action[:, 0::3]
+    dz = soldier_action[:, 1::3]
     a = jnp.arctan2(dz, dx)
     diff = wrap_angle(a - angle_mean)
 
@@ -699,12 +730,22 @@ def action_logprob(action_output, local_action):
     lp_angle = jnp.sum(lp_angle, axis=1)
 
     logits = action_output[:, ATTACK_IDX]
-    at = local_action[:, ATTACK_IDX]
+    at = soldier_action[:, 2::3]
     lp_attack = (at * (-jnp.logaddexp(0.0, -logits)) +
                  (1.0 - at) * (-jnp.logaddexp(0.0, logits)))
     lp_attack = jnp.sum(lp_attack, axis=1)
 
-    return lp_angle + lp_attack
+    cmd_mean = action_output[:, COMMANDER_MEAN_IDX]
+    cmd_logstd = jnp.clip(action_output[:, COMMANDER_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX)
+    cmd_std = jnp.exp(cmd_logstd)
+    cmd_dx = local_action[:, SOLDIER_ACTION_SIZE]
+    cmd_dz = local_action[:, SOLDIER_ACTION_SIZE + 1]
+    cmd_angle = jnp.arctan2(cmd_dz, cmd_dx)
+    cmd_diff = wrap_angle(cmd_angle - cmd_mean)
+    lp_cmd = (-0.5 * (cmd_diff / cmd_std) ** 2
+              - cmd_logstd - 0.5 * jnp.log(2.0 * jnp.pi))
+
+    return lp_angle + lp_attack + lp_cmd
 
 
 def policy_entropy(action_output):
@@ -714,43 +755,61 @@ def policy_entropy(action_output):
     p = jax.nn.sigmoid(action_output[:, ATTACK_IDX])
     e_attack = -(p * jnp.log(p + 1e-8) + (1.0 - p) * jnp.log(1.0 - p + 1e-8))
     e_attack = jnp.sum(e_attack, axis=1)
-    return e_angle + e_attack
+
+    cmd_logstd = jnp.clip(action_output[:, COMMANDER_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX)
+    e_cmd = cmd_logstd + 0.5 * jnp.log(2.0 * jnp.pi * jnp.e)
+    return e_angle + e_attack + e_cmd
 
 
 def sample_action(params, obs, key):
     action_output, value = policy_forward(params, obs)
     B = obs.shape[0]
-    k_noise, k_attack = random.split(key)
+    k_noise_soldier, k_attack, k_noise_cmd = random.split(key, 3)
 
     mean = action_output[:, ANGLE_MEAN_IDX]
     logstd = jnp.clip(action_output[:, ANGLE_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX)
     std = jnp.exp(logstd)
 
-    angle = mean + std * random.normal(k_noise, (B, N_SOLDIERS_PER_TEAM))
+    angle = mean + std * random.normal(k_noise_soldier, (B, N_SOLDIERS_PER_TEAM))
     dx, dz = jnp.cos(angle), jnp.sin(angle)
 
     prob = jax.nn.sigmoid(action_output[:, ATTACK_IDX])
     at = random.bernoulli(k_attack, prob).astype(jnp.float32)
 
+    cmd_mean = action_output[:, COMMANDER_MEAN_IDX]
+    cmd_logstd = jnp.clip(action_output[:, COMMANDER_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX)
+    cmd_std = jnp.exp(cmd_logstd)
+    cmd_angle = cmd_mean + cmd_std * random.normal(k_noise_cmd, (B,))
+    cmd_dx, cmd_dz = jnp.cos(cmd_angle), jnp.sin(cmd_angle)
+
     la = jnp.zeros((B, ACTION_SIZE), dtype=jnp.float32)
-    la = la.at[:, 0::3].set(dx)
-    la = la.at[:, 1::3].set(dz)
-    la = la.at[:, 2::3].set(at)
+    la = la.at[:, 0:SOLDIER_ACTION_SIZE:3].set(dx)
+    la = la.at[:, 1:SOLDIER_ACTION_SIZE:3].set(dz)
+    la = la.at[:, 2:SOLDIER_ACTION_SIZE:3].set(at)
+    la = la.at[:, SOLDIER_ACTION_SIZE].set(cmd_dx)
+    la = la.at[:, SOLDIER_ACTION_SIZE + 1].set(cmd_dz)
 
     return la, action_logprob(action_output, la), value
 
 
 def deterministic_local_action(params, obs):
-    """obs : [B, OBS_SIZE]"""
+    """obs : [B, OBS_SIZE]. Returns soldier actions + commander movement."""
     action_output, value = policy_forward(params, obs)
+
     mean = action_output[:, ANGLE_MEAN_IDX]
     dx, dz = jnp.cos(mean), jnp.sin(mean)
     at = (jax.nn.sigmoid(action_output[:, ATTACK_IDX]) >= 0.5).astype(jnp.float32)
 
+    cmd_mean = action_output[:, COMMANDER_MEAN_IDX]
+    cmd_dx = jnp.cos(cmd_mean)
+    cmd_dz = jnp.sin(cmd_mean)
+
     la = jnp.zeros((obs.shape[0], ACTION_SIZE), dtype=jnp.float32)
-    la = la.at[:, 0::3].set(dx)
-    la = la.at[:, 1::3].set(dz)
-    la = la.at[:, 2::3].set(at)
+    la = la.at[:, 0:SOLDIER_ACTION_SIZE:3].set(dx)
+    la = la.at[:, 1:SOLDIER_ACTION_SIZE:3].set(dz)
+    la = la.at[:, 2:SOLDIER_ACTION_SIZE:3].set(at)
+    la = la.at[:, SOLDIER_ACTION_SIZE].set(cmd_dx)
+    la = la.at[:, SOLDIER_ACTION_SIZE + 1].set(cmd_dz)
     return la, value
 
 
