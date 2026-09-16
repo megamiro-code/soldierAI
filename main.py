@@ -1701,8 +1701,8 @@ def record_bout(params_red, params_blue, initial_state):
         "alive": alives,
         "red_actions": red_actions,
         "blue_actions": blue_actions,
-        "result": result[0],
-        "end_step": end_step[0],
+        "result": result,
+        "end_step": end_step,
         "final_state": jax.tree_util.tree_map(lambda a: a[0], final_state),
     }
 
@@ -2038,6 +2038,62 @@ def prune_checkpoints(keep_path=None):
 # PART 7 : TRAINING LOOP
 # ============================================================
 
+# Diagnostic deterministic replays are taken from the same fixed initial state
+# within each generation so that PPO-step-to-step behavioral changes can be
+# compared directly.  PPO=0 is the unchanged Elite policy.
+DIAGNOSTIC_PPO_STEPS = (0, 1, 2, 5, 10, 20)
+
+
+def save_diagnostic_bout(path, generation, ppo_step, bout):
+    steps = int(np.asarray(bout["end_step"]))
+    frames = steps + 1
+    red_actions = np.asarray(bout["red_actions"][:steps])
+    blue_actions = np.asarray(bout["blue_actions"][:steps])
+
+    # Red soldier movement cohesion: 1 means nearly identical directions,
+    # 0 means highly dispersed directions.  This is only a diagnostic metric;
+    # it does not affect training or Elite selection.
+    if red_actions.shape[0] > 0:
+        soldier_dx = red_actions[:, 0:SOLDIER_ACTION_SIZE:3]
+        soldier_dz = red_actions[:, 1:SOLDIER_ACTION_SIZE:3]
+        mean_dx = np.mean(soldier_dx, axis=1)
+        mean_dz = np.mean(soldier_dz, axis=1)
+        cohesion = np.sqrt(mean_dx * mean_dx + mean_dz * mean_dz)
+        mean_cohesion = float(np.mean(cohesion))
+    else:
+        mean_cohesion = float("nan")
+
+    data = {
+        "generation": np.array(generation, dtype=np.int32),
+        "ppo_step": np.array(ppo_step, dtype=np.int32),
+        "result_code": np.array(int(np.asarray(bout["result"])), dtype=np.int32),
+        "win_time": np.array(steps * DT, dtype=np.float32),
+        "end_step": np.array(steps, dtype=np.int32),
+        "dt": np.array(DT, dtype=np.float32),
+        "field_size": np.array(FIELD_SIZE, dtype=np.float32),
+        "terrain_res": np.array(TERRAIN_RES, dtype=np.int32),
+        "raw_obs_size": np.array(RAW_OBS_SIZE, dtype=np.int32),
+        "global_input_size": np.array(GLOBAL_INPUT_SIZE, dtype=np.int32),
+        "action_size": np.array(ACTION_SIZE, dtype=np.int32),
+        "attack_cooldown": np.array(ATTACK_COOLDOWN, dtype=np.float32),
+        "start_x": np.asarray(bout["x"][0]),
+        "start_z": np.asarray(bout["z"][0]),
+        "start_hp": np.asarray(bout["hp"][0]),
+        "start_alive": np.asarray(bout["alive"][0]),
+        "x": np.asarray(bout["x"][:frames]),
+        "z": np.asarray(bout["z"][:frames]),
+        "hp": np.asarray(bout["hp"][:frames]),
+        "alive": np.asarray(bout["alive"][:frames]),
+        "red_actions": red_actions,
+        "blue_actions": blue_actions,
+        "diagnostic_red_soldier_cohesion": np.array(
+            mean_cohesion, dtype=np.float32
+        ),
+    }
+    np.savez_compressed(path, **data)
+    return path, mean_cohesion
+
+
 LAST_COMPLETED_GENERATION = None
 
 
@@ -2152,9 +2208,17 @@ def train(n_generations=N_GENERATIONS, resume=True):
             candidate_opt = optimizer.init(candidate_params)
             first_ppo = 1
 
-        master_key, rk, ek = random.split(master_key, 3)
+        master_key, rk, ek, dk = random.split(master_key, 4)
         env_state = reset(rk)
         env_key = ek
+
+        # Fixed starting state shared by all diagnostic PPO-step replays in
+        # this generation.  The policy is always played deterministically
+        # (mean action), so stochastic sampling noise is excluded here.
+        diagnostic_base = reset_batch(dk, 1)
+        diagnostic_init_state = tree_index(
+            make_evaluation_states(diagnostic_base), 0
+        )
 
         cum = {
             "battles": 0,
@@ -2163,6 +2227,29 @@ def train(n_generations=N_GENERATIONS, resume=True):
             "timeouts": 0,
             "draws": 0,
         }
+
+        # PPO=0: the Candidate is exactly the current Elite before any PPO
+        # update.  Save this baseline so later PPO-step replays can be compared
+        # against the unchanged policy on the identical initial state.
+        if first_ppo == 1 and 0 in DIAGNOSTIC_PPO_STEPS:
+            diag_bout = record_bout(
+                elite_params,
+                elite_params,
+                diagnostic_init_state,
+            )
+            diag_path, diag_cohesion = save_diagnostic_bout(
+                os.path.join(
+                    BOUT_DIR,
+                    f"generation_{generation:04d}_ppo_000_diagnostic.npz",
+                ),
+                generation,
+                0,
+                diag_bout,
+            )
+            print(
+                f"Diagnostic PPO  0/20 | deterministic replay | "
+                f"soldier cohesion {diag_cohesion:.3f} | Saved: {diag_path}"
+            )
 
         for ppo_index in range(first_ppo, PPO_UPDATES_PER_GENERATION + 1):
             global_update = (
@@ -2216,8 +2303,30 @@ def train(n_generations=N_GENERATIONS, resume=True):
                 f"({metrics['entropy_per_soldier']:.3f}/soldier) "
                 f"logstd {metrics['logstd_mean']:.3f} "
                 f"KL {metrics['approx_kl']:.5f} "
-                f"clip {metrics['clip_fraction']:.3f}"
+                f"clip {metrics['clip_fraction']:.3f} "
+                f"policy {metrics['policy_loss']:.5f} "
+                f"value {metrics['value_loss']:.5f}"
             )
+
+            if ppo_index in DIAGNOSTIC_PPO_STEPS:
+                diag_bout = record_bout(
+                    candidate_params,
+                    elite_params,
+                    diagnostic_init_state,
+                )
+                diag_path, diag_cohesion = save_diagnostic_bout(
+                    os.path.join(
+                        BOUT_DIR,
+                        f"generation_{generation:04d}_ppo_{ppo_index:03d}_diagnostic.npz",
+                    ),
+                    generation,
+                    ppo_index,
+                    diag_bout,
+                )
+                print(
+                    f"Diagnostic PPO {ppo_index:2d}/20 | deterministic replay | "
+                    f"soldier cohesion {diag_cohesion:.3f} | Saved: {diag_path}"
+                )
 
         print()
         print("PPO summary")
