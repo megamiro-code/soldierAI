@@ -122,13 +122,15 @@ ACTION_DIM = ACTION_SIZE
 # Reward settings
 # ------------------------------------------------------------
 
-REWARD_SOLDIER_HIT = 0.05
+REWARD_SOLDIER_HIT = 0.050
 REWARD_SOLDIER_MISS = -0.003
-REWARD_SOLDIER_WALL = -0.08
+REWARD_SOLDIER_WALL = -0.050
 REWARD_SOLDIER_KILL = 0.050
-REWARD_COMMANDER_WALL = 0.005
+REWARD_SOLDIER_APPROACH = 0.005
+REWARD_COMMANDER_WALL = -0.005
 REWARD_COMMANDER_HIT_BY_ENEMY = -0.020
-REWARD_COMMANDER_WIN = 6.0
+REWARD_COMMANDER_WIN = 4.0
+REWARD_COMMANDER_LOSS = -4.0
 
 # Original damage shaping is intentionally disabled.
 SHAPING_COEF = 0.0
@@ -462,29 +464,59 @@ def step_one(state, red_action, blue_action):
     hp_after = hp - attack_damage
     target_died = (hp_before > 0) & (hp_after <= 0)
 
-    # An attacker gets the kill reward when its target dies in this step.
     attacker_kill = (
         can_attack
         & target_died[target]
     ).astype(jnp.float32)
 
-    soldier_rewards = jnp.zeros(N_SOLDIERS_TOTAL, dtype=jnp.float32)
     soldier_wall = wall_collision[ALL_SOLDIER_INDICES].astype(jnp.float32)
+
+    # Per-soldier approach shaping: reward only actual progress toward the
+    # enemy commander, not merely being near it. This is kept small so it does
+    # not dominate hit/kill or the terminal win signal.
+    enemy_cmd_idx = jnp.where(
+        a_team < 0.5,
+        BLUE_COMMANDER_INDEX,
+        RED_COMMANDER_INDEX,
+    )
+    old_enemy_x = x[enemy_cmd_idx]
+    old_enemy_z = z[enemy_cmd_idx]
+    new_enemy_x = nx[enemy_cmd_idx]
+    new_enemy_z = nz[enemy_cmd_idx]
+
+    old_cmd_dx = old_enemy_x - ax
+    old_cmd_dz = old_enemy_z - az
+    new_cmd_dx = new_enemy_x - ax
+    new_cmd_dz = new_enemy_z - az
+    old_cmd_dist = jnp.sqrt(old_cmd_dx * old_cmd_dx + old_cmd_dz * old_cmd_dz + 1e-8)
+    new_cmd_dist = jnp.sqrt(new_cmd_dx * new_cmd_dx + new_cmd_dz * new_cmd_dz + 1e-8)
+    distance_progress = old_cmd_dist - new_cmd_dist
+    enemy_cmd_alive = (alive[enemy_cmd_idx] > 0).astype(jnp.float32)
+    approach_reward = (
+        REWARD_SOLDIER_APPROACH
+        * distance_progress
+        * (alive[ALL_SOLDIER_INDICES] > 0).astype(jnp.float32)
+        * enemy_cmd_alive
+    )
+
     soldier_rewards = (
-        soldier_rewards
-        + REWARD_SOLDIER_HIT * can_attack.astype(jnp.float32)
+        REWARD_SOLDIER_HIT * can_attack.astype(jnp.float32)
         + REWARD_SOLDIER_MISS * attack_miss.astype(jnp.float32)
         + REWARD_SOLDIER_WALL * soldier_wall
         + REWARD_SOLDIER_KILL * attacker_kill
+        + approach_reward
     )
 
     local_reward = jnp.zeros(N_UNITS, dtype=jnp.float32)
     local_reward = local_reward.at[ALL_SOLDIER_INDICES].set(soldier_rewards)
 
-    # Commander wall collision.
-    local_reward = local_reward + REWARD_COMMANDER_WALL * wall_collision.astype(jnp.float32) * commander_mask
+    local_reward = (
+        local_reward
+        + REWARD_COMMANDER_WALL
+        * wall_collision.astype(jnp.float32)
+        * commander_mask
+    )
 
-    # Commander takes -0.020 for each enemy soldier attack that actually hits.
     red_cmd_hits = jnp.sum(
         can_attack
         & (target == RED_COMMANDER_INDEX)
@@ -512,40 +544,34 @@ def step_one(state, red_action, blue_action):
 
     new_time = state["time"] + DT
 
-    red_cmd = alive[RED_COMMANDER_INDEX] > 0
-    blue_cmd = alive[BLUE_COMMANDER_INDEX] > 0
-    commander_done = (~red_cmd) | (~blue_cmd)
+    red_cmd_alive = alive[RED_COMMANDER_INDEX] > 0
+    blue_cmd_alive = alive[BLUE_COMMANDER_INDEX] > 0
+    commander_done = (~red_cmd_alive) | (~blue_cmd_alive)
     timeout = new_time >= MAX_TIME
     done = commander_done | timeout
 
     red_n = jnp.sum(alive[RED_SOLDIER_START:RED_SOLDIER_END])
     blue_n = jnp.sum(alive[BLUE_SOLDIER_START:BLUE_SOLDIER_END])
 
-    commander_reward = REWARD_COMMANDER_WIN * (red_cmd.astype(jnp.float32) - blue_cmd.astype(jnp.float32))
-    timeout_reward = (red_n - blue_n) / N_SOLDIERS_PER_TEAM
     terminal_red = jnp.where(
         commander_done,
-        commander_reward,
-        jnp.where(timeout, timeout_reward, 0.0),
+        jnp.where(
+            red_cmd_alive & (~blue_cmd_alive),
+            REWARD_COMMANDER_WIN,
+            jnp.where(
+                blue_cmd_alive & (~red_cmd_alive),
+                REWARD_COMMANDER_LOSS,
+                0.0,
+            ),
+        ),
+        jnp.where(timeout, (red_n - blue_n) / N_SOLDIERS_PER_TEAM, 0.0),
     )
     terminal_blue = -terminal_red
 
-    # Shared-PPO scalar reward: average local reward over the 101 own units.
-    red_local = jnp.mean(
-        jnp.concatenate([
-            local_reward[RED_COMMANDER_INDEX:RED_COMMANDER_INDEX + 1],
-            local_reward[RED_SOLDIER_START:RED_SOLDIER_END],
-        ])
-    )
-    blue_local = jnp.mean(
-        jnp.concatenate([
-            local_reward[BLUE_COMMANDER_INDEX:BLUE_COMMANDER_INDEX + 1],
-            local_reward[BLUE_SOLDIER_START:BLUE_SOLDIER_END],
-        ])
-    )
-
-    reward_red = terminal_red + red_local
-    reward_blue = terminal_blue + blue_local
+    red_soldier_reward = local_reward[RED_SOLDIER_START:RED_SOLDIER_END]
+    blue_soldier_reward = local_reward[BLUE_SOLDIER_START:BLUE_SOLDIER_END]
+    red_commander_reward = local_reward[RED_COMMANDER_INDEX]
+    blue_commander_reward = local_reward[BLUE_COMMANDER_INDEX]
 
     next_state = {
         "x": nx,
@@ -560,7 +586,16 @@ def step_one(state, red_action, blue_action):
         "done": done,
     }
 
-    return next_state, reward_red, reward_blue, done
+    return (
+        next_state,
+        terminal_red,
+        terminal_blue,
+        red_soldier_reward,
+        blue_soldier_reward,
+        red_commander_reward,
+        blue_commander_reward,
+        done,
+    )
 
 
 def env_step(state, red_action, blue_action):
@@ -779,19 +814,24 @@ GAMMA = 0.999
 GAE_LAMBDA = 0.97
 CLIP_EPS = 0.20
 VALUE_COEF = 0.5
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 5e-5
 
-ENTROPY_START = 0.0005
-ENTROPY_END = 0.00005
+ENTROPY_START = 0.005
+ENTROPY_END = 0.0005
 
 LOGSTD_INIT = -1.0
 LOGSTD_MIN = -3.0
-LOGSTD_MAX = -0.7
+LOGSTD_MAX = -0.3
 LOGSTD_TARGET = -1.0
 LOGSTD_REG_COEF = 0.01
 
 PPO_EPOCHS = 4
 MINIBATCHES = 16
+
+# Stop PPO epoch/update early when the full-action KL grows too large.
+# This KL is summed over the full RTS action, so it is intentionally
+# looser than typical single-action PPO thresholds.
+TARGET_KL = 0.30
 
 PPO_ROLLOUT_STEPS = 512
 ROLLOUT_STEPS = PPO_ROLLOUT_STEPS
@@ -799,9 +839,13 @@ BATCH_SIZE = ROLLOUT_STEPS * N_ENVS * 2
 MINIBATCH_SIZE = BATCH_SIZE // MINIBATCHES
 
 PPO_UPDATES_PER_GENERATION = 5
-N_GENERATIONS = 400
+N_GENERATIONS = 100
 EVAL_GAMES_PER_SIDE = 32
 EVAL_GAMES = EVAL_GAMES_PER_SIDE * 2
+
+# Stagger generation starts so PPO 1 is not forced to begin with every
+# environment at t=0. Warm-up data is never used as PPO training data.
+WARMUP_MAX_STEPS = MAX_STEPS
 
 EVAL_Z_OFFSETS = jnp.array(
     [-0.72, -0.48, -0.24, 0.00, 0.24, 0.48, 0.72, 0.00],
@@ -875,7 +919,7 @@ def init_attention_block(key, prefix):
 
 
 def init_policy(key):
-    keys = random.split(key, 24)
+    keys = random.split(key, 32)
     p = {
         "Ws1": glorot_uniform(keys[0], (SOLDIER_FEATURES, LOCAL_HIDDEN_SIZE)),
         "bs1": jnp.zeros((LOCAL_HIDDEN_SIZE,)),
@@ -885,26 +929,30 @@ def init_policy(key):
         "bc": jnp.zeros((LOCAL_EMBED_SIZE,)),
         "Wg1": glorot_uniform(keys[3], (GLOBAL_INPUT_SIZE, HIDDEN1)),
         "bg1": jnp.zeros((HIDDEN1,)),
-        "W_actor": glorot_uniform(keys[4], (HIDDEN1, ACTOR_HIDDEN)),
-        "b_actor": jnp.zeros((ACTOR_HIDDEN,)),
-        "W_critic": glorot_uniform(keys[5], (HIDDEN1, CRITIC_HIDDEN)),
+        "W_actor_s": glorot_uniform(keys[4], (HIDDEN1, ACTOR_HIDDEN)),
+        "b_actor_s": jnp.zeros((ACTOR_HIDDEN,)),
+        "W_actor_c": glorot_uniform(keys[5], (HIDDEN1, ACTOR_HIDDEN)),
+        "b_actor_c": jnp.zeros((ACTOR_HIDDEN,)),
+        "W_critic": glorot_uniform(keys[6], (HIDDEN1, CRITIC_HIDDEN)),
         "b_critic": jnp.zeros((CRITIC_HIDDEN,)),
-        "Wa": random.normal(keys[6], (ACTOR_HIDDEN, ACTION_SIZE)) * 0.01,
-        "ba": jnp.zeros((ACTION_SIZE,)),
-        "Wv": random.normal(keys[7], (CRITIC_HIDDEN, 1)) * 0.01,
+        "Wa_s": random.normal(keys[7], (ACTOR_HIDDEN, SOLDIER_ACTION_SIZE)) * 0.01,
+        "ba_s": jnp.zeros((SOLDIER_ACTION_SIZE,)),
+        "Wa_c": random.normal(keys[8], (ACTOR_HIDDEN, COMMANDER_ACTION_SIZE)) * 0.01,
+        "ba_c": jnp.zeros((COMMANDER_ACTION_SIZE,)),
+        "Wv": random.normal(keys[9], (CRITIC_HIDDEN, 1)) * 0.01,
         "bv": jnp.zeros((1,)),
     }
-    p.update(init_attention_block(keys[8], "attn1"))
-    p.update(init_attention_block(keys[9], "attn2"))
+    p.update(init_attention_block(keys[10], "attn1"))
+    p.update(init_attention_block(keys[11], "attn2"))
 
-    # Preserve a single zero-padded output layout: angle mean / logstd / attack,
-    # followed by the two commander angle outputs.
-    p["ba"] = p["ba"].at[ANGLE_LOGSTD_IDX].set(LOGSTD_INIT)
-    p["ba"] = p["ba"].at[COMMANDER_LOGSTD_IDX].set(LOGSTD_INIT)
+    # Soldier layout: [angle_mean, angle_logstd, attack] x 100.
+    p["ba_s"] = p["ba_s"].at[ANGLE_LOGSTD_IDX].set(LOGSTD_INIT)
+    # Commander layout: [angle_mean, angle_logstd].
+    p["ba_c"] = p["ba_c"].at[COMMANDER_LOGSTD_IDX - SOLDIER_ACTION_SIZE].set(LOGSTD_INIT)
     return p
 
 
-def policy_forward(params, obs):
+def policy_forward(params, obs, detach_encoders=False):
     terrain_part = obs[:, :TERRAIN_SIZE]
     soldier_start = TERRAIN_SIZE
     soldier_end = soldier_start + N_SOLDIERS_TOTAL * SOLDIER_FEATURES
@@ -919,8 +967,6 @@ def policy_forward(params, obs):
     soldier_emb = jnp.tanh(soldier_h @ params["Ws2"] + params["bs2"])
     commander_emb = jnp.tanh(commander_part @ params["Wc"] + params["bc"])
 
-    # Keep red and blue soldiers as separate 100-token sets. This preserves the
-    # fixed action indexing and lets both teams learn internal coordination.
     red_soldier_emb = soldier_emb[:, :N_SOLDIERS_PER_TEAM, :]
     blue_soldier_emb = soldier_emb[:, N_SOLDIERS_PER_TEAM:, :]
 
@@ -928,33 +974,53 @@ def policy_forward(params, obs):
     blue_soldier_emb = self_attention_block(blue_soldier_emb, params, "attn1")
     red_soldier_emb = self_attention_block(red_soldier_emb, params, "attn2")
     blue_soldier_emb = self_attention_block(blue_soldier_emb, params, "attn2")
-
     soldier_emb = jnp.concatenate([red_soldier_emb, blue_soldier_emb], axis=1)
+
+    if detach_encoders:
+        soldier_global = lax.stop_gradient(soldier_emb)
+        commander_global = lax.stop_gradient(commander_emb)
+    else:
+        soldier_global = soldier_emb
+        commander_global = commander_emb
 
     global_input = jnp.concatenate([
         terrain_part,
-        soldier_emb.reshape(obs.shape[0], -1),
-        commander_emb.reshape(obs.shape[0], -1),
+        soldier_global.reshape(obs.shape[0], -1),
+        commander_global.reshape(obs.shape[0], -1),
     ], axis=-1)
 
     h_shared = jnp.tanh(global_input @ params["Wg1"] + params["bg1"])
 
-    actor_h = jnp.tanh(h_shared @ params["W_actor"] + params["b_actor"])
-    critic_h = jnp.tanh(h_shared @ params["W_critic"] + params["b_critic"])
+    soldier_h_actor = jnp.tanh(
+        h_shared @ params["W_actor_s"] + params["b_actor_s"]
+    )
+    commander_h_actor = jnp.tanh(
+        h_shared @ params["W_actor_c"] + params["b_actor_c"]
+    )
+    critic_h = jnp.tanh(
+        h_shared @ params["W_critic"] + params["b_critic"]
+    )
 
-    action_output = actor_h @ params["Wa"] + params["ba"]
+    soldier_output = soldier_h_actor @ params["Wa_s"] + params["ba_s"]
+    commander_output = commander_h_actor @ params["Wa_c"] + params["ba_c"]
+    action_output = jnp.concatenate([soldier_output, commander_output], axis=-1)
     value = (critic_h @ params["Wv"] + params["bv"])[..., 0]
     return action_output, value
 
+
+policy_forward_jit = jax.jit(policy_forward)
 
 
 def wrap_angle(a):
     return (a + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
 
-def action_logprob(action_output, local_action):
-    angle_mean = action_output[:, ANGLE_MEAN_IDX]
-    logstd = jnp.clip(action_output[:, ANGLE_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX)
+def action_logprob_components(action_output, local_action):
+    soldier_output = action_output[:, :SOLDIER_ACTION_SIZE]
+    commander_output = action_output[:, SOLDIER_ACTION_SIZE:]
+
+    angle_mean = soldier_output[:, ANGLE_MEAN_IDX]
+    logstd = jnp.clip(soldier_output[:, ANGLE_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX)
     std = jnp.exp(logstd)
 
     soldier_action = local_action[:, :SOLDIER_ACTION_SIZE]
@@ -968,50 +1034,54 @@ def action_logprob(action_output, local_action):
         - logstd
         - 0.5 * jnp.log(2.0 * jnp.pi)
     )
-    lp_angle = jnp.sum(lp_angle, axis=1)
 
-    logits = action_output[:, ATTACK_IDX]
+    logits = soldier_output[:, ATTACK_IDX]
     at = soldier_action[:, 2::3]
     lp_attack = (
         at * (-jnp.logaddexp(0.0, -logits))
         + (1.0 - at) * (-jnp.logaddexp(0.0, logits))
     )
-    lp_attack = jnp.sum(lp_attack, axis=1)
+    soldier_lp = lp_angle + lp_attack
 
-    cmd_mean = action_output[:, COMMANDER_MEAN_IDX]
-    cmd_logstd = jnp.clip(
-        action_output[:, COMMANDER_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX
-    )
+    cmd_mean = commander_output[:, 0]
+    cmd_logstd = jnp.clip(commander_output[:, 1], LOGSTD_MIN, LOGSTD_MAX)
     cmd_std = jnp.exp(cmd_logstd)
     cmd_dx = local_action[:, SOLDIER_ACTION_SIZE]
     cmd_dz = local_action[:, SOLDIER_ACTION_SIZE + 1]
     cmd_angle = jnp.arctan2(cmd_dz, cmd_dx)
     cmd_diff = wrap_angle(cmd_angle - cmd_mean)
-    lp_cmd = (
+    commander_lp = (
         -0.5 * (cmd_diff / cmd_std) ** 2
         - cmd_logstd
         - 0.5 * jnp.log(2.0 * jnp.pi)
     )
 
-    return lp_angle + lp_attack + lp_cmd
+    team_lp = jnp.sum(soldier_lp, axis=1) + commander_lp
+    return soldier_lp, commander_lp, team_lp
+
+
+def action_logprob(action_output, local_action):
+    _, _, team_lp = action_logprob_components(action_output, local_action)
+    return team_lp
 
 
 def policy_entropy(action_output):
-    logstd = jnp.clip(action_output[:, ANGLE_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX)
+    soldier_output = action_output[:, :SOLDIER_ACTION_SIZE]
+    commander_output = action_output[:, SOLDIER_ACTION_SIZE:]
+
+    logstd = jnp.clip(soldier_output[:, ANGLE_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX)
     e_angle = jnp.sum(
         logstd + 0.5 * jnp.log(2.0 * jnp.pi * jnp.e), axis=1
     )
 
-    p = jax.nn.sigmoid(action_output[:, ATTACK_IDX])
+    p = jax.nn.sigmoid(soldier_output[:, ATTACK_IDX])
     e_attack = -(
         p * jnp.log(p + 1e-8)
         + (1.0 - p) * jnp.log(1.0 - p + 1e-8)
     )
     e_attack = jnp.sum(e_attack, axis=1)
 
-    cmd_logstd = jnp.clip(
-        action_output[:, COMMANDER_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX
-    )
+    cmd_logstd = jnp.clip(commander_output[:, 1], LOGSTD_MIN, LOGSTD_MAX)
     e_cmd = cmd_logstd + 0.5 * jnp.log(2.0 * jnp.pi * jnp.e)
     return e_angle + e_attack + e_cmd
 
@@ -1021,8 +1091,11 @@ def sample_action(params, obs, key):
     B = obs.shape[0]
     k_noise_soldier, k_attack, k_noise_cmd = random.split(key, 3)
 
-    mean = action_output[:, ANGLE_MEAN_IDX]
-    logstd = jnp.clip(action_output[:, ANGLE_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX)
+    soldier_output = action_output[:, :SOLDIER_ACTION_SIZE]
+    commander_output = action_output[:, SOLDIER_ACTION_SIZE:]
+
+    mean = soldier_output[:, ANGLE_MEAN_IDX]
+    logstd = jnp.clip(soldier_output[:, ANGLE_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX)
     std = jnp.exp(logstd)
 
     angle = mean + std * random.normal(
@@ -1030,13 +1103,11 @@ def sample_action(params, obs, key):
     )
     dx, dz = jnp.cos(angle), jnp.sin(angle)
 
-    prob = jax.nn.sigmoid(action_output[:, ATTACK_IDX])
+    prob = jax.nn.sigmoid(soldier_output[:, ATTACK_IDX])
     at = random.bernoulli(k_attack, prob).astype(jnp.float32)
 
-    cmd_mean = action_output[:, COMMANDER_MEAN_IDX]
-    cmd_logstd = jnp.clip(
-        action_output[:, COMMANDER_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX
-    )
+    cmd_mean = commander_output[:, 0]
+    cmd_logstd = jnp.clip(commander_output[:, 1], LOGSTD_MIN, LOGSTD_MAX)
     cmd_std = jnp.exp(cmd_logstd)
     cmd_angle = cmd_mean + cmd_std * random.normal(k_noise_cmd, (B,))
     cmd_dx, cmd_dz = jnp.cos(cmd_angle), jnp.sin(cmd_angle)
@@ -1048,17 +1119,20 @@ def sample_action(params, obs, key):
     la = la.at[:, SOLDIER_ACTION_SIZE].set(cmd_dx)
     la = la.at[:, SOLDIER_ACTION_SIZE + 1].set(cmd_dz)
 
-    return la, action_logprob(action_output, la), value
+    soldier_lp, commander_lp, team_lp = action_logprob_components(action_output, la)
+    return la, soldier_lp, commander_lp, team_lp, value
 
 
 def deterministic_local_action(params, obs):
     action_output, value = policy_forward(params, obs)
+    soldier_output = action_output[:, :SOLDIER_ACTION_SIZE]
+    commander_output = action_output[:, SOLDIER_ACTION_SIZE:]
 
-    mean = action_output[:, ANGLE_MEAN_IDX]
+    mean = soldier_output[:, ANGLE_MEAN_IDX]
     dx, dz = jnp.cos(mean), jnp.sin(mean)
-    at = (jax.nn.sigmoid(action_output[:, ATTACK_IDX]) >= 0.5).astype(jnp.float32)
+    at = (jax.nn.sigmoid(soldier_output[:, ATTACK_IDX]) >= 0.5).astype(jnp.float32)
 
-    cmd_mean = action_output[:, COMMANDER_MEAN_IDX]
+    cmd_mean = commander_output[:, 0]
     cmd_dx = jnp.cos(cmd_mean)
     cmd_dz = jnp.sin(cmd_mean)
 
@@ -1115,52 +1189,155 @@ def compute_gae(rewards, values, dones, last_value):
     return adv, adv + values
 
 
-def ppo_loss(params, obs, local_actions, old_log_prob, advantages, returns, ent_coef):
-    action_output, values = policy_forward(params, obs)
-    new_log_prob = action_logprob(action_output, local_actions)
-    entropy = jnp.mean(policy_entropy(action_output))
+def compute_discounted_returns(rewards, dones):
+    """Monte-Carlo reward-to-go used for the local Soldier/Commander skill losses."""
+    def rev(carry, xs):
+        ret = carry
+        r_t, d_t = xs
+        m = 1.0 - d_t.astype(jnp.float32)
+        ret = r_t + GAMMA * m * ret
+        return ret, ret
 
-    soldier_logstd = action_output[:, ANGLE_LOGSTD_IDX]
-    commander_logstd = action_output[:, COMMANDER_LOGSTD_IDX]
-    soldier_logstd_reg = jnp.mean((soldier_logstd - LOGSTD_TARGET) ** 2)
-    commander_logstd_reg = jnp.mean((commander_logstd - LOGSTD_TARGET) ** 2)
-    # Balance the 100 soldier dimensions against the single commander dimension.
-    logstd_reg = 0.5 * soldier_logstd_reg + 0.5 * commander_logstd_reg
+    _, returns = lax.scan(
+        rev,
+        jnp.zeros_like(rewards[0]),
+        (rewards[::-1], dones[::-1]),
+    )
+    return returns[::-1]
 
-    ratio = jnp.exp(new_log_prob - old_log_prob)
-    unclipped = ratio * advantages
-    clipped = (
-        jnp.clip(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS)
-        * advantages
+
+# Gradient ownership for the three reward systems.
+SOLDIER_LOCAL_KEYS = (
+    "Ws1", "bs1", "Ws2", "bs2",
+    "attn1_Wq", "attn1_bq", "attn1_Wk", "attn1_bk",
+    "attn1_Wv", "attn1_bv", "attn1_Wo", "attn1_bo",
+    "attn1_ln_gamma", "attn1_ln_beta",
+    "attn2_Wq", "attn2_bq", "attn2_Wk", "attn2_bk",
+    "attn2_Wv", "attn2_bv", "attn2_Wo", "attn2_bo",
+    "attn2_ln_gamma", "attn2_ln_beta",
+    "W_actor_s", "b_actor_s", "Wa_s", "ba_s",
+)
+COMMANDER_LOCAL_KEYS = (
+    "Wc", "bc",
+    "W_actor_c", "b_actor_c", "Wa_c", "ba_c",
+)
+TEAM_KEYS = (
+    "Wg1", "bg1",
+    "W_actor_s", "b_actor_s", "Wa_s", "ba_s",
+    "W_actor_c", "b_actor_c", "Wa_c", "ba_c",
+    "W_critic", "b_critic", "Wv", "bv",
+)
+
+
+def masked_tree(tree, allowed_keys):
+    allowed = set(allowed_keys)
+    return {
+        k: (v if k in allowed else jnp.zeros_like(v))
+        for k, v in tree.items()
+    }
+
+
+def ppo_loss_parts(
+    params,
+    obs,
+    local_actions,
+    old_soldier_log_prob,
+    old_commander_log_prob,
+    old_team_log_prob,
+    soldier_advantages,
+    commander_advantages,
+    team_advantages,
+    returns,
+    ent_coef,
+):
+    """Build the three losses without mixing reward ownership."""
+    # For the team loss, detach both local encoders. This makes the global
+    # network/actor/critic learn from WIN/LOSS without sending that signal back
+    # into Soldier/Commander encoders.
+    team_action_output, team_values = policy_forward(
+        params, obs, detach_encoders=True
+    )
+    team_soldier_lp, team_commander_lp, team_lp = action_logprob_components(
+        team_action_output, local_actions
     )
 
-    policy_loss = -jnp.mean(jnp.minimum(unclipped, clipped))
-    value_loss = 0.5 * jnp.mean((returns - values) ** 2)
+    # Local skill losses use the full graph so their own encoder receives only
+    # their own reward signal after gradient masking.
+    local_action_output, _ = policy_forward(
+        params, obs, detach_encoders=False
+    )
+    soldier_lp, commander_lp, _ = action_logprob_components(
+        local_action_output, local_actions
+    )
 
-    total = (
-        policy_loss
+    # Soldier-specific PPO objective: one ratio per soldier.
+    soldier_ratio = jnp.exp(soldier_lp - old_soldier_log_prob)
+    soldier_unclipped = soldier_ratio * soldier_advantages
+    soldier_clipped = (
+        jnp.clip(soldier_ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS)
+        * soldier_advantages
+    )
+    soldier_policy_loss = -jnp.mean(
+        jnp.minimum(soldier_unclipped, soldier_clipped)
+    )
+
+    # Commander-specific PPO objective.
+    commander_ratio = jnp.exp(commander_lp - old_commander_log_prob)
+    commander_unclipped = commander_ratio * commander_advantages
+    commander_clipped = (
+        jnp.clip(commander_ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS)
+        * commander_advantages
+    )
+    commander_policy_loss = -jnp.mean(
+        jnp.minimum(commander_unclipped, commander_clipped)
+    )
+
+    # Team objective: the full action is judged by WIN/LOSS.
+    team_ratio = jnp.exp(team_lp - old_team_log_prob)
+    team_unclipped = team_ratio * team_advantages
+    team_clipped = (
+        jnp.clip(team_ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS)
+        * team_advantages
+    )
+    team_policy_loss = -jnp.mean(
+        jnp.minimum(team_unclipped, team_clipped)
+    )
+
+    entropy = jnp.mean(policy_entropy(team_action_output))
+    soldier_logstd = team_action_output[:, :SOLDIER_ACTION_SIZE][:, ANGLE_LOGSTD_IDX]
+    commander_logstd = team_action_output[:, SOLDIER_ACTION_SIZE + 1]
+    soldier_logstd_reg = jnp.mean((soldier_logstd - LOGSTD_TARGET) ** 2)
+    commander_logstd_reg = jnp.mean((commander_logstd - LOGSTD_TARGET) ** 2)
+    logstd_reg = 0.5 * soldier_logstd_reg + 0.5 * commander_logstd_reg
+
+    value_loss = 0.5 * jnp.mean((returns - team_values) ** 2)
+    team_total_loss = (
+        team_policy_loss
         + VALUE_COEF * value_loss
         - ent_coef * entropy
         + LOGSTD_REG_COEF * logstd_reg
     )
 
-    approx_kl = jnp.mean(old_log_prob - new_log_prob)
-    clip_fraction = jnp.mean(
-        (jnp.abs(ratio - 1.0) > CLIP_EPS).astype(jnp.float32)
-    )
-
     metrics = {
-        "policy_loss": policy_loss,
+        "soldier_policy_loss": soldier_policy_loss,
+        "commander_policy_loss": commander_policy_loss,
+        "team_policy_loss": team_policy_loss,
+        "policy_loss": team_policy_loss,
         "value_loss": value_loss,
         "entropy": entropy,
         "entropy_per_soldier": entropy / float(N_SOLDIERS_PER_TEAM),
         "logstd_mean": jnp.mean(jnp.clip(soldier_logstd, LOGSTD_MIN, LOGSTD_MAX)),
-        "commander_logstd_mean": jnp.mean(jnp.clip(commander_logstd, LOGSTD_MIN, LOGSTD_MAX)),
+        "commander_logstd_mean": jnp.mean(
+            jnp.clip(commander_logstd, LOGSTD_MIN, LOGSTD_MAX)
+        ),
         "logstd_reg": logstd_reg,
-        "approx_kl": approx_kl,
-        "clip_fraction": clip_fraction,
+        "approx_kl": jnp.mean(old_team_log_prob - team_lp),
+        "clip_fraction": jnp.mean(
+            (jnp.abs(team_ratio - 1.0) > CLIP_EPS).astype(jnp.float32)
+        ),
+        "team_total_loss": team_total_loss,
     }
-    return total, metrics
+    return metrics
 
 
 @jax.jit
@@ -1169,26 +1346,77 @@ def ppo_update_minibatch(
     opt_state,
     obs,
     local_actions,
-    old_log_prob,
-    advantages,
+    old_soldier_log_prob,
+    old_commander_log_prob,
+    old_team_log_prob,
+    soldier_advantages,
+    commander_advantages,
+    team_advantages,
     returns,
     ent_coef,
 ):
-    def loss_fn(p):
-        return ppo_loss(
-            p,
-            obs,
-            local_actions,
-            old_log_prob,
-            advantages,
+    def soldier_loss_fn(p):
+        m = ppo_loss_parts(
+            p, obs, local_actions,
+            old_soldier_log_prob,
+            old_commander_log_prob,
+            old_team_log_prob,
+            soldier_advantages,
+            commander_advantages,
+            team_advantages,
             returns,
             ent_coef,
         )
+        return m["soldier_policy_loss"]
 
-    (loss, metrics), grads = jax.value_and_grad(
-        loss_fn, has_aux=True
+    def commander_loss_fn(p):
+        m = ppo_loss_parts(
+            p, obs, local_actions,
+            old_soldier_log_prob,
+            old_commander_log_prob,
+            old_team_log_prob,
+            soldier_advantages,
+            commander_advantages,
+            team_advantages,
+            returns,
+            ent_coef,
+        )
+        return m["commander_policy_loss"]
+
+    def team_loss_fn(p):
+        m = ppo_loss_parts(
+            p, obs, local_actions,
+            old_soldier_log_prob,
+            old_commander_log_prob,
+            old_team_log_prob,
+            soldier_advantages,
+            commander_advantages,
+            team_advantages,
+            returns,
+            ent_coef,
+        )
+        return m["team_total_loss"], m
+
+    soldier_value, soldier_grads = jax.value_and_grad(
+        soldier_loss_fn
     )(params)
-    del loss
+    commander_value, commander_grads = jax.value_and_grad(
+        commander_loss_fn
+    )(params)
+    team_value, (team_grads, metrics) = jax.value_and_grad(
+        team_loss_fn, has_aux=True
+    )(params)
+    del soldier_value, commander_value, team_value
+
+    soldier_grads = masked_tree(soldier_grads, SOLDIER_LOCAL_KEYS)
+    commander_grads = masked_tree(commander_grads, COMMANDER_LOCAL_KEYS)
+    team_grads = masked_tree(team_grads, TEAM_KEYS)
+
+    grads = {
+        k: soldier_grads[k] + commander_grads[k] + team_grads[k]
+        for k in params
+    }
+
     updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
     return params, opt_state, metrics
@@ -1210,6 +1438,63 @@ def reset_finished_envs(state, done, key):
     return jax.tree_util.tree_map(merge, state, fresh)
 
 
+@jax.jit
+def warmup_env_state(params, state, key):
+    """Advance each environment by a random number of steps before PPO 1.
+
+    The warm-up trajectory is discarded. Its only purpose is to stagger the
+    episode phase across environments so the first PPO rollout contains a
+    realistic mixture of early/mid/late-episode states.
+    """
+    warmup_steps = random.randint(
+        key,
+        (N_ENVS,),
+        minval=0,
+        maxval=WARMUP_MAX_STEPS + 1,
+        dtype=jnp.int32,
+    )
+
+    def body(carry, step_idx):
+        st, k, completed = carry
+        k, kr, kb, kreset = random.split(k, 4)
+        red_obs, blue_obs = make_observation_pair_batch(st)
+        red_la, _, _, _, _ = sample_action(params, red_obs, kr)
+        blue_la, _, _, _, _ = sample_action(params, blue_obs, kb)
+        red_wa = local_to_world_action(red_la, 0.0)
+        blue_wa = local_to_world_action(blue_la, 1.0)
+
+        nxt, _, _, _, _, _, _, done = jax.vmap(
+            step_one, in_axes=(0, 0, 0)
+        )(st, red_wa, blue_wa)
+
+        active = step_idx < warmup_steps
+        effective_done = done & active
+        fresh = reset_parallel(random.split(kreset, N_ENVS))
+
+        def mask_for(old, mask):
+            return mask.reshape((N_ENVS,) + (1,) * (old.ndim - 1)) if old.ndim > 1 else mask
+
+        merged_nxt = jax.tree_util.tree_map(
+            lambda old, new: jnp.where(mask_for(old, active), new, old),
+            st,
+            nxt,
+        )
+        merged = jax.tree_util.tree_map(
+            lambda old, new: jnp.where(mask_for(old, effective_done), new, old),
+            merged_nxt,
+            fresh,
+        )
+        completed = completed + jnp.sum(effective_done.astype(jnp.int32))
+        return (merged, k, completed), None
+
+    (state, key, completed), _ = lax.scan(
+        body,
+        (state, key, jnp.array(0, dtype=jnp.int32)),
+        jnp.arange(WARMUP_MAX_STEPS, dtype=jnp.int32),
+    )
+    return state, key, completed
+
+
 @functools.partial(jax.jit, static_argnums=())
 def collect_rollout(params, state, key):
     def body(carry, _):
@@ -1219,13 +1504,34 @@ def collect_rollout(params, state, key):
 
         k, kr, kb, kreset = random.split(k, 4)
 
-        red_la, red_lp, red_v = sample_action(params, red_obs, kr)
-        blue_la, blue_lp, blue_v = sample_action(params, blue_obs, kb)
+        (
+            red_la,
+            red_soldier_lp,
+            red_commander_lp,
+            red_team_lp,
+            red_v,
+        ) = sample_action(params, red_obs, kr)
+        (
+            blue_la,
+            blue_soldier_lp,
+            blue_commander_lp,
+            blue_team_lp,
+            blue_v,
+        ) = sample_action(params, blue_obs, kb)
 
         red_wa = local_to_world_action(red_la, 0.0)
         blue_wa = local_to_world_action(blue_la, 1.0)
 
-        nxt, rr, br, done = jax.vmap(step_one, in_axes=(0, 0, 0))(
+        (
+            nxt,
+            rr,
+            br,
+            red_sr,
+            blue_sr,
+            red_cr,
+            blue_cr,
+            done,
+        ) = jax.vmap(step_one, in_axes=(0, 0, 0))(
             st, red_wa, blue_wa
         )
 
@@ -1253,12 +1559,20 @@ def collect_rollout(params, state, key):
             blue_obs,
             red_la,
             blue_la,
-            red_lp,
-            blue_lp,
+            red_soldier_lp,
+            blue_soldier_lp,
+            red_commander_lp,
+            blue_commander_lp,
+            red_team_lp,
+            blue_team_lp,
             red_v,
             blue_v,
             rr,
             br,
+            red_sr,
+            blue_sr,
+            red_cr,
+            blue_cr,
             done,
             reason,
         )
@@ -1276,12 +1590,20 @@ def collect_rollout(params, state, key):
         blue_obs,
         red_la,
         blue_la,
-        red_lp,
-        blue_lp,
+        red_soldier_lp,
+        blue_soldier_lp,
+        red_commander_lp,
+        blue_commander_lp,
+        red_team_lp,
+        blue_team_lp,
         red_v,
         blue_v,
-        red_r,
-        blue_r,
+        red_team_r,
+        blue_team_r,
+        red_soldier_r,
+        blue_soldier_r,
+        red_commander_r,
+        blue_commander_r,
         dones,
         reasons,
     ) = traj
@@ -1290,16 +1612,45 @@ def collect_rollout(params, state, key):
     _, red_last_v = policy_forward(params, f_red_obs)
     _, blue_last_v = policy_forward(params, f_blue_obs)
 
-    red_adv, red_ret = compute_gae(red_r, red_v, dones, red_last_v)
-    blue_adv, blue_ret = compute_gae(blue_r, blue_v, dones, blue_last_v)
+    red_team_adv, red_ret = compute_gae(
+        red_team_r, red_v, dones, red_last_v
+    )
+    blue_team_adv, blue_ret = compute_gae(
+        blue_team_r, blue_v, dones, blue_last_v
+    )
+
+    red_soldier_adv = compute_discounted_returns(red_soldier_r, dones)
+    blue_soldier_adv = compute_discounted_returns(blue_soldier_r, dones)
+    red_commander_adv = compute_discounted_returns(red_commander_r, dones)
+    blue_commander_adv = compute_discounted_returns(blue_commander_r, dones)
 
     obs = jnp.concatenate([red_obs, blue_obs], axis=1).reshape(-1, OBS_SIZE)
     acts = jnp.concatenate([red_la, blue_la], axis=1).reshape(-1, ACTION_SIZE)
-    logp = jnp.concatenate([red_lp, blue_lp], axis=1).reshape(-1)
-    adv = jnp.concatenate([red_adv, blue_adv], axis=1).reshape(-1)
-    ret = jnp.concatenate([red_ret, blue_ret], axis=1).reshape(-1)
 
-    adv = normalize_advantages(adv)
+    soldier_old_lp = jnp.concatenate(
+        [red_soldier_lp, blue_soldier_lp], axis=1
+    ).reshape(-1, N_SOLDIERS_PER_TEAM)
+    commander_old_lp = jnp.concatenate(
+        [red_commander_lp, blue_commander_lp], axis=1
+    ).reshape(-1)
+    team_old_lp = jnp.concatenate(
+        [red_team_lp, blue_team_lp], axis=1
+    ).reshape(-1)
+
+    soldier_adv = jnp.concatenate(
+        [red_soldier_adv, blue_soldier_adv], axis=1
+    ).reshape(-1, N_SOLDIERS_PER_TEAM)
+    commander_adv = jnp.concatenate(
+        [red_commander_adv, blue_commander_adv], axis=1
+    ).reshape(-1)
+    team_adv = jnp.concatenate(
+        [red_team_adv, blue_team_adv], axis=1
+    ).reshape(-1)
+    returns = jnp.concatenate([red_ret, blue_ret], axis=1).reshape(-1)
+
+    soldier_adv = normalize_advantages(soldier_adv)
+    commander_adv = normalize_advantages(commander_adv)
+    team_adv = normalize_advantages(team_adv)
 
     stats = {
         "battles": jnp.sum(reasons != 0),
@@ -1314,19 +1665,55 @@ def collect_rollout(params, state, key):
         final_key,
         obs,
         acts,
-        logp,
-        adv,
-        ret,
+        soldier_old_lp,
+        commander_old_lp,
+        team_old_lp,
+        soldier_adv,
+        commander_adv,
+        team_adv,
+        returns,
         stats,
     )
 
 
+def tree_l2_norm(tree):
+    leaves = jax.tree_util.tree_leaves(tree)
+    total = 0.0
+    for leaf in leaves:
+        arr = np.asarray(leaf)
+        total += float(np.sum(arr.astype(np.float64) ** 2))
+    return float(np.sqrt(total))
+
+
+def tree_delta_l2_norm(before, after):
+    before_leaves = jax.tree_util.tree_leaves(before)
+    after_leaves = jax.tree_util.tree_leaves(after)
+    total = 0.0
+    for a, b in zip(before_leaves, after_leaves):
+        da = np.asarray(b) - np.asarray(a)
+        total += float(np.sum(da.astype(np.float64) ** 2))
+    return float(np.sqrt(total))
+
+
+
 def run_ppo_update(params, opt_state, state, key, global_update, total_updates):
     t0 = time.time()
+    params_before = jax.tree_util.tree_map(lambda x: x.copy(), params)
 
-    state, key, obs, acts, logp, adv, ret, stats = collect_rollout(
-        params, state, key
-    )
+    (
+        state,
+        key,
+        obs,
+        acts,
+        old_soldier_lp,
+        old_commander_lp,
+        old_team_lp,
+        soldier_adv,
+        commander_adv,
+        team_adv,
+        returns,
+        stats,
+    ) = collect_rollout(params, state, key)
 
     alpha = global_update / max(1, total_updates - 1)
     ent_coef = jnp.array(
@@ -1339,30 +1726,71 @@ def run_ppo_update(params, opt_state, state, key, global_update, total_updates):
     n_mb = usable // MINIBATCH_SIZE
 
     acc = []
-    for _ in range(PPO_EPOCHS):
+    stopped_early = False
+    stop_epoch = 0
+    stop_minibatch = 0
+    max_kl = float("-inf")
+
+    for epoch in range(1, PPO_EPOCHS + 1):
         key, sk = random.split(key)
         perm = random.permutation(sk, n)[:usable]
         for mb in range(n_mb):
             idx = perm[
                 mb * MINIBATCH_SIZE:(mb + 1) * MINIBATCH_SIZE
             ]
-            params, opt_state, m = ppo_update_minibatch(
+            (
+                params,
+                opt_state,
+                m,
+            ) = ppo_update_minibatch(
                 params,
                 opt_state,
                 obs[idx],
                 acts[idx],
-                logp[idx],
-                adv[idx],
-                ret[idx],
+                old_soldier_lp[idx],
+                old_commander_lp[idx],
+                old_team_lp[idx],
+                soldier_adv[idx],
+                commander_adv[idx],
+                team_adv[idx],
+                returns[idx],
                 ent_coef,
             )
             acc.append(m)
 
+            mb_kl = float(m["approx_kl"])
+            max_kl = max(max_kl, mb_kl)
+            if mb_kl > TARGET_KL:
+                stopped_early = True
+                stop_epoch = epoch
+                stop_minibatch = mb + 1
+                break
+
+        if stopped_early:
+            break
+
     metrics = {
         k: float(np.mean([float(m[k]) for m in acc]))
         for k in acc[0]
+        if k != "team_total_loss"
     }
     metrics["entropy_coef"] = float(ent_coef)
+    metrics["max_kl"] = max_kl
+    metrics["ppo_epochs_used"] = stop_epoch if stopped_early else PPO_EPOCHS
+    metrics["early_stopped"] = 1.0 if stopped_early else 0.0
+    metrics["parameter_l2"] = tree_l2_norm(params)
+    metrics["parameter_delta_l2"] = tree_delta_l2_norm(params_before, params)
+    metrics["soldier_policy_loss"] = float(
+        np.mean([float(m["soldier_policy_loss"]) for m in acc])
+    )
+    metrics["commander_policy_loss"] = float(
+        np.mean([float(m["commander_policy_loss"]) for m in acc])
+    )
+    metrics["team_policy_loss"] = float(
+        np.mean([float(m["team_policy_loss"]) for m in acc])
+    )
+    metrics["stop_epoch"] = int(stop_epoch)
+    metrics["stop_minibatch"] = int(stop_minibatch)
 
     stats = {k: int(v) for k, v in stats.items()}
     return (
@@ -1419,20 +1847,6 @@ def evaluate_match(params_red, params_blue, init_states):
         )
 
         active = ~finished
-
-        # Freeze already-finished games. Without this, a commander killed at
-        # an earlier step could keep participating in later simulation steps,
-        # allowing the final state to overwrite the authoritative result.
-        st_next = jax.tree_util.tree_map(
-            lambda old, new: jnp.where(
-                active.reshape((active.shape[0],) + (1,) * (old.ndim - 1)),
-                new,
-                old,
-            ) if old.ndim > 0 else jnp.where(active, new, old),
-            st,
-            nxt,
-        )
-
         red_return = red_return + jnp.where(active, rr, 0.0)
         blue_return = blue_return + jnp.where(active, br, 0.0)
 
@@ -1471,7 +1885,7 @@ def evaluate_match(params_red, params_blue, init_states):
         finished = finished | done
 
         return (
-            st_next,
+            nxt,
             finished,
             result,
             end_step,
@@ -1502,27 +1916,14 @@ def evaluate_match(params_red, params_blue, init_states):
         red_return,
         blue_return,
     ), _ = lax.scan(body, init, jnp.arange(MAX_STEPS))
+    del final_state
 
-    # Derive the final outcome directly from the final commander states.
-    # This keeps batch evaluation and single-bout replay on the same authoritative
-    # physical criterion, independent of intermediate `done` bookkeeping.
-    final_red_cmd = final_state["alive"][:, RED_COMMANDER_INDEX] > 0
-    final_blue_cmd = final_state["alive"][:, BLUE_COMMANDER_INDEX] > 0
-    final_result = jnp.where(
-        final_red_cmd & (~final_blue_cmd),
-        1,
-        jnp.where(
-            final_blue_cmd & (~final_red_cmd),
-            2,
-            jnp.where(
-                (~final_red_cmd) & (~final_blue_cmd),
-                4,
-                3,
-            ),
-        ),
+    result = jnp.where(result == 0, 3, result)
+    end_step = jnp.where(
+        result == 3,
+        jnp.minimum(end_step, MAX_STEPS),
+        end_step,
     )
-    result = final_result
-    end_step = jnp.where(result == 3, MAX_STEPS, end_step)
 
     return (
         result,
@@ -1634,19 +2035,6 @@ def record_bout(params_red, params_blue, initial_state):
         del rr, br
 
         active = ~finished
-
-        # Freeze the bout immediately after it finishes so the final state
-        # remains exactly the authoritative terminal state.
-        st_next = jax.tree_util.tree_map(
-            lambda old, new: jnp.where(
-                active.reshape((active.shape[0],) + (1,) * (old.ndim - 1)),
-                new,
-                old,
-            ) if old.ndim > 0 else jnp.where(active, new, old),
-            st,
-            nxt,
-        )
-
         newly = done & active
 
         red_cmd = nxt["alive"][:, RED_COMMANDER_INDEX] > 0
@@ -1670,14 +2058,14 @@ def record_bout(params_red, params_blue, initial_state):
         finished = finished | done
 
         out = (
-            st_next["x"],
-            st_next["z"],
-            st_next["hp"],
-            st_next["alive"],
+            nxt["x"],
+            nxt["z"],
+            nxt["hp"],
+            nxt["alive"],
             red_a,
             blue_a,
         )
-        return (st_next, finished, result, end_step), out
+        return (nxt, finished, result, end_step), out
 
     init = (
         state0,
@@ -1690,23 +2078,7 @@ def record_bout(params_red, params_blue, initial_state):
         body, init, jnp.arange(MAX_STEPS)
     )
 
-    final_red_cmd = final_state["alive"][0, RED_COMMANDER_INDEX] > 0
-    final_blue_cmd = final_state["alive"][0, BLUE_COMMANDER_INDEX] > 0
-    final_result = jnp.where(
-        final_red_cmd & (~final_blue_cmd),
-        1,
-        jnp.where(
-            final_blue_cmd & (~final_red_cmd),
-            2,
-            jnp.where(
-                (~final_red_cmd) & (~final_blue_cmd),
-                4,
-                3,
-            ),
-        ),
-    )
-    result = jnp.where(final_result == 3, 3, final_result)
-    end_step = jnp.where(result == 3, MAX_STEPS, end_step)
+    result = jnp.where(result == 0, 3, result)
 
     xs, zs, hps, alives, red_actions, blue_actions = traj
 
@@ -1729,8 +2101,8 @@ def record_bout(params_red, params_blue, initial_state):
         "alive": alives,
         "red_actions": red_actions,
         "blue_actions": blue_actions,
-        "result": result,
-        "end_step": end_step,
+        "result": result[0],
+        "end_step": end_step[0],
         "final_state": jax.tree_util.tree_map(lambda a: a[0], final_state),
     }
 
@@ -1739,7 +2111,7 @@ def record_bout(params_red, params_blue, initial_state):
 def verify_bout(initial_state, red_actions, blue_actions):
     def body(st, actions):
         ra, ba = actions
-        nxt, _, _, _ = step_one(st, ra, ba)
+        nxt, _, _, _, _, _, _, _ = step_one(st, ra, ba)
         return nxt, (nxt["x"], nxt["z"], nxt["alive"])
 
     final_state, traj = lax.scan(
@@ -1753,7 +2125,7 @@ def verify_bout(initial_state, red_actions, blue_actions):
     # Reconstruct HP independently as part of replay verification.
     def hp_body(st, actions):
         ra, ba = actions
-        nxt, _, _, _ = step_one(st, ra, ba)
+        nxt, _, _, _, _, _, _, _ = step_one(st, ra, ba)
         return nxt, nxt["hp"]
 
     _, hps = lax.scan(
@@ -1795,7 +2167,7 @@ def save_best_bout(
     winner_label,
     winner_team,
 ):
-    steps = int(np.asarray(bout["end_step"]).reshape(-1)[0])
+    steps = int(bout["end_step"])
     frames = steps + 1
 
     data = {
@@ -1858,21 +2230,6 @@ def save_params(path, params, metadata=None):
     return path
 
 
-def load_params(path):
-    d = np.load(path, allow_pickle=False)
-    params = {
-        k[len("param_"):]: jnp.asarray(d[k])
-        for k in d.files
-        if k.startswith("param_")
-    }
-    meta = {}
-    if "metadata_json" in d.files:
-        try:
-            meta = json.loads(str(d["metadata_json"]))
-        except Exception:
-            meta = {}
-    return params, meta
-
 
 def save_checkpoint(
     path,
@@ -1899,7 +2256,46 @@ def save_checkpoint(
     return path
 
 
-def policy_params_compatible(params):
+def required_new_policy_shapes():
+    required_shapes = {
+        "Ws1": (SOLDIER_FEATURES, LOCAL_HIDDEN_SIZE),
+        "bs1": (LOCAL_HIDDEN_SIZE,),
+        "Ws2": (LOCAL_HIDDEN_SIZE, LOCAL_EMBED_SIZE),
+        "bs2": (LOCAL_EMBED_SIZE,),
+        "Wc": (COMMANDER_FEATURES, LOCAL_EMBED_SIZE),
+        "bc": (LOCAL_EMBED_SIZE,),
+        "Wg1": (GLOBAL_INPUT_SIZE, HIDDEN1),
+        "bg1": (HIDDEN1,),
+        "W_actor_s": (HIDDEN1, ACTOR_HIDDEN),
+        "b_actor_s": (ACTOR_HIDDEN,),
+        "W_actor_c": (HIDDEN1, ACTOR_HIDDEN),
+        "b_actor_c": (ACTOR_HIDDEN,),
+        "W_critic": (HIDDEN1, CRITIC_HIDDEN),
+        "b_critic": (CRITIC_HIDDEN,),
+        "Wa_s": (ACTOR_HIDDEN, SOLDIER_ACTION_SIZE),
+        "ba_s": (SOLDIER_ACTION_SIZE,),
+        "Wa_c": (ACTOR_HIDDEN, COMMANDER_ACTION_SIZE),
+        "ba_c": (COMMANDER_ACTION_SIZE,),
+        "Wv": (CRITIC_HIDDEN, 1),
+        "bv": (1,),
+    }
+    for prefix in ("attn1", "attn2"):
+        required_shapes.update({
+            f"{prefix}_Wq": (LOCAL_EMBED_SIZE, LOCAL_EMBED_SIZE),
+            f"{prefix}_bq": (LOCAL_EMBED_SIZE,),
+            f"{prefix}_Wk": (LOCAL_EMBED_SIZE, LOCAL_EMBED_SIZE),
+            f"{prefix}_bk": (LOCAL_EMBED_SIZE,),
+            f"{prefix}_Wv": (LOCAL_EMBED_SIZE, LOCAL_EMBED_SIZE),
+            f"{prefix}_bv": (LOCAL_EMBED_SIZE,),
+            f"{prefix}_Wo": (LOCAL_EMBED_SIZE, LOCAL_EMBED_SIZE),
+            f"{prefix}_bo": (LOCAL_EMBED_SIZE,),
+            f"{prefix}_ln_gamma": (LOCAL_EMBED_SIZE,),
+            f"{prefix}_ln_beta": (LOCAL_EMBED_SIZE,),
+        })
+    return required_shapes
+
+
+def required_old_policy_shapes():
     required_shapes = {
         "Ws1": (SOLDIER_FEATURES, LOCAL_HIDDEN_SIZE),
         "bs1": (LOCAL_HIDDEN_SIZE,),
@@ -1931,12 +2327,43 @@ def policy_params_compatible(params):
             f"{prefix}_ln_gamma": (LOCAL_EMBED_SIZE,),
             f"{prefix}_ln_beta": (LOCAL_EMBED_SIZE,),
         })
-    if set(params.keys()) != set(required_shapes.keys()):
+    return required_shapes
+
+
+def _shapes_match(params, shapes):
+    if set(params.keys()) != set(shapes.keys()):
         return False
-    return all(
-        tuple(np.asarray(params[k]).shape) == shape
-        for k, shape in required_shapes.items()
+    return all(tuple(np.asarray(params[k]).shape) == shape for k, shape in shapes.items())
+
+
+def policy_params_compatible(params):
+    return (
+        _shapes_match(params, required_new_policy_shapes())
+        or _shapes_match(params, required_old_policy_shapes())
     )
+
+
+def migrate_policy_params(params):
+    """Upgrade the previous shared-actor checkpoint layout to two actor branches."""
+    if _shapes_match(params, required_new_policy_shapes()):
+        return params, False
+    if not _shapes_match(params, required_old_policy_shapes()):
+        raise ValueError("Incompatible policy parameter shapes")
+
+    new_params = {
+        k: v for k, v in params.items()
+        if k not in ("W_actor", "b_actor", "Wa", "ba")
+    }
+    new_params["W_actor_s"] = params["W_actor"].copy()
+    new_params["b_actor_s"] = params["b_actor"].copy()
+    new_params["W_actor_c"] = params["W_actor"].copy()
+    new_params["b_actor_c"] = params["b_actor"].copy()
+    new_params["Wa_s"] = params["Wa"][:, :SOLDIER_ACTION_SIZE].copy()
+    new_params["ba_s"] = params["ba"][:SOLDIER_ACTION_SIZE].copy()
+    new_params["Wa_c"] = params["Wa"][:, SOLDIER_ACTION_SIZE:].copy()
+    new_params["ba_c"] = params["ba"][SOLDIER_ACTION_SIZE:].copy()
+    return new_params, True
+
 
 def saved_policy_file_compatible(path):
     try:
@@ -1951,40 +2378,62 @@ def saved_policy_file_compatible(path):
         return False
 
 
-def load_checkpoint(path):
+def load_params(path):
     d = np.load(path, allow_pickle=False)
-
-    params = {
+    raw_params = {
         k[len("param_"):]: jnp.asarray(d[k])
         for k in d.files
         if k.startswith("param_")
     }
+    params, migrated = migrate_policy_params(raw_params)
+    if migrated:
+        print(f"Migrated legacy shared Actor checkpoint: {os.path.basename(path)}")
+    meta = {}
+    if "metadata_json" in d.files:
+        try:
+            meta = json.loads(str(d["metadata_json"]))
+        except Exception:
+            meta = {}
+    return params, meta
 
-    if not policy_params_compatible(params):
-        raise ValueError(
-            f"Incompatible checkpoint architecture: {path} "
-            f"(raw OBS={RAW_OBS_SIZE}, global input={GLOBAL_INPUT_SIZE})"
+
+def load_checkpoint(path):
+    d = np.load(path, allow_pickle=False)
+
+    raw_params = {
+        k[len("param_"):]: jnp.asarray(d[k])
+        for k in d.files
+        if k.startswith("param_")
+    }
+    params, migrated = migrate_policy_params(raw_params)
+
+    if migrated:
+        # Optimizer moments from the old parameter tree cannot be mapped safely
+        # to the new split Actor tree. Reinitialize Adam for this one resume.
+        print(
+            "Legacy checkpoint architecture detected; migrating parameters "
+            "and reinitializing optimizer state."
         )
-
-    template = optimizer.init(params)
-    template_leaves = jax.tree_util.tree_leaves(template)
-    treedef = jax.tree_util.tree_structure(template)
-    n = int(d["opt_n_leaves"])
-    if n != len(template_leaves):
-        raise ValueError(
-            f"Incompatible optimizer state in checkpoint: {path}"
-        )
-
-    leaves = []
-    for i, template_leaf in enumerate(template_leaves):
-        leaf = jnp.asarray(d[f"opt_{i}"])
-        if tuple(leaf.shape) != tuple(template_leaf.shape):
+        opt_state = optimizer.init(params)
+    else:
+        template = optimizer.init(params)
+        template_leaves = jax.tree_util.tree_leaves(template)
+        treedef = jax.tree_util.tree_structure(template)
+        n = int(d["opt_n_leaves"])
+        if n != len(template_leaves):
             raise ValueError(
-                f"Incompatible optimizer leaf {i} in checkpoint: {path}"
+                f"Incompatible optimizer state in checkpoint: {path}"
             )
-        leaves.append(leaf)
 
-    opt_state = jax.tree_util.tree_unflatten(treedef, leaves)
+        leaves = []
+        for i, template_leaf in enumerate(template_leaves):
+            leaf = jnp.asarray(d[f"opt_{i}"])
+            if tuple(leaf.shape) != tuple(template_leaf.shape):
+                raise ValueError(
+                    f"Incompatible optimizer leaf {i} in checkpoint: {path}"
+                )
+            leaves.append(leaf)
+        opt_state = jax.tree_util.tree_unflatten(treedef, leaves)
 
     generation = int(d["generation"])
     ppo_index = int(d["ppo_index"])
@@ -1992,7 +2441,6 @@ def load_checkpoint(path):
     master_key = random.wrap_key_data(jnp.asarray(d["master_key"]))
 
     return params, opt_state, generation, ppo_index, elite_path, master_key
-
 
 def generation_number(path):
     try:
@@ -2119,7 +2567,7 @@ def train(n_generations=N_GENERATIONS, resume=True):
                 "source": "random_init",
                 "raw_obs_size": RAW_OBS_SIZE,
                 "global_input_size": GLOBAL_INPUT_SIZE,
-                "architecture": "hierarchical_64_attention2_shared_encoder_actor_critic_split",
+                "architecture": "hierarchical_64_attention2_role_separated_actor_rewards",
                 "ppo_rollout_steps": PPO_ROLLOUT_STEPS,
             },
         )
@@ -2144,16 +2592,22 @@ def train(n_generations=N_GENERATIONS, resume=True):
     print(f"Soldier encoder    : {SOLDIER_FEATURES} -> {LOCAL_HIDDEN_SIZE} -> {LOCAL_EMBED_SIZE}")
     print(f"Commander encoder  : {COMMANDER_FEATURES} -> {LOCAL_EMBED_SIZE}")
     print(f"Self-attention     : {N_SOLDIERS_PER_TEAM} soldiers/team, {ATTENTION_HEADS} heads x 2 layers")
-    print(f"Global network     : {GLOBAL_INPUT_SIZE} -> {HIDDEN1} (shared) -> actor {ACTOR_HIDDEN} / critic {CRITIC_HIDDEN}")
-    print(f"Rewards            : hit {REWARD_SOLDIER_HIT}, miss {REWARD_SOLDIER_MISS}, "
-          f"soldier wall {REWARD_SOLDIER_WALL}, kill {REWARD_SOLDIER_KILL}, "
-          f"commander wall {REWARD_COMMANDER_WALL}, "
-          f"commander hit {REWARD_COMMANDER_HIT_BY_ENEMY}")
+    print(f"Global network     : {GLOBAL_INPUT_SIZE} -> {HIDDEN1}")
+    print(f"Soldier actor      : {HIDDEN1} -> {ACTOR_HIDDEN} -> {SOLDIER_ACTION_SIZE}")
+    print(f"Commander actor    : {HIDDEN1} -> {ACTOR_HIDDEN} -> {COMMANDER_ACTION_SIZE}")
+    print(f"Global critic      : {HIDDEN1} -> {CRITIC_HIDDEN} -> 1")
+    print(f"Soldier rewards    : hit {REWARD_SOLDIER_HIT}, kill {REWARD_SOLDIER_KILL}, "
+          f"miss {REWARD_SOLDIER_MISS}, wall {REWARD_SOLDIER_WALL}, "
+          f"approach {REWARD_SOLDIER_APPROACH}")
+    print(f"Commander rewards  : wall {REWARD_COMMANDER_WALL}, "
+          f"hit by enemy {REWARD_COMMANDER_HIT_BY_ENEMY}")
+    print(f"Team rewards       : win {REWARD_COMMANDER_WIN}, loss {REWARD_COMMANDER_LOSS}")
+    print(f"Warm-up            : 0 -> {WARMUP_MAX_STEPS} steps (not used for PPO)")
     print(f"Damage shaping     : {SHAPING_COEF}")
     print(f"Entropy coef       : {ENTROPY_START} -> {ENTROPY_END}")
     print(f"Logstd             : init {LOGSTD_INIT:.1f}, target {LOGSTD_TARGET:.1f}, range [{LOGSTD_MIN:.1f}, {LOGSTD_MAX:.1f}]")
-    print("Elite selection     : candidate replaces Elite only when candidate_wins > elite_wins")
     print(f"Logstd regularizer : {LOGSTD_REG_COEF}")
+    print(f"PPO target KL      : {TARGET_KL}")
     print(f"Output directory   : {os.path.abspath(BASE_DIR)}")
     print()
 
@@ -2183,6 +2637,11 @@ def train(n_generations=N_GENERATIONS, resume=True):
         master_key, rk, ek = random.split(master_key, 3)
         env_state = reset(rk)
         env_key = ek
+
+        env_state, env_key, warmup_battles = warmup_env_state(
+            candidate_params, env_state, env_key
+        )
+        print(f"Warm-up completed games : {int(warmup_battles)}")
 
         cum = {
             "battles": 0,
@@ -2234,6 +2693,7 @@ def train(n_generations=N_GENERATIONS, resume=True):
             prune_checkpoints(checkpoint_path)
 
             decisive_games = cum["red_wins"] + cum["blue_wins"]
+            early_tag = " EARLY-STOP" if metrics["early_stopped"] > 0.5 else ""
             print(
                 f"Generation {generation} | "
                 f"PPO {ppo_index:2d}/{PPO_UPDATES_PER_GENERATION} | "
@@ -2243,13 +2703,11 @@ def train(n_generations=N_GENERATIONS, resume=True):
                 f"entropy {metrics['entropy']:7.2f} "
                 f"({metrics['entropy_per_soldier']:.3f}/soldier) "
                 f"logstd {metrics['logstd_mean']:.3f} "
-                f"KL {metrics['approx_kl']:.5f} "
+                f"KL {metrics['approx_kl']:.5f} maxKL {metrics['max_kl']:.5f} "
                 f"clip {metrics['clip_fraction']:.3f} "
-                f"policy {metrics['policy_loss']:.5f} "
-                f"value {metrics['value_loss']:.5f}"
+                f"delta {metrics['parameter_delta_l2']:.3e}"
+                f"{early_tag}"
             )
-
-
 
         print()
         print("PPO summary")
@@ -2303,7 +2761,7 @@ def train(n_generations=N_GENERATIONS, resume=True):
             params_blue = elite_params if cand_is_red else candidate_params
 
             bout = record_bout(params_red, params_blue, init_state)
-            steps = int(np.asarray(bout["end_step"]).reshape(-1)[0])
+            steps = int(bout["end_step"])
             vx_, vz_, vhp_, va_ = verify_bout(
                 init_state,
                 bout["red_actions"][:steps],
