@@ -128,6 +128,7 @@ REWARD_SOLDIER_WALL = -0.005
 REWARD_SOLDIER_KILL = 0.050
 REWARD_COMMANDER_WALL = -0.005
 REWARD_COMMANDER_HIT_BY_ENEMY = -0.020
+REWARD_COMMANDER_WIN = 2.0
 
 # Original damage shaping is intentionally disabled.
 SHAPING_COEF = 0.0
@@ -520,7 +521,7 @@ def step_one(state, red_action, blue_action):
     red_n = jnp.sum(alive[RED_SOLDIER_START:RED_SOLDIER_END])
     blue_n = jnp.sum(alive[BLUE_SOLDIER_START:BLUE_SOLDIER_END])
 
-    commander_reward = red_cmd.astype(jnp.float32) - blue_cmd.astype(jnp.float32)
+    commander_reward = REWARD_COMMANDER_WIN * (red_cmd.astype(jnp.float32) - blue_cmd.astype(jnp.float32))
     timeout_reward = (red_n - blue_n) / N_SOLDIERS_PER_TEAM
     terminal_red = jnp.where(
         commander_done,
