@@ -1418,6 +1418,20 @@ def evaluate_match(params_red, params_blue, init_states):
         )
 
         active = ~finished
+
+        # Freeze already-finished games. Without this, a commander killed at
+        # an earlier step could keep participating in later simulation steps,
+        # allowing the final state to overwrite the authoritative result.
+        st_next = jax.tree_util.tree_map(
+            lambda old, new: jnp.where(
+                active.reshape((active.shape[0],) + (1,) * (old.ndim - 1)),
+                new,
+                old,
+            ) if old.ndim > 0 else jnp.where(active, new, old),
+            st,
+            nxt,
+        )
+
         red_return = red_return + jnp.where(active, rr, 0.0)
         blue_return = blue_return + jnp.where(active, br, 0.0)
 
@@ -1456,7 +1470,7 @@ def evaluate_match(params_red, params_blue, init_states):
         finished = finished | done
 
         return (
-            nxt,
+            st_next,
             finished,
             result,
             end_step,
@@ -1619,6 +1633,19 @@ def record_bout(params_red, params_blue, initial_state):
         del rr, br
 
         active = ~finished
+
+        # Freeze the bout immediately after it finishes so the final state
+        # remains exactly the authoritative terminal state.
+        st_next = jax.tree_util.tree_map(
+            lambda old, new: jnp.where(
+                active.reshape((active.shape[0],) + (1,) * (old.ndim - 1)),
+                new,
+                old,
+            ) if old.ndim > 0 else jnp.where(active, new, old),
+            st,
+            nxt,
+        )
+
         newly = done & active
 
         red_cmd = nxt["alive"][:, RED_COMMANDER_INDEX] > 0
@@ -1642,14 +1669,14 @@ def record_bout(params_red, params_blue, initial_state):
         finished = finished | done
 
         out = (
-            nxt["x"],
-            nxt["z"],
-            nxt["hp"],
-            nxt["alive"],
+            st_next["x"],
+            st_next["z"],
+            st_next["hp"],
+            st_next["alive"],
             red_a,
             blue_a,
         )
-        return (nxt, finished, result, end_step), out
+        return (st_next, finished, result, end_step), out
 
     init = (
         state0,
@@ -1767,7 +1794,7 @@ def save_best_bout(
     winner_label,
     winner_team,
 ):
-    steps = int(bout["end_step"])
+    steps = int(np.asarray(bout["end_step"]).reshape(-1)[0])
     frames = steps + 1
 
     data = {
@@ -2045,7 +2072,9 @@ DIAGNOSTIC_PPO_STEPS = (0, 1, 2, 5, 10, 20)
 
 
 def save_diagnostic_bout(path, generation, ppo_step, bout):
-    steps = int(np.asarray(bout["end_step"]))
+    # record_bout may return a scalar JAX array or a length-1 array depending
+    # on the compiled shape path. Normalize both representations explicitly.
+    steps = int(np.asarray(bout["end_step"]).reshape(-1)[0])
     frames = steps + 1
     red_actions = np.asarray(bout["red_actions"][:steps])
     blue_actions = np.asarray(bout["blue_actions"][:steps])
@@ -2066,7 +2095,7 @@ def save_diagnostic_bout(path, generation, ppo_step, bout):
     data = {
         "generation": np.array(generation, dtype=np.int32),
         "ppo_step": np.array(ppo_step, dtype=np.int32),
-        "result_code": np.array(int(np.asarray(bout["result"])), dtype=np.int32),
+        "result_code": np.array(int(np.asarray(bout["result"]).reshape(-1)[0]), dtype=np.int32),
         "win_time": np.array(steps * DT, dtype=np.float32),
         "end_step": np.array(steps, dtype=np.int32),
         "dt": np.array(DT, dtype=np.float32),
@@ -2380,7 +2409,7 @@ def train(n_generations=N_GENERATIONS, resume=True):
             params_blue = elite_params if cand_is_red else candidate_params
 
             bout = record_bout(params_red, params_blue, init_state)
-            steps = int(bout["end_step"])
+            steps = int(np.asarray(bout["end_step"]).reshape(-1)[0])
             vx_, vz_, vhp_, va_ = verify_bout(
                 init_state,
                 bout["red_actions"][:steps],
