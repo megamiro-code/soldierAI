@@ -780,12 +780,12 @@ CLIP_EPS = 0.20
 VALUE_COEF = 0.5
 LEARNING_RATE = 3e-4
 
-ENTROPY_START = 0.005
-ENTROPY_END = 0.0005
+ENTROPY_START = 0.0005
+ENTROPY_END = 0.00005
 
 LOGSTD_INIT = -1.0
 LOGSTD_MIN = -3.0
-LOGSTD_MAX = -0.3
+LOGSTD_MAX = -0.7
 LOGSTD_TARGET = -1.0
 LOGSTD_REG_COEF = 0.01
 
@@ -1143,6 +1143,11 @@ def ppo_loss(params, obs, local_actions, old_log_prob, advantages, returns, ent_
         + LOGSTD_REG_COEF * logstd_reg
     )
 
+    approx_kl = jnp.mean(old_log_prob - new_log_prob)
+    clip_fraction = jnp.mean(
+        (jnp.abs(ratio - 1.0) > CLIP_EPS).astype(jnp.float32)
+    )
+
     metrics = {
         "policy_loss": policy_loss,
         "value_loss": value_loss,
@@ -1151,7 +1156,8 @@ def ppo_loss(params, obs, local_actions, old_log_prob, advantages, returns, ent_
         "logstd_mean": jnp.mean(jnp.clip(soldier_logstd, LOGSTD_MIN, LOGSTD_MAX)),
         "commander_logstd_mean": jnp.mean(jnp.clip(commander_logstd, LOGSTD_MIN, LOGSTD_MAX)),
         "logstd_reg": logstd_reg,
-        "approx_kl": jnp.mean(old_log_prob - new_log_prob),
+        "approx_kl": approx_kl,
+        "clip_fraction": clip_fraction,
     }
     return total, metrics
 
@@ -1481,14 +1487,27 @@ def evaluate_match(params_red, params_blue, init_states):
         red_return,
         blue_return,
     ), _ = lax.scan(body, init, jnp.arange(MAX_STEPS))
-    del final_state
 
-    result = jnp.where(result == 0, 3, result)
-    end_step = jnp.where(
-        result == 3,
-        jnp.minimum(end_step, MAX_STEPS),
-        end_step,
+    # Derive the final outcome directly from the final commander states.
+    # This keeps batch evaluation and single-bout replay on the same authoritative
+    # physical criterion, independent of intermediate `done` bookkeeping.
+    final_red_cmd = final_state["alive"][:, RED_COMMANDER_INDEX] > 0
+    final_blue_cmd = final_state["alive"][:, BLUE_COMMANDER_INDEX] > 0
+    final_result = jnp.where(
+        final_red_cmd & (~final_blue_cmd),
+        1,
+        jnp.where(
+            final_blue_cmd & (~final_red_cmd),
+            2,
+            jnp.where(
+                (~final_red_cmd) & (~final_blue_cmd),
+                4,
+                3,
+            ),
+        ),
     )
+    result = final_result
+    end_step = jnp.where(result == 3, MAX_STEPS, end_step)
 
     return (
         result,
@@ -1643,7 +1662,23 @@ def record_bout(params_red, params_blue, initial_state):
         body, init, jnp.arange(MAX_STEPS)
     )
 
-    result = jnp.where(result == 0, 3, result)
+    final_red_cmd = final_state["alive"][0, RED_COMMANDER_INDEX] > 0
+    final_blue_cmd = final_state["alive"][0, BLUE_COMMANDER_INDEX] > 0
+    final_result = jnp.where(
+        final_red_cmd & (~final_blue_cmd),
+        1,
+        jnp.where(
+            final_blue_cmd & (~final_red_cmd),
+            2,
+            jnp.where(
+                (~final_red_cmd) & (~final_blue_cmd),
+                4,
+                3,
+            ),
+        ),
+    )
+    result = jnp.where(final_result == 3, 3, final_result)
+    end_step = jnp.where(result == 3, MAX_STEPS, end_step)
 
     xs, zs, hps, alives, red_actions, blue_actions = traj
 
@@ -2089,6 +2124,7 @@ def train(n_generations=N_GENERATIONS, resume=True):
     print(f"Damage shaping     : {SHAPING_COEF}")
     print(f"Entropy coef       : {ENTROPY_START} -> {ENTROPY_END}")
     print(f"Logstd             : init {LOGSTD_INIT:.1f}, target {LOGSTD_TARGET:.1f}, range [{LOGSTD_MIN:.1f}, {LOGSTD_MAX:.1f}]")
+    print("Elite selection     : candidate replaces Elite only when candidate_wins > elite_wins")
     print(f"Logstd regularizer : {LOGSTD_REG_COEF}")
     print(f"Output directory   : {os.path.abspath(BASE_DIR)}")
     print()
@@ -2178,7 +2214,9 @@ def train(n_generations=N_GENERATIONS, resume=True):
                 f"Decisive Games {decisive_games:3d} | "
                 f"entropy {metrics['entropy']:7.2f} "
                 f"({metrics['entropy_per_soldier']:.3f}/soldier) "
-                f"logstd {metrics['logstd_mean']:.3f}"
+                f"logstd {metrics['logstd_mean']:.3f} "
+                f"KL {metrics['approx_kl']:.5f} "
+                f"clip {metrics['clip_fraction']:.3f}"
             )
 
         print()
