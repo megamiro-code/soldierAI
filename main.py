@@ -1,6 +1,6 @@
 # ============================================================
 # JAX RTS : PPO + ELITE SELF-PLAY + 3D REPLAY
-# Hierarchical local encoders + local combat rewards
+# Hierarchical local encoders + self-attention + local combat rewards
 # ============================================================
 
 import os
@@ -42,7 +42,6 @@ for d in (CHECKPOINT_DIR, ELITE_DIR, BOUT_DIR, REPLAY_DIR):
 # ============================================================
 
 N_ENVS = 32
-
 FIELD_SIZE = 16.0
 HALF_FIELD = FIELD_SIZE / 2.0
 FIELD_DIAG = float(np.sqrt(2.0) * HALF_FIELD)
@@ -55,10 +54,6 @@ N_UNITS = N_SOLDIERS_TOTAL + N_COMMANDERS
 DT = 0.20
 MAX_TIME = 180.0
 MAX_STEPS = int(MAX_TIME / DT)
-
-# PPO rollout is intentionally shorter than the maximum episode.
-# 512 steps = 102.4 simulated seconds.
-PPO_ROLLOUT_STEPS = 512
 
 ATTACK_RANGE = 0.42
 ATTACK_COOLDOWN = 0.55
@@ -89,13 +84,21 @@ TERRAIN_SIZE = TERRAIN_RES * TERRAIN_RES
 #   total = 19
 #
 # Raw observation = terrain + 200*17 + 2*19 = 3694
-# Hierarchical encoder output = terrain + 200*32 + 2*32 = 6720
-# The policy observes all 200 soldiers (100 own + 100 enemy).
+# Hierarchical encoder output = terrain + 200*64 + 2*64 = 13184
+#
+# Self-attention is applied independently to each team's 100 soldiers,
+# preserving the 100-action symmetry while keeping both teams' embeddings.
 # ------------------------------------------------------------
 
 SOLDIER_FEATURES = 17
 COMMANDER_FEATURES = 19
-LOCAL_EMBED_SIZE = 32
+
+LOCAL_HIDDEN_SIZE = 64
+LOCAL_EMBED_SIZE = 64
+
+ATTENTION_HEADS = 2
+ATTENTION_HEAD_DIM = LOCAL_EMBED_SIZE // ATTENTION_HEADS
+ATTENTION_TOKENS_PER_TEAM = N_SOLDIERS_PER_TEAM
 
 RAW_OBS_SIZE = (
     TERRAIN_SIZE
@@ -133,18 +136,12 @@ SHAPING_COEF = 0.0
 
 RED_COMMANDER_INDEX = 0
 BLUE_COMMANDER_INDEX = 1
-
 RED_SOLDIER_START = 2
 RED_SOLDIER_END = 102
-
 BLUE_SOLDIER_START = 102
 BLUE_SOLDIER_END = 202
 
-ALL_SOLDIER_INDICES = jnp.arange(
-    RED_SOLDIER_START,
-    BLUE_SOLDIER_END,
-)
-
+ALL_SOLDIER_INDICES = jnp.arange(RED_SOLDIER_START, BLUE_SOLDIER_END)
 ALL_UNIT_INDICES = jnp.arange(N_UNITS)
 
 WALL_LIST = [
@@ -154,21 +151,12 @@ WALL_LIST = [
     [ 0.5,  0.5],
 ]
 
-walls = jnp.array(
-    WALL_LIST,
-    dtype=jnp.float32,
-)
+walls = jnp.array(WALL_LIST, dtype=jnp.float32)
 
 teams = jnp.concatenate([
-    jnp.array(
-        [0.0, 1.0]
-    ),
-    jnp.zeros(
-        N_SOLDIERS_PER_TEAM
-    ),
-    jnp.ones(
-        N_SOLDIERS_PER_TEAM
-    ),
+    jnp.array([0.0, 1.0]),
+    jnp.zeros(N_SOLDIERS_PER_TEAM),
+    jnp.ones(N_SOLDIERS_PER_TEAM),
 ])
 
 soldier_mask = jnp.concatenate([
@@ -181,62 +169,25 @@ commander_mask = 1.0 - soldier_mask
 
 def make_terrain():
     centers_1d = (
-        jnp.arange(
-            TERRAIN_RES,
-            dtype=jnp.float32,
-        )
+        jnp.arange(TERRAIN_RES, dtype=jnp.float32)
         - HALF_FIELD
         + 0.5
     )
 
-    xx, zz = jnp.meshgrid(
-        centers_1d,
-        centers_1d,
-    )
-
-    centers = jnp.stack(
-        [
-            xx.reshape(-1),
-            zz.reshape(-1),
-        ],
-        axis=-1,
-    )
+    xx, zz = jnp.meshgrid(centers_1d, centers_1d)
+    centers = jnp.stack([xx.reshape(-1), zz.reshape(-1)], axis=-1)
 
     def blocked(i):
         cell = centers[i]
-        d = jnp.abs(
-            cell[None, :]
-            - walls
-        )
-        return jnp.any(
-            jnp.all(
-                d < 0.5,
-                axis=1,
-            )
-        )
+        d = jnp.abs(cell[None, :] - walls)
+        return jnp.any(jnp.all(d < 0.5, axis=1))
 
-    t = jax.vmap(
-        blocked
-    )(
-        jnp.arange(TERRAIN_SIZE)
-    )
+    t = jax.vmap(blocked)(jnp.arange(TERRAIN_SIZE))
 
-    start_column = (
-        jnp.abs(
-            centers[:, 0]
-        )
-        > (HALF_FIELD - 1.0)
-    )
+    start_column = jnp.abs(centers[:, 0]) > (HALF_FIELD - 1.0)
+    t = jnp.where(start_column, False, t)
 
-    t = jnp.where(
-        start_column,
-        False,
-        t,
-    )
-
-    return t.astype(
-        jnp.float32
-    )
+    return t.astype(jnp.float32)
 
 
 terrain = make_terrain()
@@ -245,164 +196,54 @@ terrain = make_terrain()
 # RESET
 # ============================================================
 
-
 def reset_one(key):
     del key
 
-    x = jnp.zeros(
-        N_UNITS,
-        dtype=jnp.float32,
-    )
+    x = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    z = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    vx = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    vz = jnp.zeros(N_UNITS, dtype=jnp.float32)
 
-    z = jnp.zeros(
-        N_UNITS,
-        dtype=jnp.float32,
-    )
+    hp = jnp.ones(N_UNITS, dtype=jnp.float32)
+    hp = hp.at[RED_COMMANDER_INDEX].set(0.30)
+    hp = hp.at[BLUE_COMMANDER_INDEX].set(0.30)
 
-    vx = jnp.zeros(
-        N_UNITS,
-        dtype=jnp.float32,
-    )
+    alive = jnp.ones(N_UNITS, dtype=jnp.float32)
+    attack_timer = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    speed = jnp.zeros(N_UNITS, dtype=jnp.float32)
 
-    vz = jnp.zeros(
-        N_UNITS,
-        dtype=jnp.float32,
-    )
+    x = x.at[RED_COMMANDER_INDEX].set(-5.80)
+    z = z.at[RED_COMMANDER_INDEX].set(0.0)
+    x = x.at[BLUE_COMMANDER_INDEX].set(5.80)
+    z = z.at[BLUE_COMMANDER_INDEX].set(0.0)
 
-    hp = jnp.ones(
-        N_UNITS,
-        dtype=jnp.float32,
-    )
+    speed = speed.at[RED_COMMANDER_INDEX].set(INITIAL_SOLDIER_SPEED * 0.5)
+    speed = speed.at[BLUE_COMMANDER_INDEX].set(INITIAL_SOLDIER_SPEED * 0.5)
 
-    hp = hp.at[
-        RED_COMMANDER_INDEX
-    ].set(0.30)
+    cell_x = jnp.array([-7.5, -6.5], dtype=jnp.float32)
+    row_z = jnp.arange(10, dtype=jnp.float32) - 4.5
 
-    hp = hp.at[
-        BLUE_COMMANDER_INDEX
-    ].set(0.30)
+    angles = jnp.arange(5, dtype=jnp.float32) * (2.0 * jnp.pi / 5.0)
+    offsets_x = 0.29 * jnp.cos(angles)
+    offsets_z = 0.29 * jnp.sin(angles)
 
-    alive = jnp.ones(
-        N_UNITS,
-        dtype=jnp.float32,
-    )
-
-    attack_timer = jnp.zeros(
-        N_UNITS,
-        dtype=jnp.float32,
-    )
-
-    speed = jnp.zeros(
-        N_UNITS,
-        dtype=jnp.float32,
-    )
-
-    x = x.at[
-        RED_COMMANDER_INDEX
-    ].set(-5.80)
-
-    z = z.at[
-        RED_COMMANDER_INDEX
-    ].set(0.0)
-
-    x = x.at[
-        BLUE_COMMANDER_INDEX
-    ].set(5.80)
-
-    z = z.at[
-        BLUE_COMMANDER_INDEX
-    ].set(0.0)
-
-    speed = speed.at[
-        RED_COMMANDER_INDEX
-    ].set(
-        INITIAL_SOLDIER_SPEED * 0.5
-    )
-
-    speed = speed.at[
-        BLUE_COMMANDER_INDEX
-    ].set(
-        INITIAL_SOLDIER_SPEED * 0.5
-    )
-
-    cell_x = jnp.array(
-        [-7.5, -6.5],
-        dtype=jnp.float32,
-    )
-
-    row_z = (
-        jnp.arange(
-            10,
-            dtype=jnp.float32,
-        )
-        - 4.5
-    )
-
-    angles = (
-        jnp.arange(
-            5,
-            dtype=jnp.float32,
-        )
-        * (
-            2.0 * jnp.pi / 5.0
-        )
-    )
-
-    offsets_x = (
-        0.29
-        * jnp.cos(angles)
-    )
-
-    offsets_z = (
-        0.29
-        * jnp.sin(angles)
-    )
-
-    cx, rz = jnp.meshgrid(
-        cell_x,
-        row_z,
-    )
-
+    cx, rz = jnp.meshgrid(cell_x, row_z)
     cx = cx.reshape(-1)
     rz = rz.reshape(-1)
 
-    red_x = (
-        cx[:, None]
-        + offsets_x[None, :]
-    ).reshape(-1)
-
-    red_z = (
-        rz[:, None]
-        + offsets_z[None, :]
-    ).reshape(-1)
+    red_x = (cx[:, None] + offsets_x[None, :]).reshape(-1)
+    red_z = (rz[:, None] + offsets_z[None, :]).reshape(-1)
 
     blue_x = -red_x
     blue_z = red_z
 
-    x = x.at[
-        RED_SOLDIER_START:
-        RED_SOLDIER_END
-    ].set(red_x)
+    x = x.at[RED_SOLDIER_START:RED_SOLDIER_END].set(red_x)
+    z = z.at[RED_SOLDIER_START:RED_SOLDIER_END].set(red_z)
 
-    z = z.at[
-        RED_SOLDIER_START:
-        RED_SOLDIER_END
-    ].set(red_z)
+    x = x.at[BLUE_SOLDIER_START:BLUE_SOLDIER_END].set(blue_x)
+    z = z.at[BLUE_SOLDIER_START:BLUE_SOLDIER_END].set(blue_z)
 
-    x = x.at[
-        BLUE_SOLDIER_START:
-        BLUE_SOLDIER_END
-    ].set(blue_x)
-
-    z = z.at[
-        BLUE_SOLDIER_START:
-        BLUE_SOLDIER_END
-    ].set(blue_z)
-
-    speed = speed.at[
-        RED_SOLDIER_START:
-        BLUE_SOLDIER_END
-    ].set(
+    speed = speed.at[RED_SOLDIER_START:BLUE_SOLDIER_END].set(
         INITIAL_SOLDIER_SPEED
     )
 
@@ -415,17 +256,12 @@ def reset_one(key):
         "alive": alive,
         "attack_timer": attack_timer,
         "speed": speed,
-        "time": jnp.array(
-            0.0,
-            dtype=jnp.float32,
-        ),
+        "time": jnp.array(0.0, dtype=jnp.float32),
         "done": jnp.array(False),
     }
 
 
-reset_parallel = jax.jit(
-    jax.vmap(reset_one)
-)
+reset_parallel = jax.jit(jax.vmap(reset_one))
 
 
 def reset_env(key):
@@ -433,23 +269,11 @@ def reset_env(key):
 
 
 def reset(key):
-    return reset_parallel(
-        random.split(
-            key,
-            N_ENVS,
-        )
-    )
+    return reset_parallel(random.split(key, N_ENVS))
 
 
 def reset_batch(key, n):
-    return jax.vmap(
-        reset_one
-    )(
-        random.split(
-            key,
-            n,
-        )
-    )
+    return jax.vmap(reset_one)(random.split(key, n))
 
 
 def get_alive_mask(state):
@@ -457,103 +281,51 @@ def get_alive_mask(state):
 
 
 def tree_index(tree, i):
-    return jax.tree_util.tree_map(
-        lambda a: a[i],
-        tree,
-    )
+    return jax.tree_util.tree_map(lambda a: a[i], tree)
+
 
 # ============================================================
 # PHYSICS / COMBAT
 # ============================================================
 
-
 def decode_actions(action):
-    soldier_action = action[
-        :SOLDIER_ACTION_SIZE
-    ].reshape(
-        N_SOLDIERS_PER_TEAM,
-        3,
+    soldier_action = action[:SOLDIER_ACTION_SIZE].reshape(
+        N_SOLDIERS_PER_TEAM, 3
     )
 
     raw_dx = soldier_action[:, 0]
     raw_dz = soldier_action[:, 1]
     raw_attack = soldier_action[:, 2]
 
-    norm = jnp.sqrt(
-        raw_dx * raw_dx
-        + raw_dz * raw_dz
-        + 1e-8
-    )
+    norm = jnp.sqrt(raw_dx * raw_dx + raw_dz * raw_dz + 1e-8)
 
-    soldier_dx = (
-        raw_dx / norm
-    )
+    soldier_dx = raw_dx / norm
+    soldier_dz = raw_dz / norm
 
-    soldier_dz = (
-        raw_dz / norm
-    )
+    cmd_dx = action[SOLDIER_ACTION_SIZE]
+    cmd_dz = action[SOLDIER_ACTION_SIZE + 1]
 
-    cmd_dx = action[
-        SOLDIER_ACTION_SIZE
-    ]
-
-    cmd_dz = action[
-        SOLDIER_ACTION_SIZE + 1
-    ]
-
-    cmd_norm = jnp.sqrt(
-        cmd_dx * cmd_dx
-        + cmd_dz * cmd_dz
-        + 1e-8
-    )
+    cmd_norm = jnp.sqrt(cmd_dx * cmd_dx + cmd_dz * cmd_dz + 1e-8)
 
     return (
         soldier_dx,
         soldier_dz,
-        (raw_attack > 0.5).astype(
-            jnp.float32
-        ),
+        (raw_attack > 0.5).astype(jnp.float32),
         cmd_dx / cmd_norm,
         cmd_dz / cmd_norm,
     )
 
 
-def pairwise_separation(
-    x,
-    z,
-    alive,
-    movable=None,
-):
-    dx = (
-        x[:, None]
-        - x[None, :]
-    )
+def pairwise_separation(x, z, alive, movable=None):
+    dx = x[:, None] - x[None, :]
+    dz = z[:, None] - z[None, :]
 
-    dz = (
-        z[:, None]
-        - z[None, :]
-    )
+    dist2 = dx * dx + dz * dz
+    dist = jnp.sqrt(dist2 + 1e-8)
 
-    dist2 = (
-        dx * dx
-        + dz * dz
-    )
+    radius = commander_mask * COMMANDER_RADIUS + soldier_mask * SOLDIER_RADIUS
 
-    dist = jnp.sqrt(
-        dist2 + 1e-8
-    )
-
-    radius = (
-        commander_mask
-        * COMMANDER_RADIUS
-        + soldier_mask
-        * SOLDIER_RADIUS
-    )
-
-    required = (
-        radius[:, None]
-        + radius[None, :]
-    )
+    required = radius[:, None] + radius[None, :]
 
     cpair = (
         (commander_mask[:, None] > 0)
@@ -562,16 +334,10 @@ def pairwise_separation(
 
     required = (
         required
-        + cpair.astype(
-            jnp.float32
-        )
-        * COMMANDER_EXTRA_MARGIN
+        + cpair.astype(jnp.float32) * COMMANDER_EXTRA_MARGIN
     )
 
-    overlap = jnp.maximum(
-        required - dist,
-        0.0,
-    )
+    overlap = jnp.maximum(required - dist, 0.0)
 
     valid = (
         (alive[:, None] > 0)
@@ -581,21 +347,12 @@ def pairwise_separation(
 
     corr = (
         overlap
-        * valid.astype(
-            jnp.float32
-        )
+        * valid.astype(jnp.float32)
         / (dist + 1e-8)
     )
 
-    push_x = jnp.sum(
-        corr * dx,
-        axis=1,
-    )
-
-    push_z = jnp.sum(
-        corr * dz,
-        axis=1,
-    )
+    push_x = jnp.sum(corr * dx, axis=1)
+    push_z = jnp.sum(corr * dz, axis=1)
 
     push_x = jnp.where(
         commander_mask > 0,
@@ -610,75 +367,33 @@ def pairwise_separation(
     )
 
     if movable is not None:
-        push_x = jnp.where(
-            movable,
-            push_x,
-            0.0,
-        )
+        push_x = jnp.where(movable, push_x, 0.0)
+        push_z = jnp.where(movable, push_z, 0.0)
 
-        push_z = jnp.where(
-            movable,
-            push_z,
-            0.0,
-        )
-
-    return (
-        push_x,
-        push_z,
-    )
+    return push_x, push_z
 
 
-def wall_blocked(
-    x,
-    z,
-    radius,
-):
-    x2 = x[:, None]
-    z2 = z[:, None]
-    r2 = radius[:, None]
+def wall_blocked(x, z, radius):
+    x2, z2, r2 = x[:, None], z[:, None], radius[:, None]
 
     wx = walls[:, 0][None, :]
     wz = walls[:, 1][None, :]
 
-    cx = jnp.clip(
-        x2,
-        wx - 0.5,
-        wx + 0.5,
-    )
+    cx = jnp.clip(x2, wx - 0.5, wx + 0.5)
+    cz = jnp.clip(z2, wz - 0.5, wz + 0.5)
 
-    cz = jnp.clip(
-        z2,
-        wz - 0.5,
-        wz + 0.5,
-    )
-
-    dx = x2 - cx
-    dz = z2 - cz
+    dx, dz = x2 - cx, z2 - cz
 
     return jnp.any(
-        dx * dx
-        + dz * dz
-        < r2 * r2,
+        dx * dx + dz * dz < r2 * r2,
         axis=1,
     )
 
 
-def step_one(
-    state,
-    red_action,
-    blue_action,
-):
-    x = state["x"]
-    z = state["z"]
-
-    hp = state["hp"]
-    alive = state["alive"]
-
-    attack_timer = state[
-        "attack_timer"
-    ]
-
-    speed = state["speed"]
+def step_one(state, red_action, blue_action):
+    x, z = state["x"], state["z"]
+    hp, alive = state["hp"], state["alive"]
+    attack_timer, speed = state["attack_timer"], state["speed"]
 
     (
         red_dx,
@@ -686,9 +401,7 @@ def step_one(
         red_at,
         red_cmd_dx,
         red_cmd_dz,
-    ) = decode_actions(
-        red_action
-    )
+    ) = decode_actions(red_action)
 
     (
         blue_dx,
@@ -696,108 +409,40 @@ def step_one(
         blue_at,
         blue_cmd_dx,
         blue_cmd_dz,
-    ) = decode_actions(
-        blue_action
+    ) = decode_actions(blue_action)
+
+    move_dx = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    move_dz = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    move_at = jnp.zeros(N_UNITS, dtype=jnp.float32)
+
+    move_dx = move_dx.at[RED_COMMANDER_INDEX].set(red_cmd_dx)
+    move_dz = move_dz.at[RED_COMMANDER_INDEX].set(red_cmd_dz)
+
+    move_dx = move_dx.at[BLUE_COMMANDER_INDEX].set(blue_cmd_dx)
+    move_dz = move_dz.at[BLUE_COMMANDER_INDEX].set(blue_cmd_dz)
+
+    move_dx = move_dx.at[ALL_SOLDIER_INDICES].set(
+        jnp.concatenate([red_dx, blue_dx])
     )
 
-    move_dx = jnp.zeros(
-        N_UNITS,
-        dtype=jnp.float32,
+    move_dz = move_dz.at[ALL_SOLDIER_INDICES].set(
+        jnp.concatenate([red_dz, blue_dz])
     )
 
-    move_dz = jnp.zeros(
-        N_UNITS,
-        dtype=jnp.float32,
+    move_at = move_at.at[ALL_SOLDIER_INDICES].set(
+        jnp.concatenate([red_at, blue_at])
     )
 
-    move_at = jnp.zeros(
-        N_UNITS,
-        dtype=jnp.float32,
-    )
+    attack_timer = jnp.maximum(0.0, attack_timer - DT)
+    can_move = attack_timer <= 0
+    distance = speed * DT
 
-    move_dx = move_dx.at[
-        RED_COMMANDER_INDEX
-    ].set(
-        red_cmd_dx
-    )
-
-    move_dz = move_dz.at[
-        RED_COMMANDER_INDEX
-    ].set(
-        red_cmd_dz
-    )
-
-    move_dx = move_dx.at[
-        BLUE_COMMANDER_INDEX
-    ].set(
-        blue_cmd_dx
-    )
-
-    move_dz = move_dz.at[
-        BLUE_COMMANDER_INDEX
-    ].set(
-        blue_cmd_dz
-    )
-
-    move_dx = move_dx.at[
-        ALL_SOLDIER_INDICES
-    ].set(
-        jnp.concatenate([
-            red_dx,
-            blue_dx,
-        ])
-    )
-
-    move_dz = move_dz.at[
-        ALL_SOLDIER_INDICES
-    ].set(
-        jnp.concatenate([
-            red_dz,
-            blue_dz,
-        ])
-    )
-
-    move_at = move_at.at[
-        ALL_SOLDIER_INDICES
-    ].set(
-        jnp.concatenate([
-            red_at,
-            blue_at,
-        ])
-    )
-
-    attack_timer = jnp.maximum(
-        0.0,
-        attack_timer - DT,
-    )
-
-    can_move = (
-        attack_timer <= 0
-    )
-
-    distance = (
-        speed * DT
-    )
-
-    nx = (
-        x
-        + move_dx
-        * distance
-        * can_move
-    )
-
-    nz = (
-        z
-        + move_dz
-        * distance
-        * can_move
-    )
+    nx = x + move_dx * distance * can_move
+    nz = z + move_dz * distance * can_move
 
     radius = (
-        commander_mask
-        * COMMANDER_RADIUS
-        + soldier_mask
-        * SOLDIER_RADIUS
+        commander_mask * COMMANDER_RADIUS
+        + soldier_mask * SOLDIER_RADIUS
     )
 
     inside = (
@@ -810,23 +455,11 @@ def step_one(
     attempted_move = (
         (alive > 0)
         & can_move
-        & (
-            jnp.abs(move_dx)
-            + jnp.abs(move_dz)
-            > 1e-6
-        )
+        & ((jnp.abs(move_dx) + jnp.abs(move_dz)) > 1e-6)
     )
 
-    desired_wall_hit = wall_blocked(
-        nx,
-        nz,
-        radius,
-    )
-
-    wall_collision = (
-        attempted_move
-        & desired_wall_hit
-    )
+    desired_wall_hit = wall_blocked(nx, nz, radius)
+    wall_collision = attempted_move & desired_wall_hit
 
     valid_move = (
         inside
@@ -835,29 +468,11 @@ def step_one(
         & can_move
     )
 
-    nx = jnp.where(
-        valid_move,
-        nx,
-        x,
-    )
+    nx = jnp.where(valid_move, nx, x)
+    nz = jnp.where(valid_move, nz, z)
 
-    nz = jnp.where(
-        valid_move,
-        nz,
-        z,
-    )
-
-    vx = jnp.where(
-        valid_move,
-        move_dx,
-        0.0,
-    )
-
-    vz = jnp.where(
-        valid_move,
-        move_dz,
-        0.0,
-    )
+    vx = jnp.where(valid_move, move_dx, 0.0)
+    vz = jnp.where(valid_move, move_dz, 0.0)
 
     movable = (
         (commander_mask > 0)
@@ -908,57 +523,32 @@ def step_one(
         HALF_FIELD - radius,
     )
 
-    ax = nx[
-        ALL_SOLDIER_INDICES
-    ]
+    ax = nx[ALL_SOLDIER_INDICES]
+    az = nz[ALL_SOLDIER_INDICES]
 
-    az = nz[
-        ALL_SOLDIER_INDICES
-    ]
+    ddx = nx[None, :] - ax[:, None]
+    ddz = nz[None, :] - az[:, None]
 
-    ddx = (
-        nx[None, :]
-        - ax[:, None]
-    )
+    dist2 = ddx * ddx + ddz * ddz
 
-    ddz = (
-        nz[None, :]
-        - az[:, None]
-    )
+    a_team = teams[ALL_SOLDIER_INDICES]
 
-    dist2 = (
-        ddx * ddx
-        + ddz * ddz
-    )
-
-    a_team = teams[
-        ALL_SOLDIER_INDICES
-    ]
-
-    enemy_mask = (
-        teams[None, :]
-        != a_team[:, None]
-    )
+    enemy_mask = teams[None, :] != a_team[:, None]
 
     valid_target = (
         enemy_mask
         & (alive[None, :] > 0)
+        & (dist2 <= ATTACK_RANGE ** 2)
         & (
-            dist2
-            <= ATTACK_RANGE ** 2
-        )
-        & ~(
-            ALL_UNIT_INDICES[None, :]
-            == ALL_SOLDIER_INDICES[:, None]
+            ~(
+                ALL_UNIT_INDICES[None, :]
+                == ALL_SOLDIER_INDICES[:, None]
+            )
         )
     )
 
     target = jnp.argmin(
-        jnp.where(
-            valid_target,
-            dist2,
-            1e9,
-        ),
+        jnp.where(valid_target, dist2, 1e9),
         axis=1,
     )
 
@@ -967,41 +557,20 @@ def step_one(
         axis=1,
     )
 
-    soldier_attack_timer = (
-        attack_timer[
-            ALL_SOLDIER_INDICES
-        ]
-    )
+    soldier_attack_timer = attack_timer[ALL_SOLDIER_INDICES]
 
     attack_attempt = (
-        (move_at[
-            ALL_SOLDIER_INDICES
-        ] > 0.5)
-        & (
-            soldier_attack_timer <= 0
-        )
-        & (
-            alive[
-                ALL_SOLDIER_INDICES
-            ] > 0
-        )
+        (move_at[ALL_SOLDIER_INDICES] > 0.5)
+        & (soldier_attack_timer <= 0)
+        & (alive[ALL_SOLDIER_INDICES] > 0)
     )
 
-    can_attack = (
-        attack_attempt
-        & has_target
-    )
-
-    attack_miss = (
-        attack_attempt
-        & (~has_target)
-    )
+    can_attack = attack_attempt & has_target
+    attack_miss = attack_attempt & (~has_target)
 
     damage_values = (
         ATTACK_DAMAGE
-        * can_attack.astype(
-            jnp.float32
-        )
+        * can_attack.astype(jnp.float32)
     )
 
     attack_damage = jnp.zeros(
@@ -1009,16 +578,12 @@ def step_one(
         dtype=jnp.float32,
     )
 
-    attack_damage = (
-        attack_damage.at[target]
-        .add(damage_values)
+    attack_damage = attack_damage.at[target].add(
+        damage_values
     )
 
     hp_before = hp
-
-    hp_after = (
-        hp - attack_damage
-    )
+    hp_after = hp - attack_damage
 
     target_died = (
         (hp_before > 0)
@@ -1028,37 +593,23 @@ def step_one(
     attacker_kill = (
         can_attack
         & target_died[target]
-    ).astype(
-        jnp.float32
-    )
+    ).astype(jnp.float32)
 
     soldier_rewards = jnp.zeros(
         N_SOLDIERS_TOTAL,
         dtype=jnp.float32,
     )
 
-    soldier_wall = (
-        wall_collision[
-            ALL_SOLDIER_INDICES
-        ].astype(
-            jnp.float32
-        )
-    )
+    soldier_wall = wall_collision[
+        ALL_SOLDIER_INDICES
+    ].astype(jnp.float32)
 
     soldier_rewards = (
         soldier_rewards
-        + REWARD_SOLDIER_HIT
-        * can_attack.astype(
-            jnp.float32
-        )
-        + REWARD_SOLDIER_MISS
-        * attack_miss.astype(
-            jnp.float32
-        )
-        + REWARD_SOLDIER_WALL
-        * soldier_wall
-        + REWARD_SOLDIER_KILL
-        * attacker_kill
+        + REWARD_SOLDIER_HIT * can_attack.astype(jnp.float32)
+        + REWARD_SOLDIER_MISS * attack_miss.astype(jnp.float32)
+        + REWARD_SOLDIER_WALL * soldier_wall
+        + REWARD_SOLDIER_KILL * attacker_kill
     )
 
     local_reward = jnp.zeros(
@@ -1066,65 +617,42 @@ def step_one(
         dtype=jnp.float32,
     )
 
-    local_reward = (
-        local_reward
-        .at[
-            ALL_SOLDIER_INDICES
-        ]
-        .set(soldier_rewards)
-    )
+    local_reward = local_reward.at[
+        ALL_SOLDIER_INDICES
+    ].set(soldier_rewards)
 
     local_reward = (
         local_reward
         + REWARD_COMMANDER_WALL
-        * wall_collision.astype(
-            jnp.float32
-        )
+        * wall_collision.astype(jnp.float32)
         * commander_mask
     )
 
     red_cmd_hits = jnp.sum(
         can_attack
-        & (
-            target
-            == RED_COMMANDER_INDEX
-        )
+        & (target == RED_COMMANDER_INDEX)
         & (a_team == 1.0)
     )
 
     blue_cmd_hits = jnp.sum(
         can_attack
-        & (
-            target
-            == BLUE_COMMANDER_INDEX
-        )
+        & (target == BLUE_COMMANDER_INDEX)
         & (a_team == 0.0)
     )
 
-    local_reward = (
-        local_reward
-        .at[
-            RED_COMMANDER_INDEX
-        ]
-        .add(
-            REWARD_COMMANDER_HIT_BY_ENEMY
-            * red_cmd_hits
-        )
+    local_reward = local_reward.at[
+        RED_COMMANDER_INDEX
+    ].add(
+        REWARD_COMMANDER_HIT_BY_ENEMY * red_cmd_hits
     )
 
-    local_reward = (
-        local_reward
-        .at[
-            BLUE_COMMANDER_INDEX
-        ]
-        .add(
-            REWARD_COMMANDER_HIT_BY_ENEMY
-            * blue_cmd_hits
-        )
+    local_reward = local_reward.at[
+        BLUE_COMMANDER_INDEX
+    ].add(
+        REWARD_COMMANDER_HIT_BY_ENEMY * blue_cmd_hits
     )
 
     hp = hp_after
-
     alive = jnp.where(
         hp <= 0,
         0.0,
@@ -1135,50 +663,29 @@ def step_one(
         ALL_SOLDIER_INDICES
     ]
 
-    attack_timer = (
-        attack_timer
-        .at[
-            ALL_SOLDIER_INDICES
-        ]
-        .set(
-            jnp.where(
-                attack_attempt,
-                ATTACK_COOLDOWN,
-                old_t,
-            )
+    attack_timer = attack_timer.at[
+        ALL_SOLDIER_INDICES
+    ].set(
+        jnp.where(
+            attack_attempt,
+            ATTACK_COOLDOWN,
+            old_t,
         )
     )
 
-    new_time = (
-        state["time"]
-        + DT
-    )
+    new_time = state["time"] + DT
 
-    red_cmd = (
-        alive[
-            RED_COMMANDER_INDEX
-        ] > 0
-    )
-
-    blue_cmd = (
-        alive[
-            BLUE_COMMANDER_INDEX
-        ] > 0
-    )
+    red_cmd = alive[RED_COMMANDER_INDEX] > 0
+    blue_cmd = alive[BLUE_COMMANDER_INDEX] > 0
 
     commander_done = (
         (~red_cmd)
         | (~blue_cmd)
     )
 
-    timeout = (
-        new_time >= MAX_TIME
-    )
+    timeout = new_time >= MAX_TIME
 
-    done = (
-        commander_done
-        | timeout
-    )
+    done = commander_done | timeout
 
     red_n = jnp.sum(
         alive[
@@ -1195,12 +702,8 @@ def step_one(
     )
 
     commander_reward = (
-        red_cmd.astype(
-            jnp.float32
-        )
-        - blue_cmd.astype(
-            jnp.float32
-        )
+        red_cmd.astype(jnp.float32)
+        - blue_cmd.astype(jnp.float32)
     )
 
     timeout_reward = (
@@ -1245,15 +748,8 @@ def step_one(
         ])
     )
 
-    reward_red = (
-        terminal_red
-        + red_local
-    )
-
-    reward_blue = (
-        terminal_blue
-        + blue_local
-    )
+    reward_red = terminal_red + red_local
+    reward_blue = terminal_blue + blue_local
 
     next_state = {
         "x": nx,
@@ -1276,11 +772,7 @@ def step_one(
     )
 
 
-def env_step(
-    state,
-    red_action,
-    blue_action,
-):
+def env_step(state, red_action, blue_action):
     return step_one(
         state,
         red_action,
@@ -1299,25 +791,17 @@ step_parallel = jax.jit(
 # OBSERVATION HELPERS
 # ============================================================
 
-
 def relative_features(
     source_x,
     source_z,
     target_x,
     target_z,
 ):
-    dx = (
-        target_x - source_x
-    )
-
-    dz = (
-        target_z - source_z
-    )
+    dx = target_x - source_x
+    dz = target_z - source_z
 
     dist = jnp.sqrt(
-        dx * dx
-        + dz * dz
-        + 1e-8
+        dx * dx + dz * dz + 1e-8
     )
 
     dist_norm = jnp.clip(
@@ -1329,69 +813,50 @@ def relative_features(
     sin_theta = dz / dist
     cos_theta = dx / dist
 
-    return jnp.stack(
-        [
-            dist_norm,
-            sin_theta,
-            cos_theta,
-        ],
-        axis=-1,
-    )
+    return jnp.stack([
+        dist_norm,
+        sin_theta,
+        cos_theta,
+    ], axis=-1)
 
 
-def nearest_enemy_indices(
-    x,
-    z,
-    alive,
+def nearest_enemy_features(
+    local_x,
+    local_z,
+    state,
+    perspective_team,
 ):
-    """
-    Compute nearest enemy index for all 202 units once.
-    The result is independent of Red/Blue perspective.
-    """
+    local_team = teams
+    alive = state["alive"]
+
     dx = (
-        x[None, :]
-        - x[:, None]
+        local_x[None, :]
+        - local_x[:, None]
     )
 
     dz = (
-        z[None, :]
-        - z[:, None]
+        local_z[None, :]
+        - local_z[:, None]
     )
 
-    dist2 = (
-        dx * dx
-        + dz * dz
-    )
+    dist2 = dx * dx + dz * dz
 
     valid = (
-        (teams[None, :] != teams[:, None])
+        (local_team[None, :] != local_team[:, None])
         & (alive[None, :] > 0)
     )
 
+    # perspective_team is kept explicit so the observation definition
+    # remains easy to inspect; enemy filtering uses team inequality.
+    del perspective_team
+
     nearest_idx = jnp.argmin(
-        jnp.where(
-            valid,
-            dist2,
-            1e9,
-        ),
+        jnp.where(valid, dist2, 1e9),
         axis=1,
     )
 
-    return nearest_idx
-
-
-def nearest_enemy_features_from_indices(
-    local_x,
-    local_z,
-    nearest_idx,
-):
-    nearest_x = (
-        local_x[nearest_idx]
-    )
-
-    nearest_z = (
-        local_z[nearest_idx]
-    )
+    nearest_x = local_x[nearest_idx]
+    nearest_z = local_z[nearest_idx]
 
     return relative_features(
         local_x,
@@ -1407,6 +872,8 @@ def commander_wall_features(
     terrain_local,
 ):
     # [NW, N, NE, W, E, SW, S, SE]
+    # in the local/mirrored frame.
+
     dc = jnp.array(
         [-1, 0, 1, -1, 1, -1, 0, 1],
         dtype=jnp.int32,
@@ -1449,40 +916,32 @@ def commander_wall_features(
         )
 
         idx = (
-            safe_rows
-            * TERRAIN_RES
+            safe_rows * TERRAIN_RES
             + safe_cols
         )
 
         vals = terrain_local[idx]
 
+        # Outside the battlefield is treated as blocked.
         return jnp.where(
             inside,
             vals,
             1.0,
         )
 
-    return jax.vmap(
-        one
-    )(
+    return jax.vmap(one)(
         cmd_x,
         cmd_z,
     )
 
 
-def make_observation_from_nearest(
+def make_observation(
     state,
     perspective_team,
-    nearest_idx,
 ):
-    x = state["x"]
-    z = state["z"]
-
-    vx = state["vx"]
-    vz = state["vz"]
-
-    hp = state["hp"]
-    alive = state["alive"]
+    x, z = state["x"], state["z"]
+    vx, vz = state["vx"], state["vz"]
+    hp, alive = state["hp"], state["alive"]
 
     blue = (
         perspective_team == 1.0
@@ -1506,39 +965,31 @@ def make_observation_from_nearest(
 
     own = (
         teams == perspective_team
-    ).astype(
+    ).astype(jnp.float32)
+
+    unit_type = commander_mask.astype(
         jnp.float32
     )
 
-    unit_type = (
-        commander_mask.astype(
-            jnp.float32
-        )
+    base = jnp.stack([
+        local_x / HALF_FIELD,
+        local_z / HALF_FIELD,
+        local_vx,
+        local_vz,
+        hp,
+        own,
+        unit_type,
+        alive,
+    ], axis=-1)
+
+    nearest = nearest_enemy_features(
+        local_x,
+        local_z,
+        state,
+        perspective_team,
     )
 
-    base = jnp.stack(
-        [
-            local_x / HALF_FIELD,
-            local_z / HALF_FIELD,
-            local_vx,
-            local_vz,
-            hp,
-            own,
-            unit_type,
-            alive,
-        ],
-        axis=-1,
-    )
-
-    nearest = (
-        nearest_enemy_features_from_indices(
-            local_x,
-            local_z,
-            nearest_idx,
-        )
-    )
-
-    own_cmd_idx = jnp.where(
+    own_cmd = jnp.where(
         perspective_team == 0.0,
         jnp.array(
             RED_COMMANDER_INDEX,
@@ -1550,7 +1001,7 @@ def make_observation_from_nearest(
         ),
     )
 
-    enemy_cmd_idx = jnp.where(
+    enemy_cmd = jnp.where(
         perspective_team == 0.0,
         jnp.array(
             BLUE_COMMANDER_INDEX,
@@ -1562,34 +1013,24 @@ def make_observation_from_nearest(
         ),
     )
 
-    own_cmd_x = (
-        local_x[own_cmd_idx]
-    )
+    own_cmd_x = local_x[own_cmd]
+    own_cmd_z = local_z[own_cmd]
 
-    own_cmd_z = (
-        local_z[own_cmd_idx]
-    )
-
-    enemy_cmd_x = (
-        local_x[enemy_cmd_idx]
-    )
-
-    enemy_cmd_z = (
-        local_z[enemy_cmd_idx]
-    )
+    enemy_cmd_x = local_x[enemy_cmd]
+    enemy_cmd_z = local_z[enemy_cmd]
 
     soldier_idx = jnp.arange(
         RED_SOLDIER_START,
         BLUE_SOLDIER_END,
     )
 
-    soldier_x = (
-        local_x[soldier_idx]
-    )
+    soldier_x = local_x[
+        soldier_idx
+    ]
 
-    soldier_z = (
-        local_z[soldier_idx]
-    )
+    soldier_z = local_z[
+        soldier_idx
+    ]
 
     own_cmd_features = relative_features(
         soldier_x,
@@ -1613,31 +1054,20 @@ def make_observation_from_nearest(
         soldier_idx
     ]
 
-    soldier_features = jnp.concatenate(
-        [
-            soldier_base,
-            soldier_nearest,
-            own_cmd_features,
-            enemy_cmd_features,
-        ],
-        axis=-1,
-    )
+    soldier_features = jnp.concatenate([
+        soldier_base,
+        soldier_nearest,
+        own_cmd_features,
+        enemy_cmd_features,
+    ], axis=-1)
 
-    cmd_idx = jnp.array(
-        [
-            RED_COMMANDER_INDEX,
-            BLUE_COMMANDER_INDEX,
-        ],
-        dtype=jnp.int32,
-    )
+    cmd_idx = jnp.array([
+        RED_COMMANDER_INDEX,
+        BLUE_COMMANDER_INDEX,
+    ], dtype=jnp.int32)
 
-    cmd_base = base[
-        cmd_idx
-    ]
-
-    cmd_nearest = nearest[
-        cmd_idx
-    ]
+    cmd_base = base[cmd_idx]
+    cmd_nearest = nearest[cmd_idx]
 
     terrain_2d = terrain.reshape(
         TERRAIN_RES,
@@ -1650,74 +1080,25 @@ def make_observation_from_nearest(
         terrain_2d,
     )
 
-    terrain_local = (
-        terrain_local_2d.reshape(-1)
+    terrain_local = terrain_local_2d.reshape(-1)
+
+    cmd_wall_features = commander_wall_features(
+        local_x[cmd_idx],
+        local_z[cmd_idx],
+        terrain_local,
     )
 
-    cmd_wall_features = (
-        commander_wall_features(
-            local_x[cmd_idx],
-            local_z[cmd_idx],
-            terrain_local,
-        )
-    )
-
-    commander_features = jnp.concatenate(
-        [
-            cmd_base,
-            cmd_nearest,
-            cmd_wall_features,
-        ],
-        axis=-1,
-    )
+    commander_features = jnp.concatenate([
+        cmd_base,
+        cmd_nearest,
+        cmd_wall_features,
+    ], axis=-1)
 
     return jnp.concatenate([
         terrain_local,
         soldier_features.reshape(-1),
         commander_features.reshape(-1),
     ])
-
-
-def make_observation(
-    state,
-    perspective_team,
-):
-    nearest_idx = nearest_enemy_indices(
-        state["x"],
-        state["z"],
-        state["alive"],
-    )
-
-    return make_observation_from_nearest(
-        state,
-        perspective_team,
-        nearest_idx,
-    )
-
-
-def make_observation_pair(state):
-    nearest_idx = nearest_enemy_indices(
-        state["x"],
-        state["z"],
-        state["alive"],
-    )
-
-    red_obs = make_observation_from_nearest(
-        state,
-        0.0,
-        nearest_idx,
-    )
-
-    blue_obs = make_observation_from_nearest(
-        state,
-        1.0,
-        nearest_idx,
-    )
-
-    return (
-        red_obs,
-        blue_obs,
-    )
 
 
 def make_observation_batch(
@@ -1733,21 +1114,8 @@ def make_observation_batch(
     )
 
 
-def make_observation_pair_batch(
-    state,
-):
-    return jax.vmap(
-        make_observation_pair,
-        in_axes=(0,),
-    )(state)
-
-
 make_observation_batch_jit = jax.jit(
     make_observation_batch
-)
-
-make_observation_pair_batch_jit = jax.jit(
-    make_observation_pair_batch
 )
 
 
@@ -1801,9 +1169,7 @@ def local_to_world_action(
         cmd_dx,
     )
 
-    out = jnp.zeros_like(
-        action
-    )
+    out = jnp.zeros_like(action)
 
     out = out.at[
         ...,
@@ -1834,47 +1200,21 @@ def local_to_world_action(
 
 
 print()
-print(
-    "Raw observation size :",
-    RAW_OBS_SIZE,
-)
-
-print(
-    "Global network input :",
-    GLOBAL_INPUT_SIZE,
-)
-
-print(
-    "Action size           :",
-    ACTION_SIZE,
-)
-
-print(
-    "Episode max steps     :",
-    MAX_STEPS,
-)
-
-print(
-    "PPO rollout steps     :",
-    PPO_ROLLOUT_STEPS,
-)
-
-print(
-    "PPO rollout sim time  :",
-    f"{PPO_ROLLOUT_STEPS * DT:.1f} s",
-)
-
-print(
-    "Total units           :",
-    N_UNITS,
-)
+print("Raw observation size :", RAW_OBS_SIZE)
+print("Global network input :", GLOBAL_INPUT_SIZE)
+print("Action size           :", ACTION_SIZE)
+print("Simulation steps      :", MAX_STEPS)
+print("Total units           :", N_UNITS)
 
 # ============================================================
 # PART 2 : POLICY NETWORK
+# Hierarchical encoders + 2-layer team-wise self-attention
+# + shared global encoder + split Actor/Critic branches
 # ============================================================
 
-HIDDEN1 = 256
-HIDDEN2 = 256
+HIDDEN1 = 512
+ACTOR_HIDDEN = 512
+CRITIC_HIDDEN = 512
 
 GAMMA = 0.999
 GAE_LAMBDA = 0.97
@@ -1894,6 +1234,7 @@ LOGSTD_REG_COEF = 0.01
 PPO_EPOCHS = 4
 MINIBATCHES = 8
 
+PPO_ROLLOUT_STEPS = 512
 ROLLOUT_STEPS = PPO_ROLLOUT_STEPS
 
 BATCH_SIZE = (
@@ -1903,17 +1244,14 @@ BATCH_SIZE = (
 )
 
 MINIBATCH_SIZE = (
-    BATCH_SIZE
-    // MINIBATCHES
+    BATCH_SIZE // MINIBATCHES
 )
 
 PPO_UPDATES_PER_GENERATION = 20
 N_GENERATIONS = 100
 
 EVAL_GAMES_PER_SIDE = 32
-EVAL_GAMES = (
-    EVAL_GAMES_PER_SIDE * 2
-)
+EVAL_GAMES = EVAL_GAMES_PER_SIDE * 2
 
 EVAL_Z_OFFSETS = jnp.array(
     [
@@ -1947,174 +1285,313 @@ ATTACK_IDX = jnp.arange(
     3,
 )
 
-COMMANDER_MEAN_IDX = (
-    SOLDIER_ACTION_SIZE
-)
-
-COMMANDER_LOGSTD_IDX = (
-    SOLDIER_ACTION_SIZE + 1
-)
+COMMANDER_MEAN_IDX = SOLDIER_ACTION_SIZE
+COMMANDER_LOGSTD_IDX = SOLDIER_ACTION_SIZE + 1
 
 
-def init_policy(key):
-    (
-        k1,
-        k2,
-        k3,
-        k4,
-        k5,
-        k6,
-        k7,
-        k8,
-    ) = random.split(
+def glorot_uniform(
+    key,
+    shape,
+):
+    fan_in = shape[0]
+    fan_out = shape[1]
+
+    limit = jnp.sqrt(
+        6.0 / float(
+            fan_in + fan_out
+        )
+    )
+
+    return random.uniform(
+        key,
+        shape,
+        minval=-limit,
+        maxval=limit,
+    )
+
+
+def layer_norm(
+    x,
+    gamma,
+    beta,
+    eps=1e-5,
+):
+    mean = jnp.mean(
+        x,
+        axis=-1,
+        keepdims=True,
+    )
+
+    var = jnp.mean(
+        (x - mean) ** 2,
+        axis=-1,
+        keepdims=True,
+    )
+
+    return (
+        (x - mean)
+        / jnp.sqrt(var + eps)
+        * gamma
+        + beta
+    )
+
+
+def split_heads(x):
+    b, n, _ = x.shape
+
+    return x.reshape(
+        b,
+        n,
+        ATTENTION_HEADS,
+        ATTENTION_HEAD_DIM,
+    )
+
+
+def merge_heads(x):
+    b, n, _, _ = x.shape
+
+    return x.reshape(
+        b,
+        n,
+        LOCAL_EMBED_SIZE,
+    )
+
+
+def self_attention_block(
+    x,
+    params,
+    prefix,
+):
+    q = split_heads(
+        x @ params[f"{prefix}_Wq"]
+        + params[f"{prefix}_bq"]
+    )
+
+    k = split_heads(
+        x @ params[f"{prefix}_Wk"]
+        + params[f"{prefix}_bk"]
+    )
+
+    v = split_heads(
+        x @ params[f"{prefix}_Wv"]
+        + params[f"{prefix}_bv"]
+    )
+
+    scores = jnp.einsum(
+        "bnhd,bmhd->bhnm",
+        q,
+        k,
+    )
+
+    scores = (
+        scores
+        / jnp.sqrt(
+            float(ATTENTION_HEAD_DIM)
+        )
+    )
+
+    weights = jax.nn.softmax(
+        scores,
+        axis=-1,
+    )
+
+    attended = jnp.einsum(
+        "bhnm,bmhd->bnhd",
+        weights,
+        v,
+    )
+
+    attended = merge_heads(
+        attended
+    )
+
+    attended = (
+        attended
+        @ params[f"{prefix}_Wo"]
+        + params[f"{prefix}_bo"]
+    )
+
+    x = layer_norm(
+        x + attended,
+        params[f"{prefix}_ln_gamma"],
+        params[f"{prefix}_ln_beta"],
+    )
+
+    return x
+
+
+def init_attention_block(
+    key,
+    prefix,
+):
+    keys = random.split(
         key,
         8,
     )
 
     p = {
-        # Local soldier encoder
-        "Ws": (
-            random.normal(
-                k1,
-                (
-                    SOLDIER_FEATURES,
-                    LOCAL_EMBED_SIZE,
-                ),
-            )
-            * jnp.sqrt(
-                2.0
-                / SOLDIER_FEATURES
-            )
-        ),
-
-        "bs": jnp.zeros(
+        f"{prefix}_Wq": glorot_uniform(
+            keys[0],
             (
                 LOCAL_EMBED_SIZE,
-            )
+                LOCAL_EMBED_SIZE,
+            ),
         ),
-
-        # Local commander encoder
-        "Wc": (
-            random.normal(
-                k2,
-                (
-                    COMMANDER_FEATURES,
-                    LOCAL_EMBED_SIZE,
-                ),
-            )
-            * jnp.sqrt(
-                2.0
-                / COMMANDER_FEATURES
-            )
+        f"{prefix}_bq": jnp.zeros(
+            (LOCAL_EMBED_SIZE,)
         ),
-
-        "bc": jnp.zeros(
+        f"{prefix}_Wk": glorot_uniform(
+            keys[1],
             (
                 LOCAL_EMBED_SIZE,
-            )
+                LOCAL_EMBED_SIZE,
+            ),
         ),
-
-        # Shared representation before Actor/Critic split
-        "Wg1": (
-            random.normal(
-                k3,
-                (
-                    GLOBAL_INPUT_SIZE,
-                    HIDDEN1,
-                ),
-            )
-            * jnp.sqrt(
-                2.0
-                / GLOBAL_INPUT_SIZE
-            )
+        f"{prefix}_bk": jnp.zeros(
+            (LOCAL_EMBED_SIZE,)
         ),
-
-        "bg1": jnp.zeros(
+        f"{prefix}_Wv": glorot_uniform(
+            keys[2],
             (
-                HIDDEN1,
-            )
+                LOCAL_EMBED_SIZE,
+                LOCAL_EMBED_SIZE,
+            ),
         ),
-
-        # Actor-specific hidden layer
-        "W_actor": (
-            random.normal(
-                k4,
-                (
-                    HIDDEN1,
-                    HIDDEN2,
-                ),
-            )
-            * jnp.sqrt(
-                2.0
-                / HIDDEN1
-            )
+        f"{prefix}_bv": jnp.zeros(
+            (LOCAL_EMBED_SIZE,)
         ),
-
-        "b_actor": jnp.zeros(
+        f"{prefix}_Wo": glorot_uniform(
+            keys[3],
             (
-                HIDDEN2,
-            )
+                LOCAL_EMBED_SIZE,
+                LOCAL_EMBED_SIZE,
+            ),
         ),
-
-        # Critic-specific hidden layer
-        "W_critic": (
-            random.normal(
-                k5,
-                (
-                    HIDDEN1,
-                    HIDDEN2,
-                ),
-            )
-            * jnp.sqrt(
-                2.0
-                / HIDDEN1
-            )
+        f"{prefix}_bo": jnp.zeros(
+            (LOCAL_EMBED_SIZE,)
         ),
-
-        "b_critic": jnp.zeros(
-            (
-                HIDDEN2,
-            )
+        f"{prefix}_ln_gamma": jnp.ones(
+            (LOCAL_EMBED_SIZE,)
         ),
-
-        # Actor output
-        "Wa": (
-            random.normal(
-                k6,
-                (
-                    HIDDEN2,
-                    ACTION_SIZE,
-                ),
-            )
-            * 0.01
-        ),
-
-        "ba": jnp.zeros(
-            (
-                ACTION_SIZE,
-            )
-        ),
-
-        # Critic output
-        "Wv": (
-            random.normal(
-                k7,
-                (
-                    HIDDEN2,
-                    1,
-                ),
-            )
-            * 0.01
-        ),
-
-        "bv": jnp.zeros(
-            (
-                1,
-            )
+        f"{prefix}_ln_beta": jnp.zeros(
+            (LOCAL_EMBED_SIZE,)
         ),
     }
 
-    del k8
+    return p
+
+
+def init_policy(key):
+    keys = random.split(
+        key,
+        24,
+    )
+
+    p = {
+        "Ws1": glorot_uniform(
+            keys[0],
+            (
+                SOLDIER_FEATURES,
+                LOCAL_HIDDEN_SIZE,
+            ),
+        ),
+        "bs1": jnp.zeros(
+            (LOCAL_HIDDEN_SIZE,)
+        ),
+
+        "Ws2": glorot_uniform(
+            keys[1],
+            (
+                LOCAL_HIDDEN_SIZE,
+                LOCAL_EMBED_SIZE,
+            ),
+        ),
+        "bs2": jnp.zeros(
+            (LOCAL_EMBED_SIZE,)
+        ),
+
+        "Wc": glorot_uniform(
+            keys[2],
+            (
+                COMMANDER_FEATURES,
+                LOCAL_EMBED_SIZE,
+            ),
+        ),
+        "bc": jnp.zeros(
+            (LOCAL_EMBED_SIZE,)
+        ),
+
+        "Wg1": glorot_uniform(
+            keys[3],
+            (
+                GLOBAL_INPUT_SIZE,
+                HIDDEN1,
+            ),
+        ),
+        "bg1": jnp.zeros(
+            (HIDDEN1,)
+        ),
+
+        "W_actor": glorot_uniform(
+            keys[4],
+            (
+                HIDDEN1,
+                ACTOR_HIDDEN,
+            ),
+        ),
+        "b_actor": jnp.zeros(
+            (ACTOR_HIDDEN,)
+        ),
+
+        "W_critic": glorot_uniform(
+            keys[5],
+            (
+                HIDDEN1,
+                CRITIC_HIDDEN,
+            ),
+        ),
+        "b_critic": jnp.zeros(
+            (CRITIC_HIDDEN,)
+        ),
+
+        "Wa": random.normal(
+            keys[6],
+            (
+                ACTOR_HIDDEN,
+                ACTION_SIZE,
+            ),
+        ) * 0.01,
+
+        "ba": jnp.zeros(
+            (ACTION_SIZE,)
+        ),
+
+        "Wv": random.normal(
+            keys[7],
+            (
+                CRITIC_HIDDEN,
+                1,
+            ),
+        ) * 0.01,
+
+        "bv": jnp.zeros(
+            (1,)
+        ),
+    }
+
+    p.update(
+        init_attention_block(
+            keys[8],
+            "attn1",
+        )
+    )
+
+    p.update(
+        init_attention_block(
+            keys[9],
+            "attn2",
+        )
+    )
 
     p["ba"] = p["ba"].at[
         ANGLE_LOGSTD_IDX
@@ -2137,12 +1614,10 @@ def policy_forward(
 ):
     terrain_part = obs[
         :,
-        :TERRAIN_SIZE
+        :TERRAIN_SIZE,
     ]
 
-    soldier_start = (
-        TERRAIN_SIZE
-    )
+    soldier_start = TERRAIN_SIZE
 
     soldier_end = (
         soldier_start
@@ -2152,8 +1627,7 @@ def policy_forward(
 
     soldier_part = obs[
         :,
-        soldier_start:
-        soldier_end
+        soldier_start:soldier_end
     ].reshape(
         obs.shape[0],
         N_SOLDIERS_TOTAL,
@@ -2169,11 +1643,27 @@ def policy_forward(
         COMMANDER_FEATURES,
     )
 
-    soldier_emb = jnp.tanh(
+    # ----------------------------------------
+    # Soldier local encoder
+    # 17 -> 64 -> 64
+    # ----------------------------------------
+
+    soldier_h = jnp.tanh(
         soldier_part
-        @ params["Ws"]
-        + params["bs"]
+        @ params["Ws1"]
+        + params["bs1"]
     )
+
+    soldier_emb = jnp.tanh(
+        soldier_h
+        @ params["Ws2"]
+        + params["bs2"]
+    )
+
+    # ----------------------------------------
+    # Commander local encoder
+    # 19 -> 64
+    # ----------------------------------------
 
     commander_emb = jnp.tanh(
         commander_part
@@ -2181,33 +1671,99 @@ def policy_forward(
         + params["bc"]
     )
 
-    global_input = jnp.concatenate([
-        terrain_part,
-        soldier_emb.reshape(
-            obs.shape[0],
-            -1,
-        ),
-        commander_emb.reshape(
-            obs.shape[0],
-            -1,
-        ),
-    ], axis=-1)
+    # ----------------------------------------
+    # Team-wise Self-Attention
+    #
+    # Red:  100 x 64
+    # Blue: 100 x 64
+    #
+    # The two teams are processed separately.
+    # This preserves the fixed action indexing.
+    # ----------------------------------------
 
-    # Shared representation
+    red_soldier_emb = soldier_emb[
+        :,
+        :N_SOLDIERS_PER_TEAM,
+        :
+    ]
+
+    blue_soldier_emb = soldier_emb[
+        :,
+        N_SOLDIERS_PER_TEAM:,
+        :
+    ]
+
+    red_soldier_emb = self_attention_block(
+        red_soldier_emb,
+        params,
+        "attn1",
+    )
+
+    blue_soldier_emb = self_attention_block(
+        blue_soldier_emb,
+        params,
+        "attn1",
+    )
+
+    red_soldier_emb = self_attention_block(
+        red_soldier_emb,
+        params,
+        "attn2",
+    )
+
+    blue_soldier_emb = self_attention_block(
+        blue_soldier_emb,
+        params,
+        "attn2",
+    )
+
+    soldier_emb = jnp.concatenate(
+        [
+            red_soldier_emb,
+            blue_soldier_emb,
+        ],
+        axis=1,
+    )
+
+    # ----------------------------------------
+    # Global input
+    # ----------------------------------------
+
+    global_input = jnp.concatenate(
+        [
+            terrain_part,
+            soldier_emb.reshape(
+                obs.shape[0],
+                -1,
+            ),
+            commander_emb.reshape(
+                obs.shape[0],
+                -1,
+            ),
+        ],
+        axis=-1,
+    )
+
+    # ----------------------------------------
+    # Shared global encoder
+    # ----------------------------------------
+
     h_shared = jnp.tanh(
         global_input
         @ params["Wg1"]
         + params["bg1"]
     )
 
-    # Separate Actor branch
+    # ----------------------------------------
+    # Actor / Critic split
+    # ----------------------------------------
+
     actor_h = jnp.tanh(
         h_shared
         @ params["W_actor"]
         + params["b_actor"]
     )
 
-    # Separate Critic branch
     critic_h = jnp.tanh(
         h_shared
         @ params["W_critic"]
@@ -2226,10 +1782,7 @@ def policy_forward(
         + params["bv"]
     )[..., 0]
 
-    return (
-        action_output,
-        value,
-    )
+    return action_output, value
 
 
 policy_forward_jit = jax.jit(
@@ -2296,9 +1849,7 @@ def action_logprob(
         * (diff / std) ** 2
         - logstd
         - 0.5
-        * jnp.log(
-            2.0 * jnp.pi
-        )
+        * jnp.log(2.0 * jnp.pi)
     )
 
     lp_angle = jnp.sum(
@@ -2318,19 +1869,16 @@ def action_logprob(
 
     lp_attack = (
         at
-        * (
-            -jnp.logaddexp(
-                0.0,
-                -logits,
-            )
-        )
-        + (1.0 - at)
-        * (
-            -jnp.logaddexp(
-                0.0,
-                logits,
-            )
-        )
+        * (-jnp.logaddexp(
+            0.0,
+            -logits,
+        ))
+        +
+        (1.0 - at)
+        * (-jnp.logaddexp(
+            0.0,
+            logits,
+        ))
     )
 
     lp_attack = jnp.sum(
@@ -2377,15 +1925,10 @@ def action_logprob(
 
     lp_cmd = (
         -0.5
-        * (
-            cmd_diff
-            / cmd_std
-        ) ** 2
+        * (cmd_diff / cmd_std) ** 2
         - cmd_logstd
         - 0.5
-        * jnp.log(
-            2.0 * jnp.pi
-        )
+        * jnp.log(2.0 * jnp.pi)
     )
 
     return (
@@ -2426,11 +1969,11 @@ def policy_entropy(
     )
 
     e_attack = -(
-        p
-        * jnp.log(
+        p * jnp.log(
             p + 1e-8
         )
-        + (1.0 - p)
+        +
+        (1.0 - p)
         * jnp.log(
             1.0 - p + 1e-8
         )
@@ -2472,10 +2015,7 @@ def sample_action(
     obs,
     key,
 ):
-    (
-        action_output,
-        value,
-    ) = policy_forward(
+    action_output, value = policy_forward(
         params,
         obs,
     )
@@ -2521,13 +2061,8 @@ def sample_action(
         )
     )
 
-    dx = jnp.cos(
-        angle
-    )
-
-    dz = jnp.sin(
-        angle
-    )
+    dx = jnp.cos(angle)
+    dz = jnp.sin(angle)
 
     prob = jax.nn.sigmoid(
         action_output[
@@ -2625,10 +2160,7 @@ def deterministic_local_action(
     params,
     obs,
 ):
-    (
-        action_output,
-        value,
-    ) = policy_forward(
+    action_output, value = policy_forward(
         params,
         obs,
     )
@@ -2638,13 +2170,8 @@ def deterministic_local_action(
         ANGLE_MEAN_IDX
     ]
 
-    dx = jnp.cos(
-        mean
-    )
-
-    dz = jnp.sin(
-        mean
-    )
+    dx = jnp.cos(mean)
+    dz = jnp.sin(mean)
 
     at = (
         jax.nn.sigmoid(
@@ -2652,8 +2179,7 @@ def deterministic_local_action(
                 :,
                 ATTACK_IDX
             ]
-        )
-        >= 0.5
+        ) >= 0.5
     ).astype(
         jnp.float32
     )
@@ -2731,47 +2257,6 @@ def deterministic_world_action_batch(
     )
 
 
-def deterministic_world_action_pair_batch(
-    params_red,
-    params_blue,
-    state,
-):
-    red_obs, blue_obs = (
-        make_observation_pair_batch(
-            state
-        )
-    )
-
-    red_la, _ = (
-        deterministic_local_action(
-            params_red,
-            red_obs,
-        )
-    )
-
-    blue_la, _ = (
-        deterministic_local_action(
-            params_blue,
-            blue_obs,
-        )
-    )
-
-    red_wa = local_to_world_action(
-        red_la,
-        0.0,
-    )
-
-    blue_wa = local_to_world_action(
-        blue_la,
-        1.0,
-    )
-
-    return (
-        red_wa,
-        blue_wa,
-    )
-
-
 def deterministic_world_action_single(
     params,
     state,
@@ -2792,14 +2277,13 @@ def deterministic_world_action_single(
         team,
     )[0]
 
+
 # ============================================================
 # PART 3 : OPTIMIZER / PPO
 # ============================================================
 
 optimizer = optax.chain(
-    optax.clip_by_global_norm(
-        0.5
-    ),
+    optax.clip_by_global_norm(0.5),
     optax.adam(
         LEARNING_RATE
     ),
@@ -2824,7 +2308,12 @@ def compute_gae(
     def rev(carry, xs):
         gae = carry
 
-        r_t, v_t, d_t, nv = xs
+        (
+            r_t,
+            v_t,
+            d_t,
+            nv,
+        ) = xs
 
         m = (
             1.0
@@ -2835,7 +2324,9 @@ def compute_gae(
 
         delta = (
             r_t
-            + GAMMA * m * nv
+            + GAMMA
+            * m
+            * nv
             - v_t
         )
 
@@ -2847,10 +2338,7 @@ def compute_gae(
             * gae
         )
 
-        return (
-            gae,
-            gae,
-        )
+        return gae, gae
 
     next_values = jnp.concatenate(
         [
@@ -2890,10 +2378,7 @@ def ppo_loss(
     returns,
     ent_coef,
 ):
-    (
-        action_output,
-        values,
-    ) = policy_forward(
+    action_output, values = policy_forward(
         params,
         obs,
     )
@@ -2909,45 +2394,35 @@ def ppo_loss(
         )
     )
 
-    # --------------------------------------------------------
-    # Logstd regularization
-    # --------------------------------------------------------
-    # Soldier and Commander logstd are regularized separately
-    # so that the 100 soldier dimensions do not overwhelm the
-    # single commander dimension.
-    raw_soldier_logstd = (
-        action_output[
-            :,
-            ANGLE_LOGSTD_IDX
-        ]
-    )
+    soldier_logstd = action_output[
+        :,
+        ANGLE_LOGSTD_IDX
+    ]
 
-    raw_commander_logstd = (
-        action_output[
-            :,
-            COMMANDER_LOGSTD_IDX
-        ]
-    )
+    commander_logstd = action_output[
+        :,
+        COMMANDER_LOGSTD_IDX
+    ]
 
     soldier_logstd_reg = jnp.mean(
         (
-            raw_soldier_logstd
+            soldier_logstd
             - LOGSTD_TARGET
         ) ** 2
     )
 
     commander_logstd_reg = jnp.mean(
         (
-            raw_commander_logstd
+            commander_logstd
             - LOGSTD_TARGET
         ) ** 2
     )
 
+    # Balance the 100 soldier dimensions
+    # against the single commander dimension.
     logstd_reg = (
-        0.5
-        * soldier_logstd_reg
-        + 0.5
-        * commander_logstd_reg
+        0.5 * soldier_logstd_reg
+        + 0.5 * commander_logstd_reg
     )
 
     ratio = jnp.exp(
@@ -2988,77 +2463,36 @@ def ppo_loss(
 
     total = (
         policy_loss
-        + VALUE_COEF
-        * value_loss
-        - ent_coef
-        * entropy
-        + LOGSTD_REG_COEF
-        * logstd_reg
+        + VALUE_COEF * value_loss
+        - ent_coef * entropy
+        + LOGSTD_REG_COEF * logstd_reg
     )
 
     metrics = {
         "policy_loss": policy_loss,
         "value_loss": value_loss,
-
         "entropy": entropy,
-
         "entropy_per_soldier": (
             entropy
             / float(
                 N_SOLDIERS_PER_TEAM
             )
         ),
-
-        "logstd_mean": (
-            0.5
-            * (
-                jnp.mean(
-                    jnp.clip(
-                        raw_soldier_logstd,
-                        LOGSTD_MIN,
-                        LOGSTD_MAX,
-                    )
-                )
-                + jnp.mean(
-                    jnp.clip(
-                        raw_commander_logstd,
-                        LOGSTD_MIN,
-                        LOGSTD_MAX,
-                    )
-                )
+        "logstd_mean": jnp.mean(
+            jnp.clip(
+                soldier_logstd,
+                LOGSTD_MIN,
+                LOGSTD_MAX,
             )
         ),
-
-        "soldier_logstd_mean": (
-            jnp.mean(
-                jnp.clip(
-                    raw_soldier_logstd,
-                    LOGSTD_MIN,
-                    LOGSTD_MAX,
-                )
+        "commander_logstd_mean": jnp.mean(
+            jnp.clip(
+                commander_logstd,
+                LOGSTD_MIN,
+                LOGSTD_MAX,
             )
         ),
-
-        "commander_logstd_mean": (
-            jnp.mean(
-                jnp.clip(
-                    raw_commander_logstd,
-                    LOGSTD_MIN,
-                    LOGSTD_MAX,
-                )
-            )
-        ),
-
-        "soldier_logstd_reg": (
-            soldier_logstd_reg
-        ),
-
-        "commander_logstd_reg": (
-            commander_logstd_reg
-        ),
-
         "logstd_reg": logstd_reg,
-
         "approx_kl": jnp.mean(
             old_log_prob
             - new_log_prob
@@ -3094,21 +2528,20 @@ def ppo_update_minibatch(
         )
 
     (
-        loss,
-        metrics,
-    ), grads = jax.value_and_grad(
+        loss_metrics,
+        grads,
+    ) = jax.value_and_grad(
         loss_fn,
         has_aux=True,
     )(params)
 
+    loss, metrics = loss_metrics
     del loss
 
-    updates, opt_state = (
-        optimizer.update(
-            grads,
-            opt_state,
-            params,
-        )
+    updates, opt_state = optimizer.update(
+        grads,
+        opt_state,
+        params,
     )
 
     params = optax.apply_updates(
@@ -3122,10 +2555,10 @@ def ppo_update_minibatch(
         metrics,
     )
 
+
 # ============================================================
 # ROLLOUT
 # ============================================================
-
 
 def reset_finished_envs(
     state,
@@ -3140,17 +2573,17 @@ def reset_finished_envs(
     )
 
     def merge(old, new):
-        mask = (
-            done
-            if old.ndim == 1
-            else done.reshape(
+        mask = done
+
+        if old.ndim > 1:
+            mask = done.reshape(
                 (N_ENVS,)
                 + (1,)
                 * (
-                    old.ndim - 1
+                    old.ndim
+                    - 1
                 )
             )
-        )
 
         return jnp.where(
             mask,
@@ -3177,35 +2610,44 @@ def collect_rollout(
     def body(carry, _):
         st, k = carry
 
-        # One shared nearest-enemy calculation for
-        # both Red and Blue observations.
-        red_obs, blue_obs = (
-            make_observation_pair_batch(
-                st
-            )
+        red_obs = make_observation_batch(
+            st,
+            0.0,
         )
 
-        k, kr, kb, kreset = (
-            random.split(
-                k,
-                4,
-            )
+        blue_obs = make_observation_batch(
+            st,
+            1.0,
         )
 
-        red_la, red_lp, red_v = (
-            sample_action(
-                params,
-                red_obs,
-                kr,
-            )
+        (
+            k,
+            kr,
+            kb,
+            kreset,
+        ) = random.split(
+            k,
+            4,
         )
 
-        blue_la, blue_lp, blue_v = (
-            sample_action(
-                params,
-                blue_obs,
-                kb,
-            )
+        (
+            red_la,
+            red_lp,
+            red_v,
+        ) = sample_action(
+            params,
+            red_obs,
+            kr,
+        )
+
+        (
+            blue_la,
+            blue_lp,
+            blue_v,
+        ) = sample_action(
+            params,
+            blue_obs,
+            kb,
         )
 
         red_wa = local_to_world_action(
@@ -3218,7 +2660,12 @@ def collect_rollout(
             1.0,
         )
 
-        nxt, rr, br, done = jax.vmap(
+        (
+            nxt,
+            rr,
+            br,
+            done,
+        ) = jax.vmap(
             step_one,
             in_axes=(0, 0, 0),
         )(
@@ -3231,14 +2678,16 @@ def collect_rollout(
             nxt["alive"][
                 :,
                 RED_COMMANDER_INDEX
-            ] > 0
+            ]
+            > 0
         )
 
         blue_cmd = (
             nxt["alive"][
                 :,
                 BLUE_COMMANDER_INDEX
-            ] > 0
+            ]
+            > 0
         )
 
         reason = jnp.where(
@@ -3265,12 +2714,10 @@ def collect_rollout(
             ),
         )
 
-        new_state = (
-            reset_finished_envs(
-                nxt,
-                done,
-                kreset,
-            )
+        new_state = reset_finished_envs(
+            nxt,
+            done,
+            kreset,
         )
 
         out = (
@@ -3297,12 +2744,9 @@ def collect_rollout(
         )
 
     (
-        (
-            final_state,
-            final_key,
-        ),
-        traj,
-    ) = lax.scan(
+        final_state,
+        final_key,
+    ), traj = lax.scan(
         body,
         (
             state,
@@ -3327,12 +2771,14 @@ def collect_rollout(
         reasons,
     ) = traj
 
-    # Bootstrap from the actual state at the end of
-    # the PPO rollout if the trajectory is non-terminal.
-    f_red_obs, f_blue_obs = (
-        make_observation_pair_batch(
-            final_state
-        )
+    f_red_obs = make_observation_batch(
+        final_state,
+        0.0,
+    )
+
+    f_blue_obs = make_observation_batch(
+        final_state,
+        1.0,
     )
 
     _, red_last_v = policy_forward(
@@ -3413,19 +2859,15 @@ def collect_rollout(
         "battles": jnp.sum(
             reasons != 0
         ),
-
         "red_wins": jnp.sum(
             reasons == 1
         ),
-
         "blue_wins": jnp.sum(
             reasons == 2
         ),
-
         "timeouts": jnp.sum(
             reasons == 3
         ),
-
         "draws": jnp.sum(
             reasons == 4
         ),
@@ -3489,8 +2931,7 @@ def run_ppo_update(
     n = obs.shape[0]
 
     usable = (
-        n
-        // MINIBATCH_SIZE
+        n // MINIBATCH_SIZE
     ) * MINIBATCH_SIZE
 
     n_mb = (
@@ -3515,7 +2956,8 @@ def run_ppo_update(
         for mb in range(n_mb):
             idx = perm[
                 mb * MINIBATCH_SIZE:
-                (mb + 1) * MINIBATCH_SIZE
+                (mb + 1)
+                * MINIBATCH_SIZE
             ]
 
             (
@@ -3545,7 +2987,9 @@ def run_ppo_update(
         for k in acc[0]
     }
 
-    metrics["entropy_coef"] = float(
+    metrics[
+        "entropy_coef"
+    ] = float(
         ent_coef
     )
 
@@ -3564,10 +3008,10 @@ def run_ppo_update(
         metrics,
     )
 
+
 # ============================================================
 # PART 4 : EVALUATION
 # ============================================================
-
 
 def make_evaluation_states(
     base_states,
@@ -3587,9 +3031,8 @@ def make_evaluation_states(
         values,
         unit_mask,
     ):
-        return (
-            values
-            + offsets[:, None]
+        return values + (
+            offsets[:, None]
             * unit_mask[None, :]
         )
 
@@ -3636,15 +3079,28 @@ def evaluate_match(
             blue_return,
         ) = carry
 
-        red_a, blue_a = (
-            deterministic_world_action_pair_batch(
+        red_a = (
+            deterministic_world_action_batch(
                 params_red,
-                params_blue,
                 st,
+                0.0,
             )
         )
 
-        nxt, rr, br, done = jax.vmap(
+        blue_a = (
+            deterministic_world_action_batch(
+                params_blue,
+                st,
+                1.0,
+            )
+        )
+
+        (
+            nxt,
+            rr,
+            br,
+            done,
+        ) = jax.vmap(
             step_one,
             in_axes=(0, 0, 0),
         )(
@@ -3674,21 +3130,24 @@ def evaluate_match(
         )
 
         newly = (
-            done & active
+            done
+            & active
         )
 
         red_cmd = (
             nxt["alive"][
                 :,
                 RED_COMMANDER_INDEX
-            ] > 0
+            ]
+            > 0
         )
 
         blue_cmd = (
             nxt["alive"][
                 :,
                 BLUE_COMMANDER_INDEX
-            ] > 0
+            ]
+            > 0
         )
 
         res_now = jnp.where(
@@ -3773,38 +3232,31 @@ def evaluate_match(
 
     init = (
         init_states,
-
         jnp.zeros(
             E,
             dtype=bool,
         ),
-
         jnp.zeros(
             E,
             dtype=jnp.int32,
         ),
-
         jnp.full(
             E,
             MAX_STEPS,
             dtype=jnp.int32,
         ),
-
         jnp.zeros(
             E,
             dtype=jnp.float32,
         ),
-
         jnp.zeros(
             E,
             dtype=jnp.float32,
         ),
-
         jnp.zeros(
             E,
             dtype=jnp.float32,
         ),
-
         jnp.zeros(
             E,
             dtype=jnp.float32,
@@ -3812,23 +3264,18 @@ def evaluate_match(
     )
 
     (
-        (
-            final_state,
-            _,
-            result,
-            end_step,
-            red_surv,
-            blue_surv,
-            red_return,
-            blue_return,
-        ),
+        final_state,
         _,
-    ) = lax.scan(
+        result,
+        end_step,
+        red_surv,
+        blue_surv,
+        red_return,
+        blue_return,
+    ), _ = lax.scan(
         body,
         init,
-        jnp.arange(
-            MAX_STEPS
-        ),
+        jnp.arange(MAX_STEPS),
     )
 
     del final_state
@@ -3870,7 +3317,7 @@ def evaluate_elite_match(
 
     if verbose:
         print(
-            "  Elite match: side A "
+            f"  Elite match: side A "
             f"(candidate = Red)  "
             f"{E} games ..."
         )
@@ -3890,7 +3337,7 @@ def evaluate_elite_match(
 
     if verbose:
         print(
-            "  Elite match: side B "
+            f"  Elite match: side B "
             f"(candidate = Blue) "
             f"{E} games ..."
         )
@@ -3988,20 +3435,15 @@ def evaluate_elite_match(
     win_time = (
         end_step.astype(
             np.float32
-        )
-        * DT
+        ) * DT
     )
 
     candidate_wins = int(
-        np.sum(
-            candidate_won
-        )
+        np.sum(candidate_won)
     )
 
     elite_wins = int(
-        np.sum(
-            elite_won
-        )
+        np.sum(elite_won)
     )
 
     timeouts = int(
@@ -4076,10 +3518,10 @@ def evaluate_elite_match(
         "games_per_side": E,
     }
 
+
 # ============================================================
 # PART 5 : BEST BOUT RECORDING
 # ============================================================
-
 
 @jax.jit
 def record_bout(
@@ -4087,9 +3529,11 @@ def record_bout(
     params_blue,
     initial_state,
 ):
-    state0 = jax.tree_util.tree_map(
-        lambda a: a[None, ...],
-        initial_state,
+    state0 = (
+        jax.tree_util.tree_map(
+            lambda a: a[None, ...],
+            initial_state,
+        )
     )
 
     E = 1
@@ -4105,15 +3549,28 @@ def record_bout(
             end_step,
         ) = carry
 
-        red_a, blue_a = (
-            deterministic_world_action_pair_batch(
+        red_a = (
+            deterministic_world_action_batch(
                 params_red,
-                params_blue,
                 st,
+                0.0,
             )
         )
 
-        nxt, rr, br, done = jax.vmap(
+        blue_a = (
+            deterministic_world_action_batch(
+                params_blue,
+                st,
+                1.0,
+            )
+        )
+
+        (
+            nxt,
+            rr,
+            br,
+            done,
+        ) = jax.vmap(
             step_one,
             in_axes=(0, 0, 0),
         )(
@@ -4131,14 +3588,16 @@ def record_bout(
             nxt["alive"][
                 :,
                 RED_COMMANDER_INDEX
-            ] > 0
+            ]
+            > 0
         )
 
         blue_cmd = (
             nxt["alive"][
                 :,
                 BLUE_COMMANDER_INDEX
-            ] > 0
+            ]
+            > 0
         )
 
         res_now = jnp.where(
@@ -4198,17 +3657,14 @@ def record_bout(
 
     init = (
         state0,
-
         jnp.zeros(
             E,
             dtype=bool,
         ),
-
         jnp.zeros(
             E,
             dtype=jnp.int32,
         ),
-
         jnp.full(
             E,
             MAX_STEPS,
@@ -4217,19 +3673,14 @@ def record_bout(
     )
 
     (
-        (
-            final_state,
-            _,
-            result,
-            end_step,
-        ),
-        traj,
-    ) = lax.scan(
+        final_state,
+        _,
+        result,
+        end_step,
+    ), traj = lax.scan(
         body,
         init,
-        jnp.arange(
-            MAX_STEPS
-        ),
+        jnp.arange(MAX_STEPS),
     )
 
     result = jnp.where(
@@ -4252,33 +3703,40 @@ def record_bout(
     hps = hps[:, 0, :]
     alives = alives[:, 0, :]
 
-    red_actions = (
-        red_actions[:, 0, :]
+    red_actions = red_actions[:, 0, :]
+    blue_actions = blue_actions[:, 0, :]
+
+    xs = jnp.concatenate(
+        [
+            initial_state["x"][None, :],
+            xs,
+        ],
+        axis=0,
     )
 
-    blue_actions = (
-        blue_actions[:, 0, :]
+    zs = jnp.concatenate(
+        [
+            initial_state["z"][None, :],
+            zs,
+        ],
+        axis=0,
     )
 
-    xs = jnp.concatenate([
-        initial_state["x"][None, :],
-        xs,
-    ], axis=0)
+    hps = jnp.concatenate(
+        [
+            initial_state["hp"][None, :],
+            hps,
+        ],
+        axis=0,
+    )
 
-    zs = jnp.concatenate([
-        initial_state["z"][None, :],
-        zs,
-    ], axis=0)
-
-    hps = jnp.concatenate([
-        initial_state["hp"][None, :],
-        hps,
-    ], axis=0)
-
-    alives = jnp.concatenate([
-        initial_state["alive"][None, :],
-        alives,
-    ], axis=0)
+    alives = jnp.concatenate(
+        [
+            initial_state["alive"][None, :],
+            alives,
+        ],
+        axis=0,
+    )
 
     return {
         "x": xs,
@@ -4336,20 +3794,29 @@ def verify_bout(
 
     xs, zs, alives = traj
 
-    xs = jnp.concatenate([
-        initial_state["x"][None, :],
-        xs,
-    ], axis=0)
+    xs = jnp.concatenate(
+        [
+            initial_state["x"][None, :],
+            xs,
+        ],
+        axis=0,
+    )
 
-    zs = jnp.concatenate([
-        initial_state["z"][None, :],
-        zs,
-    ], axis=0)
+    zs = jnp.concatenate(
+        [
+            initial_state["z"][None, :],
+            zs,
+        ],
+        axis=0,
+    )
 
-    alives = jnp.concatenate([
-        initial_state["alive"][None, :],
-        alives,
-    ], axis=0)
+    alives = jnp.concatenate(
+        [
+            initial_state["alive"][None, :],
+            alives,
+        ],
+        axis=0,
+    )
 
     return (
         xs,
@@ -4361,38 +3828,24 @@ def verify_bout(
 def select_best_bout_index(
     match,
 ):
-    winner = match[
-        "winner"
-    ]
+    winner = match["winner"]
 
     won = (
-        match[
-            "candidate_won"
-        ]
+        match["candidate_won"]
         if winner == 1
-        else match[
-            "elite_won"
-        ]
+        else match["elite_won"]
     )
 
     returns = (
-        match[
-            "candidate_return"
-        ]
+        match["candidate_return"]
         if winner == 1
-        else match[
-            "elite_return"
-        ]
+        else match["elite_return"]
     )
 
     surv = (
-        match[
-            "candidate_surv"
-        ]
+        match["candidate_surv"]
         if winner == 1
-        else match[
-            "elite_surv"
-        ]
+        else match["elite_surv"]
     )
 
     idx = np.where(
@@ -4405,15 +3858,15 @@ def select_best_bout_index(
     order = np.lexsort(
         (
             -surv[idx],
-            match[
-                "end_step"
-            ][idx],
+            match["end_step"][idx],
             -returns[idx],
         )
     )
 
     return int(
-        idx[order[0]]
+        idx[
+            order[0]
+        ]
     )
 
 
@@ -4433,50 +3886,40 @@ def save_best_bout(
         bout["end_step"]
     )
 
-    frames = (
-        steps + 1
-    )
+    frames = steps + 1
 
     data = {
         "generation": np.array(
             generation,
             dtype=np.int32,
         ),
-
         "winner_code": np.array(
             match["winner"],
             dtype=np.int32,
         ),
-
         "winner_label": np.array(
             winner_label
         ),
-
         "winner_team": np.array(
             winner_team,
             dtype=np.int32,
         ),
-
         "result_code": np.array(
             int(bout["result"]),
             dtype=np.int32,
         ),
-
         "win_time": np.array(
             steps * DT,
             dtype=np.float32,
         ),
-
         "end_step": np.array(
             steps,
             dtype=np.int32,
         ),
-
         "dt": np.array(
             DT,
             dtype=np.float32,
         ),
-
         "candidate_is_red": np.array(
             bool(
                 match[
@@ -4484,110 +3927,80 @@ def save_best_bout(
                 ][best_idx]
             )
         ),
-
         "candidate_wins": np.array(
-            match[
-                "candidate_wins"
-            ],
+            match["candidate_wins"],
             dtype=np.int32,
         ),
-
         "elite_wins": np.array(
-            match[
-                "elite_wins"
-            ],
+            match["elite_wins"],
             dtype=np.int32,
         ),
-
         "best_return": np.array(
             (
-                match[
-                    "candidate_return"
-                ]
+                match["candidate_return"]
                 if match["winner"] == 1
-                else match[
-                    "elite_return"
-                ]
+                else match["elite_return"]
             )[best_idx],
             dtype=np.float32,
         ),
-
         "field_size": np.array(
             FIELD_SIZE,
             dtype=np.float32,
         ),
-
         "terrain_res": np.array(
             TERRAIN_RES,
             dtype=np.int32,
         ),
-
         "raw_obs_size": np.array(
             RAW_OBS_SIZE,
             dtype=np.int32,
         ),
-
         "global_input_size": np.array(
             GLOBAL_INPUT_SIZE,
             dtype=np.int32,
         ),
-
         "action_size": np.array(
             ACTION_SIZE,
             dtype=np.int32,
         ),
-
         "attack_cooldown": np.array(
             ATTACK_COOLDOWN,
             dtype=np.float32,
         ),
-
         "start_x": np.asarray(
             bout["x"][0]
         ),
-
         "start_z": np.asarray(
             bout["z"][0]
         ),
-
         "start_hp": np.asarray(
             bout["hp"][0]
         ),
-
         "start_alive": np.asarray(
             bout["alive"][0]
         ),
-
         "x": np.asarray(
             bout["x"][:frames]
         ),
-
         "z": np.asarray(
             bout["z"][:frames]
         ),
-
         "hp": np.asarray(
             bout["hp"][:frames]
         ),
-
         "alive": np.asarray(
             bout["alive"][:frames]
         ),
-
         "red_actions": np.asarray(
             bout["red_actions"][:steps]
         ),
-
         "blue_actions": np.asarray(
             bout["blue_actions"][:steps]
         ),
-
         "verification_pass": np.array(
-            1 if verification_pass
-            else 0,
+            1 if verification_pass else 0,
             dtype=np.int32,
         ),
-
         "max_state_error": np.array(
             max_state_error,
             dtype=np.float32,
@@ -4606,10 +4019,10 @@ def save_best_bout(
 
     return path
 
+
 # ============================================================
 # PART 6 : CHECKPOINT / PARAM I-O
 # ============================================================
-
 
 def save_params(
     path,
@@ -4645,13 +4058,9 @@ def load_params(path):
     )
 
     params = {
-        k[len("param_"):]: jnp.asarray(
-            d[k]
-        )
+        k[len("param_"):]: jnp.asarray(d[k])
         for k in d.files
-        if k.startswith(
-            "param_"
-        )
+        if k.startswith("param_")
     }
 
     meta = {}
@@ -4660,7 +4069,9 @@ def load_params(path):
         try:
             meta = json.loads(
                 str(
-                    d["metadata_json"]
+                    d[
+                        "metadata_json"
+                    ]
                 )
             )
         except Exception:
@@ -4686,10 +4097,8 @@ def save_checkpoint(
         for k, v in params.items()
     }
 
-    leaves = (
-        jax.tree_util.tree_leaves(
-            opt_state
-        )
+    leaves = jax.tree_util.tree_leaves(
+        opt_state
     )
 
     for i, leaf in enumerate(
@@ -4697,9 +4106,7 @@ def save_checkpoint(
     ):
         data[
             f"opt_{i}"
-        ] = np.asarray(
-            leaf
-        )
+        ] = np.asarray(leaf)
 
     data[
         "opt_n_leaves"
@@ -4749,84 +4156,107 @@ def save_checkpoint(
 def policy_params_compatible(
     params,
 ):
-    """
-    Current architecture:
-        local encoders
-          -> shared Wg1/bg1
-          -> Actor branch
-          -> Critic branch
-
-    The previous shared Wg2/bg2 architecture is intentionally
-    rejected as incompatible.
-    """
     required_shapes = {
-        "Ws": (
+        "Ws1": (
             SOLDIER_FEATURES,
+            LOCAL_HIDDEN_SIZE,
+        ),
+        "bs1": (
+            LOCAL_HIDDEN_SIZE,
+        ),
+        "Ws2": (
+            LOCAL_HIDDEN_SIZE,
             LOCAL_EMBED_SIZE,
         ),
-
-        "bs": (
+        "bs2": (
             LOCAL_EMBED_SIZE,
         ),
-
         "Wc": (
             COMMANDER_FEATURES,
             LOCAL_EMBED_SIZE,
         ),
-
         "bc": (
             LOCAL_EMBED_SIZE,
         ),
-
         "Wg1": (
             GLOBAL_INPUT_SIZE,
             HIDDEN1,
         ),
-
         "bg1": (
             HIDDEN1,
         ),
-
         "W_actor": (
             HIDDEN1,
-            HIDDEN2,
+            ACTOR_HIDDEN,
         ),
-
         "b_actor": (
-            HIDDEN2,
+            ACTOR_HIDDEN,
         ),
-
         "W_critic": (
             HIDDEN1,
-            HIDDEN2,
+            CRITIC_HIDDEN,
         ),
-
         "b_critic": (
-            HIDDEN2,
+            CRITIC_HIDDEN,
         ),
-
         "Wa": (
-            HIDDEN2,
+            ACTOR_HIDDEN,
             ACTION_SIZE,
         ),
-
         "ba": (
             ACTION_SIZE,
         ),
-
         "Wv": (
-            HIDDEN2,
+            CRITIC_HIDDEN,
             1,
         ),
-
         "bv": (
             1,
         ),
     }
 
-    if set(
-        params.keys()
-    ) != set(
+    for prefix in (
+        "attn1",
+        "attn2",
+    ):
+        required_shapes.update({
+            f"{prefix}_Wq": (
+                LOCAL_EMBED_SIZE,
+                LOCAL_EMBED_SIZE,
+            ),
+            f"{prefix}_bq": (
+                LOCAL_EMBED_SIZE,
+            ),
+            f"{prefix}_Wk": (
+                LOCAL_EMBED_SIZE,
+                LOCAL_EMBED_SIZE,
+            ),
+            f"{prefix}_bk": (
+                LOCAL_EMBED_SIZE,
+            ),
+            f"{prefix}_Wv": (
+                LOCAL_EMBED_SIZE,
+                LOCAL_EMBED_SIZE,
+            ),
+            f"{prefix}_bv": (
+                LOCAL_EMBED_SIZE,
+            ),
+            f"{prefix}_Wo": (
+                LOCAL_EMBED_SIZE,
+                LOCAL_EMBED_SIZE,
+            ),
+            f"{prefix}_bo": (
+                LOCAL_EMBED_SIZE,
+            ),
+            f"{prefix}_ln_gamma": (
+                LOCAL_EMBED_SIZE,
+            ),
+            f"{prefix}_ln_beta": (
+                LOCAL_EMBED_SIZE,
+            ),
+        })
+
+    if set(params.keys()) != set(
         required_shapes.keys()
     ):
         return False
@@ -4836,10 +4266,8 @@ def policy_params_compatible(
             np.asarray(
                 params[k]
             ).shape
-        )
-        == shape
-        for k, shape
-        in required_shapes.items()
+        ) == shape
+        for k, shape in required_shapes.items()
     )
 
 
@@ -4854,9 +4282,7 @@ def saved_policy_file_compatible(
             params = {
                 k[len("param_"):]: d[k]
                 for k in d.files
-                if k.startswith(
-                    "param_"
-                )
+                if k.startswith("param_")
             }
 
         return policy_params_compatible(
@@ -4874,21 +4300,16 @@ def load_checkpoint(path):
     )
 
     params = {
-        k[len("param_"):]: jnp.asarray(
-            d[k]
-        )
+        k[len("param_"):]: jnp.asarray(d[k])
         for k in d.files
-        if k.startswith(
-            "param_"
-        )
+        if k.startswith("param_")
     }
 
     if not policy_params_compatible(
         params
     ):
         raise ValueError(
-            "Incompatible checkpoint architecture: "
-            f"{path} "
+            f"Incompatible checkpoint architecture: {path} "
             f"(raw OBS={RAW_OBS_SIZE}, "
             f"global input={GLOBAL_INPUT_SIZE})"
         )
@@ -4917,8 +4338,7 @@ def load_checkpoint(path):
         template_leaves
     ):
         raise ValueError(
-            f"Incompatible optimizer state "
-            f"in checkpoint: {path}"
+            f"Incompatible optimizer state in checkpoint: {path}"
         )
 
     leaves = []
@@ -4936,8 +4356,7 @@ def load_checkpoint(path):
             template_leaf.shape
         ):
             raise ValueError(
-                f"Incompatible optimizer leaf "
-                f"{i} in checkpoint: {path}"
+                f"Incompatible optimizer leaf {i} in checkpoint: {path}"
             )
 
         leaves.append(
@@ -4960,9 +4379,7 @@ def load_checkpoint(path):
     )
 
     elite_path = (
-        str(
-            d["elite_path"]
-        )
+        str(d["elite_path"])
         if "elite_path" in d.files
         else ""
     )
@@ -4985,18 +4402,14 @@ def load_checkpoint(path):
     )
 
 
-def generation_number(
-    path,
-):
+def generation_number(path):
     try:
         return int(
             os.path.basename(
                 path
-            )
-            .split(
+            ).split(
                 "generation_"
-            )[1]
-            .split(
+            )[1].split(
                 ".npz"
             )[0]
         )
@@ -5023,10 +4436,8 @@ def find_latest_elite():
     if not compatible:
         if files:
             print(
-                f"Ignoring {len(files)} "
-                f"incompatible Elite file(s) "
-                f"(current global input="
-                f"{GLOBAL_INPUT_SIZE})."
+                f"Ignoring {len(files)} incompatible Elite file(s) "
+                f"(current global input={GLOBAL_INPUT_SIZE})."
             )
 
         return None
@@ -5062,10 +4473,8 @@ def find_latest_checkpoint():
 
     if incompatible:
         print(
-            f"Ignoring {len(incompatible)} "
-            f"incompatible checkpoint(s) "
-            f"(current global input="
-            f"{GLOBAL_INPUT_SIZE})."
+            f"Ignoring {len(incompatible)} incompatible checkpoint(s) "
+            f"(current global input={GLOBAL_INPUT_SIZE})."
         )
 
     if not compatible:
@@ -5104,14 +4513,13 @@ def prune_checkpoints(
             continue
 
         try:
-            os.remove(
-                path
-            )
+            os.remove(path)
             removed += 1
         except OSError:
             pass
 
     return removed
+
 
 # ============================================================
 # PART 7 : TRAINING LOOP
@@ -5165,7 +4573,6 @@ def train(
             ):
                 start_ppo_index = 1
                 start_generation += 1
-
                 resumed_params = None
                 resumed_opt = None
 
@@ -5183,13 +4590,11 @@ def train(
             EOFError,
         ) as exc:
             print(
-                f"Checkpoint resume skipped: "
-                f"{exc}"
+                f"Checkpoint resume skipped: {exc}"
             )
 
             resumed_params = None
             resumed_opt = None
-
             start_generation = 1
             start_ppo_index = 1
 
@@ -5198,10 +4603,8 @@ def train(
     )
 
     if latest_elite is None:
-        master_key, ik = (
-            random.split(
-                master_key
-            )
+        master_key, ik = random.split(
+            master_key
         )
 
         params0 = init_policy(
@@ -5218,10 +4621,9 @@ def train(
                 "generation": 0,
                 "source": "random_init",
                 "raw_obs_size": RAW_OBS_SIZE,
-                "global_input_size":
-                    GLOBAL_INPUT_SIZE,
+                "global_input_size": GLOBAL_INPUT_SIZE,
                 "architecture":
-                    "shared_encoder_actor_critic_split",
+                    "hierarchical_64_attention2_shared_encoder_actor_critic_split",
                 "ppo_rollout_steps":
                     PPO_ROLLOUT_STEPS,
             },
@@ -5252,40 +4654,37 @@ def train(
     )
 
     print(
-        f"Raw observation    : "
-        f"{RAW_OBS_SIZE}"
+        f"Raw observation    : {RAW_OBS_SIZE}"
     )
 
     print(
-        f"Global network in  : "
-        f"{GLOBAL_INPUT_SIZE}"
+        f"Global network in  : {GLOBAL_INPUT_SIZE}"
     )
 
     print(
-        f"Action             : "
-        f"{ACTION_SIZE}"
+        f"Action             : {ACTION_SIZE}"
     )
 
     print(
-        f"Episode max steps  : "
-        f"{MAX_STEPS} "
+        f"Environments       : {N_ENVS}"
+    )
+
+    print(
+        f"Episode max steps  : {MAX_STEPS} "
         f"({MAX_TIME:.1f} sim sec)"
     )
 
     print(
-        f"PPO rollout steps  : "
-        f"{PPO_ROLLOUT_STEPS} "
+        f"PPO rollout steps  : {PPO_ROLLOUT_STEPS} "
         f"({PPO_ROLLOUT_STEPS * DT:.1f} sim sec)"
     )
 
     print(
-        f"PPO batch          : "
-        f"{BATCH_SIZE}"
+        f"PPO batch          : {BATCH_SIZE}"
     )
 
     print(
-        f"Minibatch          : "
-        f"{MINIBATCH_SIZE}"
+        f"Minibatch          : {MINIBATCH_SIZE}"
     )
 
     print(
@@ -5294,13 +4693,13 @@ def train(
     )
 
     print(
-        f"Elite eval games   : "
-        f"{EVAL_GAMES}"
+        f"Elite eval games   : {EVAL_GAMES}"
     )
 
     print(
         f"Soldier encoder    : "
         f"{SOLDIER_FEATURES} -> "
+        f"{LOCAL_HIDDEN_SIZE} -> "
         f"{LOCAL_EMBED_SIZE}"
     )
 
@@ -5311,20 +4710,17 @@ def train(
     )
 
     print(
-        f"Shared network     : "
+        f"Self-attention     : "
+        f"{N_SOLDIERS_PER_TEAM} soldiers/team, "
+        f"{ATTENTION_HEADS} heads x 2 layers"
+    )
+
+    print(
+        f"Global network     : "
         f"{GLOBAL_INPUT_SIZE} -> "
-        f"{HIDDEN1}"
-    )
-
-    print(
-        f"Actor branch       : "
-        f"{HIDDEN1} -> {HIDDEN2} -> "
-        f"{ACTION_SIZE}"
-    )
-
-    print(
-        f"Critic branch      : "
-        f"{HIDDEN1} -> {HIDDEN2} -> 1"
+        f"{HIDDEN1} (shared) -> "
+        f"actor {ACTOR_HIDDEN} / "
+        f"critic {CRITIC_HIDDEN}"
     )
 
     print(
@@ -5334,8 +4730,7 @@ def train(
         f"soldier wall {REWARD_SOLDIER_WALL}, "
         f"kill {REWARD_SOLDIER_KILL}, "
         f"commander wall {REWARD_COMMANDER_WALL}, "
-        f"commander hit "
-        f"{REWARD_COMMANDER_HIT_BY_ENEMY}"
+        f"commander hit {REWARD_COMMANDER_HIT_BY_ENEMY}"
     )
 
     print(
@@ -5363,12 +4758,7 @@ def train(
     )
 
     print(
-        "Nearest-enemy obs  : "
-        "shared Red/Blue pairwise calculation"
-    )
-
-    print(
-        "Output directory   : "
+        f"Output directory   : "
         f"{os.path.abspath(BASE_DIR)}"
     )
 
@@ -5394,24 +4784,14 @@ def train(
             "=================================================="
         )
 
-        elite_params, _ = (
-            load_params(
-                latest_elite
-            )
+        elite_params, _ = load_params(
+            latest_elite
         )
 
         if resumed_params is not None:
-            candidate_params = (
-                resumed_params
-            )
-
-            candidate_opt = (
-                resumed_opt
-            )
-
-            first_ppo = (
-                start_ppo_index
-            )
+            candidate_params = resumed_params
+            candidate_opt = resumed_opt
+            first_ppo = start_ppo_index
 
             resumed_params = None
             resumed_opt = None
@@ -5430,11 +4810,9 @@ def train(
 
             first_ppo = 1
 
-        master_key, rk, ek = (
-            random.split(
-                master_key,
-                3,
-            )
+        master_key, rk, ek = random.split(
+            master_key,
+            3,
         )
 
         env_state = reset(
@@ -5487,9 +4865,11 @@ def train(
 
             checkpoint_path = os.path.join(
                 CHECKPOINT_DIR,
-                f"checkpoint_g"
-                f"{generation:04d}"
-                f"_p{ppo_index:03d}.npz",
+                (
+                    f"checkpoint_g"
+                    f"{generation:04d}_p"
+                    f"{ppo_index:03d}.npz"
+                ),
             )
 
             save_checkpoint(
@@ -5520,10 +4900,8 @@ def train(
                 f"Commander Kills {kills:3d} | "
                 f"entropy {metrics['entropy']:7.2f} "
                 f"({metrics['entropy_per_soldier']:.3f}/soldier) "
-                f"logstd soldier "
-                f"{metrics['soldier_logstd_mean']:.3f} "
-                f"commander "
-                f"{metrics['commander_logstd_mean']:.3f}"
+                f"logstd {metrics['logstd_mean']:.3f} "
+                f"cmd_logstd {metrics['commander_logstd_mean']:.3f}"
             )
 
         print()
@@ -5533,22 +4911,17 @@ def train(
         print(
             "------------------------------------------"
         )
-
         print(
-            f"Battles completed : "
-            f"{cum['battles']}"
+            f"Battles completed : {cum['battles']}"
         )
-
         print(
             f"Commander kills   : "
             f"{cum['red_wins'] + cum['blue_wins']}"
         )
-
         print(
             f"Timeouts          : "
             f"{cum['timeouts']}"
         )
-
         print()
 
         master_key, evk = random.split(
@@ -5560,16 +4933,13 @@ def train(
             EVAL_GAMES_PER_SIDE,
         )
 
-        eval_states = (
-            make_evaluation_states(
-                base_states
-            )
+        eval_states = make_evaluation_states(
+            base_states
         )
 
         print(
             "Elite match"
         )
-
         print(
             "------------------------------------------"
         )
@@ -5591,7 +4961,6 @@ def train(
         print(
             "Elite Match Result"
         )
-
         print(
             "------------------------------------------"
         )
@@ -5622,22 +4991,18 @@ def train(
         )
 
         if np.isfinite(
-            match[
-                "avg_candidate_time"
-            ]
+            match["avg_candidate_time"]
         ):
             print(
-                f"Candidate avg win time : "
+                "Candidate avg win time : "
                 f"{match['avg_candidate_time']:.2f} s"
             )
 
         if np.isfinite(
-            match[
-                "avg_elite_time"
-            ]
+            match["avg_elite_time"]
         ):
             print(
-                f"Elite avg win time     : "
+                "Elite avg win time     : "
                 f"{match['avg_elite_time']:.2f} s"
             )
 
@@ -5678,9 +5043,7 @@ def train(
 
             base_idx = (
                 best_idx
-                % match[
-                    "games_per_side"
-                ]
+                % match["games_per_side"]
             )
 
             init_state = tree_index(
@@ -5750,9 +5113,9 @@ def train(
                 jnp.max(
                     jnp.abs(
                         va_
-                        - bout[
-                            "alive"
-                        ][:steps + 1]
+                        - bout["alive"][
+                            :steps + 1
+                        ]
                     )
                 )
             )
@@ -5863,7 +5226,7 @@ def train(
 
             print(
                 f"Win time            : "
-                f"{steps * DT:.2f} s "
+                f"{steps * DT:.2f} s  "
                 f"({steps} steps)"
             )
 
@@ -5895,9 +5258,11 @@ def train(
             path = save_best_bout(
                 os.path.join(
                     BOUT_DIR,
-                    f"generation_"
-                    f"{generation:04d}"
-                    "_best_bout.npz",
+                    (
+                        f"generation_"
+                        f"{generation:04d}"
+                        f"_best_bout.npz"
+                    ),
                 ),
                 generation,
                 match,
@@ -5918,10 +5283,8 @@ def train(
             ):
                 print(
                     "WARNING            : "
-                    "replay result differs "
-                    "from evaluation; "
-                    "evaluation remains "
-                    "authoritative"
+                    "replay result differs from evaluation; "
+                    "evaluation remains authoritative"
                 )
 
             print(
@@ -5933,21 +5296,19 @@ def train(
             latest_elite = save_params(
                 os.path.join(
                     ELITE_DIR,
-                    f"generation_"
-                    f"{generation:04d}.npz",
+                    (
+                        f"generation_"
+                        f"{generation:04d}.npz"
+                    ),
                 ),
                 candidate_params,
                 {
                     "generation": generation,
                     "source": "candidate",
-                    "raw_obs_size": (
-                        RAW_OBS_SIZE
-                    ),
-                    "global_input_size": (
-                        GLOBAL_INPUT_SIZE
-                    ),
+                    "raw_obs_size": RAW_OBS_SIZE,
+                    "global_input_size": GLOBAL_INPUT_SIZE,
                     "architecture":
-                        "shared_encoder_actor_critic_split",
+                        "hierarchical_64_attention2_shared_encoder_actor_critic_split",
                     "ppo_rollout_steps":
                         PPO_ROLLOUT_STEPS,
                 },
@@ -5957,40 +5318,32 @@ def train(
         print(
             "Generation summary"
         )
-
         print(
             "------------------------------------------"
         )
-
         print(
             f"Elite changed : "
             f"{'YES' if elite_changed else 'NO'}"
         )
-
         print(
             f"Current Elite : "
             f"{os.path.basename(latest_elite)}"
         )
-
         print(
             f"Best Bout     : "
             f"{'SAVED' if best_bout_saved else 'NONE'}"
         )
-
         print(
             "Checkpoint    : "
             "latest PPO checkpoint retained"
         )
-
         print()
 
         global LAST_COMPLETED_GENERATION
-
-        LAST_COMPLETED_GENERATION = (
-            generation
-        )
+        LAST_COMPLETED_GENERATION = generation
 
     return latest_elite
+
 
 # ============================================================
 # PART 8 : 3D REPLAY
@@ -6079,7 +5432,7 @@ def build_replay_html(
         - FIELD_SIZE
     ) > 1e-6:
         raise ValueError(
-            f"Best Bout field size mismatch: "
+            "Best Bout field size mismatch: "
             f"saved={saved_field_size}, "
             f"current={FIELD_SIZE}"
         )
@@ -6139,8 +5492,7 @@ def build_replay_html(
 
     if n_units != N_UNITS:
         raise ValueError(
-            f"Unexpected unit count: "
-            f"{n_units}"
+            f"Unexpected unit count: {n_units}"
         )
 
     if n_frames < 2:
@@ -6151,7 +5503,8 @@ def build_replay_html(
     if (
         red_actions.shape[0]
         != end_step
-        or blue_actions.shape[0]
+        or
+        blue_actions.shape[0]
         != end_step
     ):
         raise ValueError(
@@ -6160,147 +5513,245 @@ def build_replay_html(
 
     payload = json.dumps(
         {
-            "generation":
-                generation,
-
-            "winnerLabel":
-                winner_label,
-
-            "winnerTeam":
-                winner_team,
-
+            "generation": generation,
+            "winnerLabel": winner_label,
+            "winnerTeam": winner_team,
             "winnerSide":
                 (
                     "Red"
                     if winner_team == 0
                     else "Blue"
                 ),
-
             "resultText":
                 RESULT_TEXT.get(
                     result_code,
                     "UNKNOWN",
                 ),
-
-            "winTime":
-                win_time,
-
-            "endStep":
-                end_step,
-
-            "dt":
-                dt,
-
-            "steps":
-                n_frames - 1,
-
+            "winTime": win_time,
+            "endStep": end_step,
+            "dt": dt,
+            "steps": n_frames - 1,
             "verificationPass":
                 verification_pass,
-
             "maxStateError":
                 max_state_error,
-
-            "fieldSize":
-                FIELD_SIZE,
-
-            "walls":
-                WALL_LIST,
-
+            "fieldSize": FIELD_SIZE,
+            "walls": WALL_LIST,
             "x":
                 np.round(
                     x,
                     4,
                 ).tolist(),
-
             "z":
                 np.round(
                     z,
                     4,
                 ).tolist(),
-
             "hp":
                 np.round(
                     hp,
                     3,
                 ).tolist(),
-
             "alive":
                 alive.astype(
                     np.uint8
                 ).tolist(),
-
             "redActions":
                 np.round(
                     red_actions,
                     3,
                 ).tolist(),
-
             "blueActions":
                 np.round(
                     blue_actions,
                     3,
                 ).tolist(),
-
             "attackCooldown":
                 float(
                     ATTACK_COOLDOWN
                 ),
         },
-        separators=(",", ":"),
+        separators=(
+            ",",
+            ":",
+        ),
     )
 
     html = r'''<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport"
+      content="width=device-width,initial-scale=1">
 <title>RTS Best Bout Replay</title>
+
 <style>
-html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#101010;font-family:Arial,Helvetica,sans-serif;}
-#app{position:relative;width:100vw;height:100vh;}
-#info{position:absolute;left:14px;top:14px;z-index:10;padding:12px 15px;background:rgba(0,0,0,.74);color:#fff;border-radius:8px;min-width:280px;line-height:1.5;font-size:14px;pointer-events:none;}
-#controls{position:absolute;left:14px;bottom:14px;z-index:10;padding:10px 12px;background:rgba(0,0,0,.74);border-radius:8px;color:#fff;}
-button{margin-right:5px;padding:5px 9px;border:0;border-radius:4px;cursor:pointer;}
-#timeline{width:440px;max-width:45vw;vertical-align:middle;}
-#status{margin-top:7px;font-size:12px;opacity:.85;}
-.pass{color:#5fd97a;font-weight:bold}.fail{color:#ff6a6a;font-weight:bold}.attack{color:#ffd95a;font-weight:bold}
-hr{border:0;border-top:1px solid rgba(255,255,255,.25);margin:7px 0;}
-#error{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:30;display:none;max-width:75vw;padding:18px 22px;background:rgba(40,0,0,.92);color:#fff;border:1px solid #f66;border-radius:10px;font-family:Consolas,monospace;white-space:pre-wrap;}
+html,body{
+    margin:0;
+    padding:0;
+    width:100%;
+    height:100%;
+    overflow:hidden;
+    background:#101010;
+    font-family:Arial,Helvetica,sans-serif;
+}
+
+#app{
+    position:relative;
+    width:100vw;
+    height:100vh;
+}
+
+#info{
+    position:absolute;
+    left:14px;
+    top:14px;
+    z-index:10;
+    padding:12px 15px;
+    background:rgba(0,0,0,.74);
+    color:#fff;
+    border-radius:8px;
+    min-width:280px;
+    line-height:1.5;
+    font-size:14px;
+    pointer-events:none;
+}
+
+#controls{
+    position:absolute;
+    left:14px;
+    bottom:14px;
+    z-index:10;
+    padding:10px 12px;
+    background:rgba(0,0,0,.74);
+    border-radius:8px;
+    color:#fff;
+}
+
+button{
+    margin-right:5px;
+    padding:5px 9px;
+    border:0;
+    border-radius:4px;
+    cursor:pointer;
+}
+
+#timeline{
+    width:440px;
+    max-width:45vw;
+    vertical-align:middle;
+}
+
+#status{
+    margin-top:7px;
+    font-size:12px;
+    opacity:.85;
+}
+
+.pass{
+    color:#5fd97a;
+    font-weight:bold;
+}
+
+.fail{
+    color:#ff6a6a;
+    font-weight:bold;
+}
+
+.attack{
+    color:#ffd95a;
+    font-weight:bold;
+}
+
+hr{
+    border:0;
+    border-top:1px solid rgba(255,255,255,.25);
+    margin:7px 0;
+}
+
+#error{
+    position:absolute;
+    left:50%;
+    top:50%;
+    transform:translate(-50%,-50%);
+    z-index:30;
+    display:none;
+    max-width:75vw;
+    padding:18px 22px;
+    background:rgba(40,0,0,.92);
+    color:#fff;
+    border:1px solid #f66;
+    border-radius:10px;
+    font-family:Consolas,monospace;
+    white-space:pre-wrap;
+}
 </style>
 </head>
+
 <body>
+
 <div id="app">
-<div id="info"></div>
-<div id="error"></div>
-<div id="controls">
-<button id="play">Play</button>
-<button id="pause">Pause</button>
-<button id="reset">Reset</button>
-<button data-speed="0.25">0.25x</button>
-<button data-speed="0.5">0.5x</button>
-<button data-speed="1">1x</button>
-<button data-speed="2">2x</button>
-<br><br>
-<input id="timeline" type="range" min="0" max="__MAXSTEP__" value="0" step="1">
-<div id="status"></div>
-</div>
+    <div id="info"></div>
+    <div id="error"></div>
+
+    <div id="controls">
+        <button id="play">Play</button>
+        <button id="pause">Pause</button>
+        <button id="reset">Reset</button>
+
+        <button data-speed="0.25">0.25x</button>
+        <button data-speed="0.5">0.5x</button>
+        <button data-speed="1">1x</button>
+        <button data-speed="2">2x</button>
+
+        <br><br>
+
+        <input
+            id="timeline"
+            type="range"
+            min="0"
+            max="__MAXSTEP__"
+            value="0"
+            step="1">
+
+        <div id="status"></div>
+    </div>
 </div>
 
 <script type="importmap">
-{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}
+{
+    "imports":{
+        "three":
+            "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/":
+            "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+}
 </script>
 
 <script type="module">
+
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import {
+    OrbitControls
+} from 'three/addons/controls/OrbitControls.js';
 
 const DATA=__PAYLOAD__;
 
-const app=document.getElementById('app');
-const info=document.getElementById('info');
-const errorBox=document.getElementById('error');
-const timeline=document.getElementById('timeline');
-const statusEl=document.getElementById('status');
+const app =
+    document.getElementById('app');
+
+const info =
+    document.getElementById('info');
+
+const errorBox =
+    document.getElementById('error');
+
+const timeline =
+    document.getElementById('timeline');
+
+const statusEl =
+    document.getElementById('status');
 
 let replayTime=0;
 let playing=false;
@@ -6308,793 +5759,872 @@ let speed=1;
 let lastTs=null;
 
 function showError(err){
-  errorBox.style.display='block';
-  errorBox.textContent=String(
-    err&&err.stack
-      ? err.stack
-      : err
-  );
+    errorBox.style.display='block';
+    errorBox.textContent=
+        String(
+            err&&err.stack
+                ? err.stack
+                : err
+        );
 }
 
 try{
-  const scene=new THREE.Scene();
-  scene.background=new THREE.Color(
-    0x101010
-  );
 
-  const camera=new THREE.PerspectiveCamera(
-    45,
-    innerWidth/innerHeight,
-    .1,
-    250
-  );
+const scene=new THREE.Scene();
 
-  camera.position.set(
+scene.background=
+    new THREE.Color(0x101010);
+
+const camera=
+    new THREE.PerspectiveCamera(
+        45,
+        innerWidth/innerHeight,
+        .1,
+        250
+    );
+
+camera.position.set(
     0,
     18,
     17
-  );
+);
 
-  const renderer=new THREE.WebGLRenderer({
-    antialias:true
-  });
+const renderer=
+    new THREE.WebGLRenderer({
+        antialias:true
+    });
 
-  renderer.setPixelRatio(
+renderer.setPixelRatio(
     Math.min(
-      devicePixelRatio||1,
-      2
+        devicePixelRatio||1,
+        2
     )
-  );
+);
 
-  renderer.setSize(
+renderer.setSize(
     innerWidth,
     innerHeight
-  );
+);
 
-  app.appendChild(
+app.appendChild(
     renderer.domElement
-  );
+);
 
-  const controls=new OrbitControls(
-    camera,
-    renderer.domElement
-  );
+const controls=
+    new OrbitControls(
+        camera,
+        renderer.domElement
+    );
 
-  controls.target.set(
+controls.target.set(
     0,
     0,
     0
-  );
+);
 
-  controls.enableDamping=true;
-  controls.dampingFactor=.08;
-  controls.update();
+controls.enableDamping=true;
+controls.dampingFactor=.08;
+controls.update();
 
-  scene.add(
+scene.add(
     new THREE.HemisphereLight(
-      0xffffff,
-      0x444444,
-      2.0
+        0xffffff,
+        0x444444,
+        2.0
     )
-  );
+);
 
-  const dir=new THREE.DirectionalLight(
-    0xffffff,
-    1.3
-  );
+const dir=
+    new THREE.DirectionalLight(
+        0xffffff,
+        1.3
+    );
 
-  dir.position.set(
+dir.position.set(
     6,
     14,
     8
-  );
+);
 
-  scene.add(dir);
+scene.add(dir);
 
-  const fieldSize=DATA.fieldSize;
-  const half=fieldSize/2;
+const fieldSize=
+    DATA.fieldSize;
 
-  const ground=new THREE.Mesh(
-    new THREE.PlaneGeometry(
-      fieldSize,
-      fieldSize
-    ),
-    new THREE.MeshStandardMaterial({
-      color:0x303030
-    })
-  );
+const half=
+    fieldSize/2;
 
-  ground.rotation.x=-Math.PI/2;
-  ground.position.y=-.02;
-  scene.add(ground);
+const ground=
+    new THREE.Mesh(
+        new THREE.PlaneGeometry(
+            fieldSize,
+            fieldSize
+        ),
+        new THREE.MeshStandardMaterial({
+            color:0x303030
+        })
+    );
 
-  const grid=new THREE.GridHelper(
-    fieldSize,
-    fieldSize,
-    0x777777,
-    0x444444
-  );
+ground.rotation.x=-Math.PI/2;
+ground.position.y=-.02;
 
-  grid.position.y=.01;
-  scene.add(grid);
+scene.add(ground);
 
-  const redStart=new THREE.Mesh(
-    new THREE.PlaneGeometry(
-      2,
-      fieldSize
-    ),
-    new THREE.MeshBasicMaterial({
-      color:0xd94b4b,
-      transparent:true,
-      opacity:.16,
-      side:THREE.DoubleSide
-    })
-  );
+const grid=
+    new THREE.GridHelper(
+        fieldSize,
+        fieldSize,
+        0x777777,
+        0x444444
+    );
 
-  redStart.rotation.x=-Math.PI/2;
+grid.position.y=.01;
 
-  redStart.position.set(
+scene.add(grid);
+
+const redStart=
+    new THREE.Mesh(
+        new THREE.PlaneGeometry(
+            2,
+            fieldSize
+        ),
+        new THREE.MeshBasicMaterial({
+            color:0xd94b4b,
+            transparent:true,
+            opacity:.16,
+            side:THREE.DoubleSide
+        })
+    );
+
+redStart.rotation.x=-Math.PI/2;
+
+redStart.position.set(
     -half+1,
     .015,
     0
-  );
+);
 
-  scene.add(redStart);
+scene.add(
+    redStart
+);
 
-  const blueStart=new THREE.Mesh(
-    new THREE.PlaneGeometry(
-      2,
-      fieldSize
-    ),
-    new THREE.MeshBasicMaterial({
-      color:0x4b7bd9,
-      transparent:true,
-      opacity:.16,
-      side:THREE.DoubleSide
-    })
-  );
+const blueStart=
+    new THREE.Mesh(
+        new THREE.PlaneGeometry(
+            2,
+            fieldSize
+        ),
+        new THREE.MeshBasicMaterial({
+            color:0x4b7bd9,
+            transparent:true,
+            opacity:.16,
+            side:THREE.DoubleSide
+        })
+    );
 
-  blueStart.rotation.x=-Math.PI/2;
+blueStart.rotation.x=-Math.PI/2;
 
-  blueStart.position.set(
+blueStart.position.set(
     half-1,
     .016,
     0
-  );
+);
 
-  scene.add(blueStart);
+scene.add(
+    blueStart
+);
 
-  const wallGeo=new THREE.BoxGeometry(
-    1,
-    .7,
-    1
-  );
-
-  const wallMat=new THREE.MeshStandardMaterial({
-    color:0x777777
-  });
-
-  for(const p of DATA.walls){
-    const w=new THREE.Mesh(
-      wallGeo,
-      wallMat
+const wallGeo=
+    new THREE.BoxGeometry(
+        1,
+        .7,
+        1
     );
 
+const wallMat=
+    new THREE.MeshStandardMaterial({
+        color:0x777777
+    });
+
+for(
+    const p
+    of DATA.walls
+){
+    const w=
+        new THREE.Mesh(
+            wallGeo,
+            wallMat
+        );
+
     w.position.set(
-      p[0],
-      .35,
-      p[1]
+        p[0],
+        .35,
+        p[1]
     );
 
     scene.add(w);
-  }
+}
 
-  const soldierBodyGeo=new THREE.BoxGeometry(
-    .22,
-    .36,
-    .22
-  );
-
-  const soldierHeadGeo=new THREE.SphereGeometry(
-    .105,
-    12,
-    12
-  );
-
-  const redBodyMat=new THREE.MeshStandardMaterial({
-    color:0xd94b4b
-  });
-
-  const blueBodyMat=new THREE.MeshStandardMaterial({
-    color:0x4b7bd9
-  });
-
-  const redFaceMat=new THREE.MeshStandardMaterial({
-    color:0xd94b4b,
-    emissive:0x000000
-  });
-
-  const blueFaceMat=new THREE.MeshStandardMaterial({
-    color:0x4b7bd9,
-    emissive:0x000000
-  });
-
-  const attackFaceMat=new THREE.MeshStandardMaterial({
-    color:0xffe13b,
-    emissive:0x4a3a00,
-    emissiveIntensity:.35
-  });
-
-  const redEyeMat=new THREE.LineBasicMaterial({
-    color:0xd94b4b
-  });
-
-  const blueEyeMat=new THREE.LineBasicMaterial({
-    color:0x4b7bd9
-  });
-
-  const attackEyeMat=new THREE.LineBasicMaterial({
-    color:0xffe13b
-  });
-
-  const redSoldiers=[];
-  const blueSoldiers=[];
-
-  function makeSoldier(team){
-    const g=new THREE.Group();
-
-    const body=new THREE.Mesh(
-      soldierBodyGeo,
-      team===0
-        ? redBodyMat
-        : blueBodyMat
+const soldierBodyGeo=
+    new THREE.BoxGeometry(
+        .22,
+        .36,
+        .22
     );
+
+const soldierHeadGeo=
+    new THREE.SphereGeometry(
+        .105,
+        12,
+        12
+    );
+
+const redBodyMat=
+    new THREE.MeshStandardMaterial({
+        color:0xd94b4b
+    });
+
+const blueBodyMat=
+    new THREE.MeshStandardMaterial({
+        color:0x4b7bd9
+    });
+
+const redFaceMat=
+    new THREE.MeshStandardMaterial({
+        color:0xd94b4b,
+        emissive:0x000000
+    });
+
+const blueFaceMat=
+    new THREE.MeshStandardMaterial({
+        color:0x4b7bd9,
+        emissive:0x000000
+    });
+
+const attackFaceMat=
+    new THREE.MeshStandardMaterial({
+        color:0xffe13b,
+        emissive:0x4a3a00,
+        emissiveIntensity:.35
+    });
+
+const redEyeMat=
+    new THREE.LineBasicMaterial({
+        color:0xd94b4b
+    });
+
+const blueEyeMat=
+    new THREE.LineBasicMaterial({
+        color:0x4b7bd9
+    });
+
+const attackEyeMat=
+    new THREE.LineBasicMaterial({
+        color:0xffe13b
+    });
+
+const redSoldiers=[];
+const blueSoldiers=[];
+
+function makeSoldier(team){
+
+    const g=
+        new THREE.Group();
+
+    const body=
+        new THREE.Mesh(
+            soldierBodyGeo,
+            team===0
+                ? redBodyMat
+                : blueBodyMat
+        );
 
     body.position.y=.18;
 
-    const face=new THREE.Mesh(
-      soldierHeadGeo,
-      team===0
-        ? redFaceMat
-        : blueFaceMat
-    );
+    const face=
+        new THREE.Mesh(
+            soldierHeadGeo,
+            team===0
+                ? redFaceMat
+                : blueFaceMat
+        );
 
     face.position.set(
-      0,
-      .43,
-      0
+        0,
+        .43,
+        0
     );
 
     const lineGeo=
-      new THREE.BufferGeometry()
-        .setFromPoints([
-          new THREE.Vector3(
-            0,
-            .43,
-            .06
-          ),
-          new THREE.Vector3(
-            0,
-            .43,
-            .34
-          )
-        ]);
+        new THREE.BufferGeometry()
+            .setFromPoints([
+                new THREE.Vector3(
+                    0,
+                    .43,
+                    .06
+                ),
+                new THREE.Vector3(
+                    0,
+                    .43,
+                    .34
+                )
+            ]);
 
-    const eyeLine=new THREE.Line(
-      lineGeo,
-      team===0
-        ? redEyeMat
-        : blueEyeMat
-    );
+    const eyeLine=
+        new THREE.Line(
+            lineGeo,
+            team===0
+                ? redEyeMat
+                : blueEyeMat
+        );
 
     g.add(
-      body,
-      face,
-      eyeLine
+        body,
+        face,
+        eyeLine
     );
 
     scene.add(g);
 
-    return {
-      team,
-      group:g,
-      body,
-      face,
-      eyeLine,
-      baseFace:
-        team===0
-          ? redFaceMat
-          : blueFaceMat,
-      baseEye:
-        team===0
-          ? redEyeMat
-          : blueEyeMat
+    return{
+        team,
+        group:g,
+        body,
+        face,
+        eyeLine,
+        baseFace:
+            team===0
+                ? redFaceMat
+                : blueFaceMat,
+        baseEye:
+            team===0
+                ? redEyeMat
+                : blueEyeMat
     };
-  }
+}
 
-  for(let i=0;i<100;i++){
+for(
+    let i=0;
+    i<100;
+    i++
+){
     redSoldiers.push(
-      makeSoldier(0)
+        makeSoldier(0)
     );
-  }
+}
 
-  for(let i=0;i<100;i++){
+for(
+    let i=0;
+    i<100;
+    i++
+){
     blueSoldiers.push(
-      makeSoldier(1)
+        makeSoldier(1)
     );
-  }
+}
 
-  const cmdGeo=new THREE.BoxGeometry(
-    .44,
-    .8,
-    .44
-  );
+const cmdGeo=
+    new THREE.BoxGeometry(
+        .44,
+        .8,
+        .44
+    );
 
-  const redCommander=new THREE.Mesh(
-    cmdGeo,
-    redBodyMat
-  );
+const redCommander=
+    new THREE.Mesh(
+        cmdGeo,
+        redBodyMat
+    );
 
-  const blueCommander=new THREE.Mesh(
-    cmdGeo,
-    blueBodyMat
-  );
+const blueCommander=
+    new THREE.Mesh(
+        cmdGeo,
+        blueBodyMat
+    );
 
-  scene.add(
+scene.add(
     redCommander,
     blueCommander
-  );
+);
 
-  const crownGeo=new THREE.ConeGeometry(
-    .22,
-    .22,
-    5
-  );
+const crownGeo=
+    new THREE.ConeGeometry(
+        .22,
+        .22,
+        5
+    );
 
-  const crownMat=new THREE.MeshStandardMaterial({
-    color:0xffd83d
-  });
+const crownMat=
+    new THREE.MeshStandardMaterial({
+        color:0xffd83d
+    });
 
-  const redCrown=new THREE.Mesh(
-    crownGeo,
-    crownMat
-  );
+const redCrown=
+    new THREE.Mesh(
+        crownGeo,
+        crownMat
+    );
 
-  const blueCrown=new THREE.Mesh(
-    crownGeo,
-    crownMat
-  );
+const blueCrown=
+    new THREE.Mesh(
+        crownGeo,
+        crownMat
+    );
 
-  redCommander.add(
+redCommander.add(
     redCrown
-  );
+);
 
-  blueCommander.add(
+blueCommander.add(
     blueCrown
-  );
+);
 
-  redCrown.position.set(
+redCrown.position.set(
     0,
     .51,
     0
-  );
+);
 
-  blueCrown.position.set(
+blueCrown.position.set(
     0,
     .51,
     0
-  );
+);
 
-  function setSoldierVisual(
+function setSoldierVisual(
     s,
     attackNow
-  ){
+){
     s.face.material=
-      attackNow
-        ? attackFaceMat
-        : s.baseFace;
+        attackNow
+            ? attackFaceMat
+            : s.baseFace;
 
     s.eyeLine.material=
-      attackNow
-        ? attackEyeMat
-        : s.baseEye;
-  }
+        attackNow
+            ? attackEyeMat
+            : s.baseEye;
+}
 
-  function frameInfo(){
-    const t=Math.max(
-      0,
-      Math.min(
-        DATA.steps*DATA.dt,
-        replayTime
-      )
-    );
+function frameInfo(){
 
-    const raw=t/DATA.dt;
+    const t=
+        Math.max(
+            0,
+            Math.min(
+                DATA.steps * DATA.dt,
+                replayTime
+            )
+        );
 
-    const i=Math.min(
-      Math.floor(raw),
-      DATA.steps
-    );
+    const raw=
+        t / DATA.dt;
+
+    const i=
+        Math.min(
+            Math.floor(raw),
+            DATA.steps
+        );
 
     const a=
-      i>=DATA.steps
-        ? 0
-        : raw-i;
+        i>=DATA.steps
+            ? 0
+            : raw-i;
 
-    return {
-      t,
-      i,
-      a
+    return{
+        t,
+        i,
+        a
     };
-  }
+}
 
-  function updateReplay(){
-    const f=frameInfo();
+function updateReplay(){
+
+    const f=
+        frameInfo();
 
     const i=f.i;
     const a=f.a;
 
-    timeline.value=String(i);
+    timeline.value=
+        String(i);
 
-    const X0=DATA.x[i];
-    const Z0=DATA.z[i];
-    const A=DATA.alive[i];
+    const X0=
+        DATA.x[i];
+
+    const Z0=
+        DATA.z[i];
+
+    const A=
+        DATA.alive[i];
 
     const X1=
-      i<DATA.steps
-        ? DATA.x[i+1]
-        : X0;
+        i<DATA.steps
+            ? DATA.x[i+1]
+            : X0;
 
     const Z1=
-      i<DATA.steps
-        ? DATA.z[i+1]
-        : Z0;
+        i<DATA.steps
+            ? DATA.z[i+1]
+            : Z0;
 
     const px=
-      k=>
-        X0[k]
-        +(
-          X1[k]-X0[k]
-        )*a;
+        k =>
+            X0[k]
+            + (
+                X1[k]-X0[k]
+            )*a;
 
     const pz=
-      k=>
-        Z0[k]
-        +(
-          Z1[k]-Z0[k]
-        )*a;
+        k =>
+            Z0[k]
+            + (
+                Z1[k]-Z0[k]
+            )*a;
 
     const redActions=
-      DATA.redActions[i]
-      ||null;
+        DATA.redActions[i]
+        || null;
 
     const blueActions=
-      DATA.blueActions[i]
-      ||null;
+        DATA.blueActions[i]
+        || null;
 
     let redAttackCount=0;
     let blueAttackCount=0;
 
-    for(let k=0;k<100;k++){
-      const ridx=2+k;
-      const bidx=102+k;
+    for(
+        let k=0;
+        k<100;
+        k++
+    ){
+        const ridx=2+k;
+        const bidx=102+k;
 
-      const rAttack=
-        !!redActions
-        && redActions[3*k+2]>.5
-        && A[ridx]>0;
+        const rAttack=
+            !!redActions
+            && redActions[
+                3*k+2
+            ]>.5
+            && A[ridx]>0;
 
-      const bAttack=
-        !!blueActions
-        && blueActions[3*k+2]>.5
-        && A[bidx]>0;
+        const bAttack=
+            !!blueActions
+            && blueActions[
+                3*k+2
+            ]>.5
+            && A[bidx]>0;
 
-      const rdx=
-        !!redActions
-          ? redActions[3*k]
-          : 0;
+        const rdx=
+            !!redActions
+                ? redActions[
+                    3*k
+                ]
+                : 0;
 
-      const rdz=
-        !!redActions
-          ? redActions[3*k+1]
-          : 0;
+        const rdz=
+            !!redActions
+                ? redActions[
+                    3*k+1
+                ]
+                : 0;
 
-      const bdx=
-        !!blueActions
-          ? blueActions[3*k]
-          : 0;
+        const bdx=
+            !!blueActions
+                ? blueActions[
+                    3*k
+                ]
+                : 0;
 
-      const bdz=
-        !!blueActions
-          ? blueActions[3*k+1]
-          : 0;
+        const bdz=
+            !!blueActions
+                ? blueActions[
+                    3*k+1
+                ]
+                : 0;
 
-      redSoldiers[k].group.position.set(
-        px(ridx),
-        0,
-        pz(ridx)
-      );
+        redSoldiers[k]
+            .group
+            .position
+            .set(
+                px(ridx),
+                0,
+                pz(ridx)
+            );
 
-      redSoldiers[k].group.rotation.y=
-        (
-          Math.abs(rdx)
-          +Math.abs(rdz)
-          >1e-6
-        )
-        ? Math.atan2(
-            rdx,
-            rdz
-          )
-        : redSoldiers[k]
-          .group.rotation.y;
+        redSoldiers[k]
+            .group
+            .rotation
+            .y=
+                (
+                    Math.abs(rdx)
+                    + Math.abs(rdz)
+                    >1e-6
+                )
+                    ? Math.atan2(
+                        rdx,
+                        rdz
+                    )
+                    : redSoldiers[k]
+                        .group
+                        .rotation
+                        .y;
 
-      redSoldiers[k].group.visible=
-        A[ridx]>0;
+        redSoldiers[k]
+            .group
+            .visible=
+                A[ridx]>0;
 
-      setSoldierVisual(
-        redSoldiers[k],
-        rAttack
-      );
+        setSoldierVisual(
+            redSoldiers[k],
+            rAttack
+        );
 
-      if(rAttack)
-        redAttackCount++;
+        if(rAttack){
+            redAttackCount++;
+        }
 
-      blueSoldiers[k].group.position.set(
-        px(bidx),
-        0,
-        pz(bidx)
-      );
+        blueSoldiers[k]
+            .group
+            .position
+            .set(
+                px(bidx),
+                0,
+                pz(bidx)
+            );
 
-      blueSoldiers[k].group.rotation.y=
-        (
-          Math.abs(bdx)
-          +Math.abs(bdz)
-          >1e-6
-        )
-        ? Math.atan2(
-            bdx,
-            bdz
-          )
-        : blueSoldiers[k]
-          .group.rotation.y;
+        blueSoldiers[k]
+            .group
+            .rotation
+            .y=
+                (
+                    Math.abs(bdx)
+                    + Math.abs(bdz)
+                    >1e-6
+                )
+                    ? Math.atan2(
+                        bdx,
+                        bdz
+                    )
+                    : blueSoldiers[k]
+                        .group
+                        .rotation
+                        .y;
 
-      blueSoldiers[k].group.visible=
-        A[bidx]>0;
+        blueSoldiers[k]
+            .group
+            .visible=
+                A[bidx]>0;
 
-      setSoldierVisual(
-        blueSoldiers[k],
-        bAttack
-      );
+        setSoldierVisual(
+            blueSoldiers[k],
+            bAttack
+        );
 
-      if(bAttack)
-        blueAttackCount++;
+        if(bAttack){
+            blueAttackCount++;
+        }
     }
 
     redCommander.position.set(
-      px(0),
-      0,
-      pz(0)
+        px(0),
+        0,
+        pz(0)
     );
 
     redCommander.visible=
-      A[0]>0;
+        A[0]>0;
 
     redCrown.visible=
-      A[0]>0;
+        A[0]>0;
 
     blueCommander.position.set(
-      px(1),
-      0,
-      pz(1)
+        px(1),
+        0,
+        pz(1)
     );
 
     blueCommander.visible=
-      A[1]>0;
+        A[1]>0;
 
     blueCrown.visible=
-      A[1]>0;
+        A[1]>0;
 
-    const ra=Array.from(
-      A.slice(
-        2,
-        102
-      )
-    ).reduce(
-      (sum,v)=>sum+v,
-      0
-    );
+    const ra=
+        Array.from(
+            A.slice(2,102)
+        ).reduce(
+            (sum,v)=>sum+v,
+            0
+        );
 
-    const ba=Array.from(
-      A.slice(
-        102,
-        202
-      )
-    ).reduce(
-      (sum,v)=>sum+v,
-      0
-    );
+    const ba=
+        Array.from(
+            A.slice(102,202)
+        ).reduce(
+            (sum,v)=>sum+v,
+            0
+        );
 
     const verify=
-      DATA.verificationPass
-        ? '<span class="pass">'
-          +'Replay verification: PASS'
-          +'</span>'
-        : '<span class="fail">'
-          +'Replay verification: FAIL'
-          +'</span>'
-          +'<br>Max state error: '
-          +DATA.maxStateError
-            .toExponential(2);
+        DATA.verificationPass
+            ? '<span class="pass">Replay verification: PASS</span>'
+            : '<span class="fail">Replay verification: FAIL</span><br>Max state error: '
+              + DATA.maxStateError.toExponential(2);
 
     info.innerHTML=
-      '<b>Generation '
-      +DATA.generation
-      +'</b><br>'
-      +'Winner: <b>'
-      +DATA.winnerLabel
-      +'</b> ('
-      +DATA.winnerSide
-      +')<br>'
-      +'Battle time: '
-      +DATA.winTime.toFixed(1)
-      +' s<br>'
-      +'Replay time: '
-      +f.t.toFixed(2)
-      +' s<br>'
-      +'Step: '
-      +i
-      +' / '
-      +DATA.steps
-      +'<hr>'
-      +'Red soldiers: '
-      +ra
-      +'<br>'
-      +'Blue soldiers: '
-      +ba
-      +'<br>'
-      +'Red Commander HP: '
-      +DATA.hp[i][0]
-        .toFixed(2)
-      +'<br>'
-      +'Blue Commander HP: '
-      +DATA.hp[i][1]
-        .toFixed(2)
-      +'<hr>'
-      +'<span class="attack">'
-      +'Red attacks: '
-      +redAttackCount
-      +'</span><br>'
-      +'<span class="attack">'
-      +'Blue attacks: '
-      +blueAttackCount
-      +'</span>'
-      +'<hr>'
-      +'Result: <b>'
-      +DATA.resultText
-      +'</b><br>'
-      +verify;
+        '<b>Generation '
+        + DATA.generation
+        + '</b><br>Winner: <b>'
+        + DATA.winnerLabel
+        + '</b> ('
+        + DATA.winnerSide
+        + ')<br>Battle time: '
+        + DATA.winTime.toFixed(1)
+        + ' s<br>Replay time: '
+        + f.t.toFixed(2)
+        + ' s<br>Step: '
+        + i
+        + ' / '
+        + DATA.steps
+        + '<hr>Red soldiers: '
+        + ra
+        + '<br>Blue soldiers: '
+        + ba
+        + '<br>Red Commander HP: '
+        + DATA.hp[i][0].toFixed(2)
+        + '<br>Blue Commander HP: '
+        + DATA.hp[i][1].toFixed(2)
+        + '<hr><span class="attack">Red attacks: '
+        + redAttackCount
+        + '</span><br><span class="attack">Blue attacks: '
+        + blueAttackCount
+        + '</span><hr>Result: <b>'
+        + DATA.resultText
+        + '</b><br>'
+        + verify;
 
     statusEl.textContent=
-      'Generation '
-      +DATA.generation
-      +' | Best Bout | '
-      +f.t.toFixed(2)
-      +' s';
-  }
+        'Generation '
+        + DATA.generation
+        + ' | Best Bout | '
+        + f.t.toFixed(2)
+        + ' s';
+}
 
-  document.getElementById(
+document.getElementById(
     'play'
-  ).onclick=()=>{
-    playing=true;
-  };
+).onclick=
+    () => playing=true;
 
-  document.getElementById(
+document.getElementById(
     'pause'
-  ).onclick=()=>{
-    playing=false;
-  };
+).onclick=
+    () => playing=false;
 
-  document.getElementById(
+document.getElementById(
     'reset'
-  ).onclick=()=>{
-    playing=false;
-    replayTime=0;
-    updateReplay();
-  };
+).onclick=
+    () => {
+        playing=false;
+        replayTime=0;
+        updateReplay();
+    };
 
-  document.querySelectorAll(
+document.querySelectorAll(
     'button[data-speed]'
-  ).forEach(
-    b=>{
-      b.onclick=()=>{
-        speed=parseFloat(
-          b.dataset.speed
-        );
-      };
-    }
-  );
+).forEach(
+    b =>
+        b.onclick=
+            () =>
+                speed=parseFloat(
+                    b.dataset.speed
+                )
+);
 
-  timeline.oninput=()=>{
-    playing=false;
+timeline.oninput=
+    () => {
+        playing=false;
+        replayTime=
+            parseInt(
+                timeline.value,
+                10
+            ) * DATA.dt;
+        updateReplay();
+    };
 
-    replayTime=
-      parseInt(
-        timeline.value,
-        10
-      ) * DATA.dt;
-
-    updateReplay();
-  };
-
-  addEventListener(
+addEventListener(
     'resize',
-    ()=>{
-      camera.aspect=
-        innerWidth/
-        innerHeight;
+    () => {
+        camera.aspect=
+            innerWidth/
+            innerHeight;
 
-      camera.updateProjectionMatrix();
+        camera.updateProjectionMatrix();
 
-      renderer.setSize(
-        innerWidth,
-        innerHeight
-      );
+        renderer.setSize(
+            innerWidth,
+            innerHeight
+        );
     }
-  );
+);
 
-  function animate(ts){
+function animate(ts){
+
     requestAnimationFrame(
-      animate
+        animate
     );
 
     if(lastTs===null)
-      lastTs=ts;
+        lastTs=ts;
 
-    const delta=Math.min(
-      .05,
-      (
-        ts-lastTs
-      )/1000
-    );
+    const delta=
+        Math.min(
+            .05,
+            (ts-lastTs)/1000
+        );
 
     lastTs=ts;
 
     if(playing){
-      replayTime += (
-        delta * speed
-      );
+        replayTime+=
+            delta*speed;
 
-      if(
-        replayTime
-        >=
-        DATA.steps*DATA.dt
-      ){
-        replayTime=
-          DATA.steps*DATA.dt;
+        if(
+            replayTime
+            >=
+            DATA.steps
+            * DATA.dt
+        ){
+            replayTime=
+                DATA.steps
+                * DATA.dt;
 
-        playing=false;
-      }
+            playing=false;
+        }
     }
 
     updateReplay();
+
     controls.update();
 
     renderer.render(
-      scene,
-      camera
+        scene,
+        camera
     );
-  }
+}
 
-  updateReplay();
-
-  requestAnimationFrame(
+updateReplay();
+requestAnimationFrame(
     animate
-  );
+);
 
 }catch(err){
-  showError(err);
+    showError(err);
 }
+
 </script>
+
 </body>
 </html>'''
 
@@ -7115,8 +6645,10 @@ try{
     if out_path is None:
         out_path = os.path.join(
             REPLAY_DIR,
-            f"replay_generation_"
-            f"{generation:04d}.html",
+            (
+                f"replay_generation_"
+                f"{generation:04d}.html"
+            ),
         )
 
     with open(
@@ -7175,9 +6707,7 @@ def _replay_file_compatible(
                 and saved_raw
                 == RAW_OBS_SIZE
                 and int(
-                    d[
-                        "global_input_size"
-                    ]
+                    d["global_input_size"]
                 )
                 == GLOBAL_INPUT_SIZE
             )
@@ -7193,8 +6723,7 @@ def show_replay(
         glob.glob(
             os.path.join(
                 BOUT_DIR,
-                "generation_*"
-                "_best_bout.npz",
+                "generation_*_best_bout.npz",
             )
         ),
         key=generation_number,
@@ -7210,8 +6739,8 @@ def show_replay(
 
     if not compatible:
         raise FileNotFoundError(
-            "No compatible Best Bout found "
-            f"in {os.path.abspath(BOUT_DIR)}"
+            "No compatible Best Bout found in "
+            f"{os.path.abspath(BOUT_DIR)}"
         )
 
     if generation is None:
@@ -7220,8 +6749,11 @@ def show_replay(
     else:
         bout_path = os.path.join(
             BOUT_DIR,
-            f"generation_{generation:04d}"
-            "_best_bout.npz",
+            (
+                f"generation_"
+                f"{generation:04d}"
+                f"_best_bout.npz"
+            ),
         )
 
         if not os.path.exists(
@@ -7240,10 +6772,8 @@ def show_replay(
                 "with the current environment/network."
             )
 
-    out_path, html = (
-        build_replay_html(
-            bout_path
-        )
+    out_path, html = build_replay_html(
+        bout_path
     )
 
     try:
@@ -7266,15 +6796,14 @@ def show_replay(
 
         except Exception:
             display(
-                HTML(
-                    html
-                )
+                HTML(html)
             )
 
     except ImportError:
         pass
 
     return out_path
+
 
 # ============================================================
 # ENTRY POINT
@@ -7303,9 +6832,7 @@ if __name__ == "__main__":
 
         print(
             "Replay written to:",
-            os.path.abspath(
-                path
-            ),
+            os.path.abspath(path),
         )
 
     except FileNotFoundError as e:
