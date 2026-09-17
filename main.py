@@ -484,8 +484,10 @@ def step_one(state, red_action, blue_action):
     new_enemy_x = nx[enemy_cmd_idx]
     new_enemy_z = nz[enemy_cmd_idx]
 
-    old_cmd_dx = old_enemy_x - ax
-    old_cmd_dz = old_enemy_z - az
+    old_ax = x[ALL_SOLDIER_INDICES]
+    old_az = z[ALL_SOLDIER_INDICES]
+    old_cmd_dx = old_enemy_x - old_ax
+    old_cmd_dz = old_enemy_z - old_az
     new_cmd_dx = new_enemy_x - ax
     new_cmd_dz = new_enemy_z - az
     old_cmd_dist = jnp.sqrt(old_cmd_dx * old_cmd_dx + old_cmd_dz * old_cmd_dz + 1e-8)
@@ -1890,7 +1892,16 @@ def evaluate_match(params_red, params_blue, init_states):
         red_a = deterministic_world_action_batch(params_red, st, 0.0)
         blue_a = deterministic_world_action_batch(params_blue, st, 1.0)
 
-        nxt, rr, br, done = jax.vmap(step_one, in_axes=(0, 0, 0))(
+        (
+            nxt,
+            rr,
+            br,
+            _red_soldier_reward,
+            _blue_soldier_reward,
+            _red_commander_reward,
+            _blue_commander_reward,
+            done,
+        ) = jax.vmap(step_one, in_axes=(0, 0, 0))(
             st, red_a, blue_a
         )
 
@@ -2077,10 +2088,19 @@ def record_bout(params_red, params_blue, initial_state):
         red_a = deterministic_world_action_batch(params_red, st, 0.0)
         blue_a = deterministic_world_action_batch(params_blue, st, 1.0)
 
-        nxt, rr, br, done = jax.vmap(step_one, in_axes=(0, 0, 0))(
+        (
+            nxt,
+            rr,
+            br,
+            _red_soldier_reward,
+            _blue_soldier_reward,
+            _red_commander_reward,
+            _blue_commander_reward,
+            done,
+        ) = jax.vmap(step_one, in_axes=(0, 0, 0))(
             st, red_a, blue_a
         )
-        del rr, br
+        del rr, br, _red_soldier_reward, _blue_soldier_reward, _red_commander_reward, _blue_commander_reward
 
         active = ~finished
         newly = done & active
@@ -2189,18 +2209,43 @@ def verify_bout(initial_state, red_actions, blue_actions):
     return xs, zs, hps, alives
 
 
-def select_best_bout_index(match):
-    winner = match["winner"]
-    won = match["candidate_won"] if winner == 1 else match["elite_won"]
-    returns = match["candidate_return"] if winner == 1 else match["elite_return"]
-    surv = match["candidate_surv"] if winner == 1 else match["elite_surv"]
+def select_best_bout_index(match, key=None):
+    """Choose a representative bout; fall back to a random game if no decisive win exists."""
+    winner = int(match["winner"])
+    if winner == 1:
+        won = np.asarray(match["candidate_won"], dtype=bool)
+        returns = np.asarray(match["candidate_return"], dtype=np.float32)
+        surv = np.asarray(match["candidate_surv"], dtype=np.float32)
+    elif winner == 2:
+        won = np.asarray(match["elite_won"], dtype=bool)
+        returns = np.asarray(match["elite_return"], dtype=np.float32)
+        surv = np.asarray(match["elite_surv"], dtype=np.float32)
+    else:
+        won = np.zeros_like(np.asarray(match["result"], dtype=np.int32), dtype=bool)
+        returns = np.maximum(
+            np.asarray(match["candidate_return"], dtype=np.float32),
+            np.asarray(match["elite_return"], dtype=np.float32),
+        )
+        surv = np.maximum(
+            np.asarray(match["candidate_surv"], dtype=np.float32),
+            np.asarray(match["elite_surv"], dtype=np.float32),
+        )
 
     idx = np.where(won)[0]
-    if len(idx) == 0:
-        return None
+    if len(idx) > 0:
+        order = np.lexsort((-surv[idx], match["end_step"][idx], -returns[idx]))
+        return int(idx[order[0]]), False
 
-    order = np.lexsort((-surv[idx], match["end_step"][idx], -returns[idx]))
-    return int(idx[order[0]])
+    n_games = len(match["result"])
+    if n_games <= 0:
+        return None, True
+
+    if key is None:
+        rng = np.random.default_rng()
+        idx = int(rng.integers(0, n_games))
+    else:
+        idx = int(jax.random.randint(key, (), 0, n_games))
+    return idx, True
 
 
 def save_best_bout(
@@ -2220,9 +2265,10 @@ def save_best_bout(
 
     data = {
         "generation": np.array(generation, dtype=np.int32),
-        "winner_code": np.array(match["winner"], dtype=np.int32),
+        "winner_code": np.array(int(bout["result"]), dtype=np.int32),
         "winner_label": np.array(winner_label),
         "winner_team": np.array(winner_team, dtype=np.int32),
+        "overall_match_winner_code": np.array(match["winner"], dtype=np.int32),
         "result_code": np.array(int(bout["result"]), dtype=np.int32),
         "win_time": np.array(steps * DT, dtype=np.float32),
         "end_step": np.array(steps, dtype=np.int32),
@@ -2287,6 +2333,8 @@ def save_checkpoint(
     ppo_index,
     elite_path,
     master_key,
+    entropy_schedule_start_generation=None,
+    entropy_schedule_total_updates=None,
 ):
     data = {f"param_{k}": np.asarray(v) for k, v in params.items()}
 
@@ -2299,6 +2347,14 @@ def save_checkpoint(
     data["ppo_index"] = np.array(ppo_index, dtype=np.int32)
     data["elite_path"] = np.array(elite_path if elite_path else "")
     data["master_key"] = np.asarray(random.key_data(master_key))
+    if entropy_schedule_start_generation is not None:
+        data["entropy_schedule_start_generation"] = np.array(
+            entropy_schedule_start_generation, dtype=np.int32
+        )
+    if entropy_schedule_total_updates is not None:
+        data["entropy_schedule_total_updates"] = np.array(
+            entropy_schedule_total_updates, dtype=np.int32
+        )
 
     np.savez(path, **data)
     return path
@@ -2487,8 +2543,21 @@ def load_checkpoint(path):
     ppo_index = int(d["ppo_index"])
     elite_path = str(d["elite_path"]) if "elite_path" in d.files else ""
     master_key = random.wrap_key_data(jnp.asarray(d["master_key"]))
+    schedule_start_generation = (
+        int(d["entropy_schedule_start_generation"])
+        if "entropy_schedule_start_generation" in d.files
+        else generation
+    )
+    schedule_total_updates = (
+        int(d["entropy_schedule_total_updates"])
+        if "entropy_schedule_total_updates" in d.files
+        else None
+    )
 
-    return params, opt_state, generation, ppo_index, elite_path, master_key
+    return (
+        params, opt_state, generation, ppo_index, elite_path, master_key,
+        schedule_start_generation, schedule_total_updates
+    )
 
 def generation_number(path):
     try:
@@ -2572,6 +2641,8 @@ def train(n_generations=N_GENERATIONS, resume=True):
     start_ppo_index = 1
     resumed_params = None
     resumed_opt = None
+    entropy_schedule_start_generation = None
+    entropy_schedule_total_updates = None
 
     ckpt = find_latest_checkpoint() if resume else None
     if ckpt is not None:
@@ -2583,10 +2654,14 @@ def train(n_generations=N_GENERATIONS, resume=True):
                 p,
                 saved_elite,
                 master_key,
+                entropy_schedule_start_generation,
+                entropy_schedule_total_updates,
             ) = load_checkpoint(ckpt)
             del saved_elite
             start_generation = g
             start_ppo_index = p + 1
+            if entropy_schedule_total_updates is None:
+                entropy_schedule_total_updates = n_generations * PPO_UPDATES_PER_GENERATION
             if start_ppo_index > PPO_UPDATES_PER_GENERATION:
                 start_ppo_index = 1
                 start_generation += 1
@@ -2602,6 +2677,8 @@ def train(n_generations=N_GENERATIONS, resume=True):
             resumed_opt = None
             start_generation = 1
             start_ppo_index = 1
+            entropy_schedule_start_generation = None
+            entropy_schedule_total_updates = None
 
     latest_elite = find_latest_elite()
     if latest_elite is None:
@@ -2657,6 +2734,10 @@ def train(n_generations=N_GENERATIONS, resume=True):
     print(f"Warm-up            : 0 -> {WARMUP_MAX_STEPS} steps (not used for PPO)")
     print(f"Damage shaping     : {SHAPING_COEF}")
     print(f"Entropy coef       : {ENTROPY_START} -> {ENTROPY_END}")
+    print(
+        f"Entropy schedule   : generation {entropy_schedule_start_generation}"
+        f" + {int(entropy_schedule_total_updates)} updates"
+    )
     print(f"Logstd             : init {LOGSTD_INIT:.1f}, target {LOGSTD_TARGET:.1f}, range [{LOGSTD_MIN:.1f}, {LOGSTD_MAX:.1f}]")
     print(f"Logstd regularizer : {LOGSTD_REG_COEF}")
     print(f"PPO target KL      : {TARGET_KL}")
@@ -2665,8 +2746,13 @@ def train(n_generations=N_GENERATIONS, resume=True):
 
     # n_generations is the number of generations to run from the current
     # resume point. For example, resuming at 190 with 10000 means 190..10189.
+    if entropy_schedule_start_generation is None:
+        entropy_schedule_start_generation = start_generation
+    if entropy_schedule_total_updates is None:
+        entropy_schedule_total_updates = n_generations * PPO_UPDATES_PER_GENERATION
+
     end_generation = start_generation + n_generations - 1
-    total_updates = n_generations * PPO_UPDATES_PER_GENERATION
+    total_updates = int(entropy_schedule_total_updates)
 
     for generation in range(start_generation, end_generation + 1):
         print()
@@ -2715,9 +2801,11 @@ def train(n_generations=N_GENERATIONS, resume=True):
 
         for ppo_index in range(first_ppo, PPO_UPDATES_PER_GENERATION + 1):
             global_update = (
-                (generation - start_generation) * PPO_UPDATES_PER_GENERATION
-                + (ppo_index - first_ppo)
+                (generation - entropy_schedule_start_generation)
+                * PPO_UPDATES_PER_GENERATION
+                + (ppo_index - 1)
             )
+            global_update = max(0, int(global_update))
 
             (
                 candidate_params,
@@ -2759,6 +2847,8 @@ def train(n_generations=N_GENERATIONS, resume=True):
                 ppo_index,
                 latest_elite,
                 master_key,
+                entropy_schedule_start_generation=entropy_schedule_start_generation,
+                entropy_schedule_total_updates=total_updates,
             )
             prune_checkpoints(checkpoint_path)
 
@@ -2843,12 +2933,20 @@ def train(n_generations=N_GENERATIONS, resume=True):
             print(f"Elite avg win time     : {match['avg_elite_time']:.2f} s")
         print(f"Evaluation time        : {match_time:.1f} s")
 
-        winner_label = "Candidate" if match["winner"] == 1 else "Elite"
+        if match["candidate_wins"] > match["elite_wins"]:
+            winner_label = "Candidate"
+        elif match["elite_wins"] > match["candidate_wins"]:
+            winner_label = "Elite"
+        else:
+            winner_label = "Tie / Elite retained"
         elite_changed = match["winner"] == 1
         print(f"Winner                 : {winner_label}")
 
         best_bout_saved = False
-        best_idx = select_best_bout_index(match)
+        master_key, best_bout_key = random.split(master_key)
+        best_idx, is_random_pick = select_best_bout_index(match, best_bout_key)
+        if is_random_pick:
+            print("Best Bout selection   : random fallback (no decisive winner)")
 
         if best_idx is not None:
             cand_is_red = bool(match["candidate_is_red"][best_idx])
@@ -2898,28 +2996,39 @@ def train(n_generations=N_GENERATIONS, resume=True):
                 commander_outcome_pass = None
                 commander_outcome_status = "SKIP (timeout/draw)"
 
-            if match["winner"] == 1:
-                winner_team = 0 if cand_is_red else 1
+            if expected_result == 1:
+                bout_winner_label = "Candidate" if cand_is_red else "Elite"
+                winner_team = 0
+            elif expected_result == 2:
+                bout_winner_label = "Elite" if cand_is_red else "Candidate"
+                winner_team = 1
             else:
-                winner_team = 1 if cand_is_red else 0
+                bout_winner_label = "Timeout / Draw"
+                winner_team = -1
 
-            surv = (
-                match["candidate_surv"]
-                if match["winner"] == 1
-                else match["elite_surv"]
-            )[best_idx]
-            best_return = (
-                match["candidate_return"]
-                if match["winner"] == 1
-                else match["elite_return"]
-            )[best_idx]
+            surv = max(
+                float(match["candidate_surv"][best_idx]),
+                float(match["elite_surv"][best_idx]),
+            ) if expected_result >= 3 else (
+                float(match["candidate_surv"][best_idx])
+                if bout_winner_label == "Candidate"
+                else float(match["elite_surv"][best_idx])
+            )
+            best_return = max(
+                float(match["candidate_return"][best_idx]),
+                float(match["elite_return"][best_idx]),
+            ) if expected_result >= 3 else (
+                float(match["candidate_return"][best_idx])
+                if bout_winner_label == "Candidate"
+                else float(match["elite_return"][best_idx])
+            )
 
             print()
             print("Best Bout")
             print("------------------------------------------")
+            side_text = "Tie" if winner_team < 0 else ("Red" if winner_team == 0 else "Blue")
             print(
-                f"Winner              : {winner_label} "
-                f"({'Red' if winner_team == 0 else 'Blue'})"
+                f"Winner              : {bout_winner_label} ({side_text})"
             )
             print(f"Return              : {float(best_return):.6f}")
             print(f"Win time            : {steps * DT:.2f} s  ({steps} steps)")
@@ -2947,7 +3056,7 @@ def train(n_generations=N_GENERATIONS, resume=True):
                 verification_pass,
                 max_err,
                 err_hp,
-                winner_label,
+                bout_winner_label,
                 winner_team,
             )
             best_bout_saved = True
@@ -3045,7 +3154,7 @@ def build_replay_html(bout_path, out_path=None):
             "generation": generation,
             "winnerLabel": winner_label,
             "winnerTeam": winner_team,
-            "winnerSide": "Red" if winner_team == 0 else "Blue",
+            "winnerSide": ("Tie" if winner_team < 0 else ("Red" if winner_team == 0 else "Blue")),
             "resultText": RESULT_TEXT.get(result_code, "UNKNOWN"),
             "winTime": win_time,
             "endStep": end_step,
