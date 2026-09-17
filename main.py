@@ -15,6 +15,16 @@ import jax.numpy as jnp
 from jax import random, lax
 import optax
 
+# ========== ここから追加 ==========
+import modal
+
+# Modalの環境設定 (GPU対応のJAXとoptaxをインストール)
+app_image = modal.Image.debian_slim().pip_install("jax[cuda12]", "optax")
+# 学習途中データ(チェックポイント等)を保存・再開するための永続ボリューム
+vol = modal.Volume.from_name("rts-storage", create_if_missing=True)
+app = modal.App("rts-jax-ppo")
+# ========== ここまで追加 ==========
+
 print("JAX version :", jax.__version__)
 print("Backend     :", jax.default_backend())
 print("Devices     :", jax.devices())
@@ -27,7 +37,7 @@ print("Devices     :", jax.devices())
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # どこから実行しても、必ずスクリプトと同じ階層（soldierAIの中）にPPO_RTSを作る
-BASE_DIR = os.environ.get("RTS_BASE_DIR", os.path.join(SCRIPT_DIR, "PPO_RTS"))
+BASE_DIR = os.environ.get("RTS_BASE_DIR", "/data/PPO_RTS")
 
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
 ELITE_DIR = os.path.join(BASE_DIR, "elite")
@@ -827,7 +837,7 @@ LOGSTD_TARGET = -1.0
 LOGSTD_REG_COEF = 0.01
 
 PPO_EPOCHS = 4
-MINIBATCHES = 16
+MINIBATCHES = 8
 
 # Stop PPO epoch/update early when the full-action KL grows too large.
 # This KL is summed over the full RTS action, so it is intentionally
@@ -2579,15 +2589,19 @@ def checkpoint_number(path):
 
 def find_latest_elite():
     files = glob.glob(os.path.join(ELITE_DIR, "generation_*.npz"))
-    compatible = [f for f in files if saved_policy_file_compatible(f)]
-    if not compatible:
-        if files:
-            print(
-                f"Ignoring {len(files)} incompatible Elite file(s) "
-                f"(current global input={GLOBAL_INPUT_SIZE})."
-            )
-        return None
-    return sorted(compatible, key=generation_number)[-1]
+    
+    # 世代番号が新しい順（降順）に並び替える
+    files_sorted = sorted(files, key=generation_number, reverse=True)
+    
+    # 最新のものから順番に1つずつチェックし、OKなら即座に返す
+    for f in files_sorted:
+        if saved_policy_file_compatible(f):
+            return f
+            
+    # もし使えるファイルが1つも無ければ None
+    if files:
+        print(f"Ignoring incompatible Elite file(s) (current global input={GLOBAL_INPUT_SIZE}).")
+    return None
 
 
 def find_latest_checkpoint():
@@ -2699,6 +2713,11 @@ def train(n_generations=N_GENERATIONS, resume=True):
     else:
         print("Existing Elite found:", os.path.basename(latest_elite))
 
+    if entropy_schedule_start_generation is None:
+        entropy_schedule_start_generation = start_generation
+    if entropy_schedule_total_updates is None:
+        entropy_schedule_total_updates = n_generations * PPO_UPDATES_PER_GENERATION
+
     print()
     print("============================================")
     print("PPO + ELITE SELF-PLAY")
@@ -2746,10 +2765,6 @@ def train(n_generations=N_GENERATIONS, resume=True):
 
     # n_generations is the number of generations to run from the current
     # resume point. For example, resuming at 190 with 10000 means 190..10189.
-    if entropy_schedule_start_generation is None:
-        entropy_schedule_start_generation = start_generation
-    if entropy_schedule_total_updates is None:
-        entropy_schedule_total_updates = n_generations * PPO_UPDATES_PER_GENERATION
 
     end_generation = start_generation + n_generations - 1
     total_updates = int(entropy_schedule_total_updates)
@@ -3313,12 +3328,15 @@ def show_replay(generation=None):
     return out_path
 
 # ============================================================
-# ENTRY POINT
+# ENTRY POINT (Modal用に書き換え)
 # ============================================================
 
-if __name__ == "__main__":
+# クラウドのGPUで実行するメイン処理
+@app.function(image=app_image, gpu="A10G", timeout=86400, volumes={"/data": vol})
+def run_training_remotely():
+    # 既存のtrain関数をクラウド上で実行
     latest = train(n_generations=N_GENERATIONS, resume=True)
-    del latest
+    
     try:
         replay_generation = LAST_COMPLETED_GENERATION
         path = (
@@ -3326,6 +3344,27 @@ if __name__ == "__main__":
             if replay_generation is not None
             else show_replay()
         )
-        print("Replay written to:", os.path.abspath(path))
+        print("Replay written to (Cloud):", os.path.abspath(path))
+        
+        # 学習完了後、生成されたHTMLファイルのテキストデータを返す（手元に持ってくるため）
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+            
     except FileNotFoundError as e:
         print("Replay skipped:", e)
+        return None
+
+# 手元のPC（ローカル）で動くエントリーポイント
+@app.local_entrypoint()
+def main():
+    print("クラウドのGPUに接続して学習を開始します...")
+    
+    # クラウド側の関数を呼び出し、完了するまで待機（ログは手元に流れます）
+    html_content = run_training_remotely.remote()
+    
+    # クラウドから受け取ったHTMLテキストを、手元のPCにファイルとして保存する
+    if html_content:
+        local_path = "latest_replay.html"
+        with open(local_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        print(f"手元のPCにリプレイを保存しました: {local_path}")
