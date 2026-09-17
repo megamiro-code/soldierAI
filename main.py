@@ -839,7 +839,7 @@ BATCH_SIZE = ROLLOUT_STEPS * N_ENVS * 2
 MINIBATCH_SIZE = BATCH_SIZE // MINIBATCHES
 
 PPO_UPDATES_PER_GENERATION = 5
-N_GENERATIONS = 100
+N_GENERATIONS = 10000
 EVAL_GAMES_PER_SIDE = 32
 EVAL_GAMES = EVAL_GAMES_PER_SIDE * 2
 
@@ -1190,11 +1190,18 @@ def compute_gae(rewards, values, dones, last_value):
 
 
 def compute_discounted_returns(rewards, dones):
-    """Monte-Carlo reward-to-go used for the local Soldier/Commander skill losses."""
+    """Monte-Carlo reward-to-go for local skill rewards.
+
+    ``dones`` is environment-level with shape ``(batch,)`` while local
+    Soldier rewards can be ``(batch, 100)``. Expand the done mask to match
+    the reward tensor so each Soldier/Commander stream resets at episode end.
+    """
     def rev(carry, xs):
         ret = carry
         r_t, d_t = xs
         m = 1.0 - d_t.astype(jnp.float32)
+        while m.ndim < r_t.ndim:
+            m = m[..., None]
         ret = r_t + GAMMA * m * ret
         return ret, ret
 
@@ -1403,7 +1410,7 @@ def ppo_update_minibatch(
     commander_value, commander_grads = jax.value_and_grad(
         commander_loss_fn
     )(params)
-    team_value, (team_grads, metrics) = jax.value_and_grad(
+    (team_value, metrics), team_grads = jax.value_and_grad(
         team_loss_fn, has_aux=True
     )(params)
     del soldier_value, commander_value, team_value
@@ -1411,6 +1418,17 @@ def ppo_update_minibatch(
     soldier_grads = masked_tree(soldier_grads, SOLDIER_LOCAL_KEYS)
     commander_grads = masked_tree(commander_grads, COMMANDER_LOCAL_KEYS)
     team_grads = masked_tree(team_grads, TEAM_KEYS)
+
+    def grad_l2(tree):
+        leaves = jax.tree_util.tree_leaves(tree)
+        return jnp.sqrt(
+            sum(jnp.sum(x * x) for x in leaves) + jnp.float32(1e-12)
+        )
+
+    metrics = dict(metrics)
+    metrics["grad_norm_soldier_local"] = grad_l2(soldier_grads)
+    metrics["grad_norm_commander_local"] = grad_l2(commander_grads)
+    metrics["grad_norm_team"] = grad_l2(team_grads)
 
     grads = {
         k: soldier_grads[k] + commander_grads[k] + team_grads[k]
@@ -1658,6 +1676,32 @@ def collect_rollout(params, state, key):
         "blue_wins": jnp.sum(reasons == 2),
         "timeouts": jnp.sum(reasons == 3),
         "draws": jnp.sum(reasons == 4),
+        # These are the exact reward/advantage tensors consumed by each PPO
+        # objective. They make reward-to-NN wiring visible in the log.
+        "soldier_reward_abs_mean": 0.5 * (
+            jnp.mean(jnp.abs(red_soldier_r))
+            + jnp.mean(jnp.abs(blue_soldier_r))
+        ),
+        "commander_reward_abs_mean": 0.5 * (
+            jnp.mean(jnp.abs(red_commander_r))
+            + jnp.mean(jnp.abs(blue_commander_r))
+        ),
+        "team_reward_abs_mean": 0.5 * (
+            jnp.mean(jnp.abs(red_team_r))
+            + jnp.mean(jnp.abs(blue_team_r))
+        ),
+        "soldier_adv_abs_mean": 0.5 * (
+            jnp.mean(jnp.abs(soldier_adv))
+            + jnp.mean(jnp.abs(blue_soldier_adv))
+        ),
+        "commander_adv_abs_mean": 0.5 * (
+            jnp.mean(jnp.abs(red_commander_adv))
+            + jnp.mean(jnp.abs(blue_commander_adv))
+        ),
+        "team_adv_abs_mean": 0.5 * (
+            jnp.mean(jnp.abs(red_team_adv))
+            + jnp.mean(jnp.abs(blue_team_adv))
+        ),
     }
 
     return (
@@ -1792,7 +1836,11 @@ def run_ppo_update(params, opt_state, state, key, global_update, total_updates):
     metrics["stop_epoch"] = int(stop_epoch)
     metrics["stop_minibatch"] = int(stop_minibatch)
 
-    stats = {k: int(v) for k, v in stats.items()}
+    integer_stats = {"battles", "red_wins", "blue_wins", "timeouts", "draws"}
+    stats = {
+        k: (int(v) if k in integer_stats else float(v))
+        for k, v in stats.items()
+    }
     return (
         params,
         opt_state,
@@ -2602,6 +2650,10 @@ def train(n_generations=N_GENERATIONS, resume=True):
     print(f"Commander rewards  : wall {REWARD_COMMANDER_WALL}, "
           f"hit by enemy {REWARD_COMMANDER_HIT_BY_ENEMY}")
     print(f"Team rewards       : win {REWARD_COMMANDER_WIN}, loss {REWARD_COMMANDER_LOSS}")
+    print("Reward ownership   : Soldier local -> Soldier Encoder + Soldier Actor")
+    print("                     Commander local -> Commander Encoder + Commander Actor")
+    print("                     Team win/loss -> Global + both Actors + Critic")
+    print("                     Team win/loss -> encoders BLOCKED (stop-gradient)")
     print(f"Warm-up            : 0 -> {WARMUP_MAX_STEPS} steps (not used for PPO)")
     print(f"Damage shaping     : {SHAPING_COEF}")
     print(f"Entropy coef       : {ENTROPY_START} -> {ENTROPY_END}")
@@ -2611,9 +2663,12 @@ def train(n_generations=N_GENERATIONS, resume=True):
     print(f"Output directory   : {os.path.abspath(BASE_DIR)}")
     print()
 
+    # n_generations is the number of generations to run from the current
+    # resume point. For example, resuming at 190 with 10000 means 190..10189.
+    end_generation = start_generation + n_generations - 1
     total_updates = n_generations * PPO_UPDATES_PER_GENERATION
 
-    for generation in range(start_generation, n_generations + 1):
+    for generation in range(start_generation, end_generation + 1):
         print()
         print("==================================================")
         print(f"GENERATION {generation}")
@@ -2649,12 +2704,19 @@ def train(n_generations=N_GENERATIONS, resume=True):
             "blue_wins": 0,
             "timeouts": 0,
             "draws": 0,
+            "reward_samples": 0,
+            "soldier_reward_abs_sum": 0.0,
+            "commander_reward_abs_sum": 0.0,
+            "team_reward_abs_sum": 0.0,
+            "soldier_adv_abs_sum": 0.0,
+            "commander_adv_abs_sum": 0.0,
+            "team_adv_abs_sum": 0.0,
         }
 
         for ppo_index in range(first_ppo, PPO_UPDATES_PER_GENERATION + 1):
             global_update = (
-                (generation - 1) * PPO_UPDATES_PER_GENERATION
-                + (ppo_index - 1)
+                (generation - start_generation) * PPO_UPDATES_PER_GENERATION
+                + (ppo_index - first_ppo)
             )
 
             (
@@ -2674,8 +2736,16 @@ def train(n_generations=N_GENERATIONS, resume=True):
                 total_updates,
             )
 
-            for k in cum:
+            for k in ("battles", "red_wins", "blue_wins", "timeouts", "draws"):
                 cum[k] += stats[k]
+
+            cum["reward_samples"] += 1
+            cum["soldier_reward_abs_sum"] += stats["soldier_reward_abs_mean"]
+            cum["commander_reward_abs_sum"] += stats["commander_reward_abs_mean"]
+            cum["team_reward_abs_sum"] += stats["team_reward_abs_mean"]
+            cum["soldier_adv_abs_sum"] += stats["soldier_adv_abs_mean"]
+            cum["commander_adv_abs_sum"] += stats["commander_adv_abs_mean"]
+            cum["team_adv_abs_sum"] += stats["team_adv_abs_mean"]
 
             checkpoint_path = os.path.join(
                 CHECKPOINT_DIR,
@@ -2708,6 +2778,18 @@ def train(n_generations=N_GENERATIONS, resume=True):
                 f"delta {metrics['parameter_delta_l2']:.3e}"
                 f"{early_tag}"
             )
+            print(
+                f"  Reward→NN | "
+                f"Soldier |R| {stats['soldier_reward_abs_mean']:.3e} "
+                f"|A| {stats['soldier_adv_abs_mean']:.3e} "
+                f"grad {metrics['grad_norm_soldier_local']:.3e}; "
+                f"Commander |R| {stats['commander_reward_abs_mean']:.3e} "
+                f"|A| {stats['commander_adv_abs_mean']:.3e} "
+                f"grad {metrics['grad_norm_commander_local']:.3e}; "
+                f"Team |R| {stats['team_reward_abs_mean']:.3e} "
+                f"|A| {stats['team_adv_abs_mean']:.3e} "
+                f"grad {metrics['grad_norm_team']:.3e}"
+            )
 
         print()
         print("PPO summary")
@@ -2715,6 +2797,22 @@ def train(n_generations=N_GENERATIONS, resume=True):
         print(f"Battles completed : {cum['battles']}")
         print(f"Decisive games     : {cum['red_wins'] + cum['blue_wins']}")
         print(f"Timeouts          : {cum['timeouts']}")
+        if cum["reward_samples"] > 0:
+            d = float(cum["reward_samples"])
+            print("Reward -> NN diagnostics (rollout averages)")
+            print("------------------------------------------")
+            print(
+                f"Soldier   |R| {cum['soldier_reward_abs_sum']/d:.3e}  "
+                f"|A| {cum['soldier_adv_abs_sum']/d:.3e}"
+            )
+            print(
+                f"Commander |R| {cum['commander_reward_abs_sum']/d:.3e}  "
+                f"|A| {cum['commander_adv_abs_sum']/d:.3e}"
+            )
+            print(
+                f"Team      |R| {cum['team_reward_abs_sum']/d:.3e}  "
+                f"|A| {cum['team_adv_abs_sum']/d:.3e}"
+            )
         print()
 
         master_key, evk = random.split(master_key)
