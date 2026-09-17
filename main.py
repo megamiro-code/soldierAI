@@ -127,7 +127,8 @@ REWARD_SOLDIER_MISS = -0.003
 REWARD_SOLDIER_WALL = -0.050
 REWARD_SOLDIER_KILL = 0.050
 REWARD_SOLDIER_APPROACH = 0.005
-REWARD_COMMANDER_WALL = 0
+REWARD_COMMANDER_WALL = 0.0
+REWARD_COMMANDER_SURVIVAL = 0.0005
 REWARD_COMMANDER_HIT_BY_ENEMY = -0.020
 REWARD_COMMANDER_WIN = 4.0
 REWARD_COMMANDER_LOSS = -4.0
@@ -512,11 +513,13 @@ def step_one(state, red_action, blue_action):
     local_reward = jnp.zeros(N_UNITS, dtype=jnp.float32)
     local_reward = local_reward.at[ALL_SOLDIER_INDICES].set(soldier_rewards)
 
+    commander_alive_after = alive * commander_mask
     local_reward = (
         local_reward
         + REWARD_COMMANDER_WALL
         * wall_collision.astype(jnp.float32)
         * commander_mask
+        + REWARD_COMMANDER_SURVIVAL * commander_alive_after
     )
 
     red_cmd_hits = jnp.sum(
@@ -2725,6 +2728,7 @@ def train(n_generations=N_GENERATIONS, resume=True):
           f"miss {REWARD_SOLDIER_MISS}, wall {REWARD_SOLDIER_WALL}, "
           f"approach {REWARD_SOLDIER_APPROACH}")
     print(f"Commander rewards  : wall {REWARD_COMMANDER_WALL}, "
+          f"survival {REWARD_COMMANDER_SURVIVAL} / step, "
           f"hit by enemy {REWARD_COMMANDER_HIT_BY_ENEMY}")
     print(f"Team rewards       : win {REWARD_COMMANDER_WIN}, loss {REWARD_COMMANDER_LOSS}")
     print("Reward ownership   : Soldier local -> Soldier Encoder + Soldier Actor")
