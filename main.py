@@ -10,6 +10,7 @@ import time
 import functools
 import argparse
 import re
+import webbrowser
 from pathlib import Path
 import numpy as np
 
@@ -179,8 +180,21 @@ walls = jnp.asarray(WALL_LIST, dtype=jnp.float32).reshape((-1, 2))
 # commander" chase task and its replay. They do not affect the
 # main RTS environment.
 # ------------------------------------------------------------
+# Each entry is one 1x1 wall cell. Four entries make one 2x2 block.
+# 16x16 field -> four 8x8 blocks, with a 2x2 wall at the center of each block.
 TAG_WALL_LIST = [
-    # Example: (-2.0, 0.0), (0.0, 2.0), (2.0, -1.0)
+    # bottom-left 8x8 block (center = -4, -4)
+    (-4.5, -4.5), (-4.5, -3.5),
+    (-3.5, -4.5), (-3.5, -3.5),
+    # top-left 8x8 block (center = -4, +4)
+    (-4.5,  3.5), (-4.5,  4.5),
+    (-3.5,  3.5), (-3.5,  4.5),
+    # bottom-right 8x8 block (center = +4, -4)
+    ( 3.5, -4.5), ( 3.5, -3.5),
+    ( 4.5, -4.5), ( 4.5, -3.5),
+    # top-right 8x8 block (center = +4, +4)
+    ( 3.5,  3.5), ( 3.5,  4.5),
+    ( 4.5,  3.5), ( 4.5,  4.5),
 ]
 
 tag_walls = jnp.asarray(TAG_WALL_LIST, dtype=jnp.float32).reshape((-1, 2))
@@ -402,16 +416,22 @@ def pairwise_separation(x, z, alive, movable=None):
     return push_x, push_z
 
 
-def wall_blocked(x, z, radius):
+def wall_blocked(x, z, radius, wall_array=None):
+    """Vectorized wall collision test.
+
+    Production uses ``walls`` by default. Tag passes ``tag_walls`` explicitly so
+    its physics can use the Tag-specific wall layout without changing production.
+    """
+    wall_array = walls if wall_array is None else wall_array
     x2, z2, r2 = x[:, None], z[:, None], radius[:, None]
-    wx, wz = walls[:, 0][None, :], walls[:, 1][None, :]
+    wx, wz = wall_array[:, 0][None, :], wall_array[:, 1][None, :]
     cx = jnp.clip(x2, wx - 0.5, wx + 0.5)
     cz = jnp.clip(z2, wz - 0.5, wz + 0.5)
     dx, dz = x2 - cx, z2 - cz
     return jnp.any(dx * dx + dz * dz < r2 * r2, axis=1)
 
 
-def step_one(state, red_action, blue_action):
+def step_one(state, red_action, blue_action, wall_array=None):
     x, z = state["x"], state["z"]
     hp, alive = state["hp"], state["alive"]
     attack_timer, speed = state["attack_timer"], state["speed"]
@@ -452,7 +472,7 @@ def step_one(state, red_action, blue_action):
         & can_move
         & ((jnp.abs(move_dx) + jnp.abs(move_dz)) > 1e-6)
     )
-    desired_wall_hit = wall_blocked(nx, nz, radius)
+    desired_wall_hit = wall_blocked(nx, nz, radius, wall_array)
     wall_collision = attempted_move & desired_wall_hit
 
     valid_move = inside & (~desired_wall_hit) & (alive > 0) & can_move
@@ -470,7 +490,7 @@ def step_one(state, red_action, blue_action):
 
     separated_x = nx + px
     separated_z = nz + pz
-    separated_blocked = wall_blocked(separated_x, separated_z, radius)
+    separated_blocked = wall_blocked(separated_x, separated_z, radius, wall_array)
     nx = jnp.where(separated_blocked, nx, separated_x)
     nz = jnp.where(separated_blocked, nz, separated_z)
 
@@ -1587,181 +1607,18 @@ def tag_wall_blocked(x, z, radius):
     return jnp.asarray(blocked, dtype=jnp.bool_)
 
 
-def tag_role_indices(role):
-    # role=0: Red soldier chases Blue commander; role=1: Blue soldier chases Red commander.
-    chaser_team = role.astype(jnp.int32)
-    runner_team = 1 - chaser_team
-    chaser_idx = jnp.where(chaser_team == 0, RED_SOLDIER_START, BLUE_SOLDIER_START)
-    runner_cmd_idx = jnp.where(runner_team == 0, RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX)
-    chaser_cmd_idx = jnp.where(chaser_team == 0, RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX)
-    return chaser_team, runner_team, chaser_idx, runner_cmd_idx, chaser_cmd_idx
 
 
-def reset_tag_one(key, role):
-    k1, k2, k3, k4 = random.split(key, 4)
-    x = jnp.zeros(N_UNITS, dtype=jnp.float32)
-    z = jnp.zeros(N_UNITS, dtype=jnp.float32)
-    vx = jnp.zeros(N_UNITS, dtype=jnp.float32)
-    vz = jnp.zeros(N_UNITS, dtype=jnp.float32)
-    hp = jnp.zeros(N_UNITS, dtype=jnp.float32)
-    alive = jnp.zeros(N_UNITS, dtype=jnp.float32)
-    attack_timer = jnp.zeros(N_UNITS, dtype=jnp.float32)
-    speed = jnp.zeros(N_UNITS, dtype=jnp.float32)
-
-    # Both commanders exist for observation consistency; only the enemy-team
-    # commander is the tag-game runner. The chaser team's commander is static.
-    red_cmd_alive = jnp.ones(())
-    blue_cmd_alive = jnp.ones(())
-    alive = alive.at[RED_COMMANDER_INDEX].set(red_cmd_alive)
-    alive = alive.at[BLUE_COMMANDER_INDEX].set(blue_cmd_alive)
-    hp = hp.at[RED_COMMANDER_INDEX].set(0.30)
-    hp = hp.at[BLUE_COMMANDER_INDEX].set(0.30)
-
-    z_runner = random.uniform(k1, (), minval=-4.0, maxval=4.0)
-    z_chaser = random.uniform(k2, (), minval=-4.0, maxval=4.0)
-    chaser_team, runner_team, chaser_idx, runner_cmd_idx, chaser_cmd_idx = tag_role_indices(role)
-
-    chaser_x = jnp.where(chaser_team == 0, -5.5, 5.5)
-    runner_x = jnp.where(chaser_team == 0, 5.5, -5.5)
-    own_cmd_x = jnp.where(chaser_team == 0, -5.8, 5.8)
-    own_cmd_z = jnp.where(chaser_team == 0, 0.0, 0.0)
-    enemy_cmd_x = runner_x
-
-    # Tiny randomized center offset for the chaser's own commander so the
-    # encoder cannot memorize one exact geometry.
-    own_cmd_z = own_cmd_z + random.uniform(k3, (), minval=-1.0, maxval=1.0)
-
-    x = x.at[chaser_idx].set(chaser_x)
-    z = z.at[chaser_idx].set(z_chaser)
-    x = x.at[runner_cmd_idx].set(runner_x)
-    z = z.at[runner_cmd_idx].set(z_runner)
-    x = x.at[chaser_cmd_idx].set(own_cmd_x)
-    z = z.at[chaser_cmd_idx].set(own_cmd_z)
-
-    alive = alive.at[chaser_idx].set(1.0)
-    hp = hp.at[chaser_idx].set(1.0)
-    speed = speed.at[chaser_idx].set(TAG_CHASER_SPEED)
-    speed = speed.at[runner_cmd_idx].set(TAG_RUNNER_SPEED)
-    speed = speed.at[chaser_cmd_idx].set(0.0)
-
-    # Keep active units out of user-defined tag walls at reset without Python-side
-    # dict mutation, so the function remains JAX-jittable under vmap.
-    state = {
-        "x": x, "z": z, "vx": vx, "vz": vz, "hp": hp, "alive": alive,
-        "attack_timer": attack_timer, "speed": speed,
-        "time": jnp.array(0.0, dtype=jnp.float32), "done": jnp.array(False),
-    }
-
-    def repair_unit(state_in, idx, radius, key_in):
-        px = state_in["x"][idx]
-        pz = state_in["z"][idx]
-        blocked = tag_wall_blocked(px, pz, radius)
-        key_out, kz = random.split(key_in)
-        step_dir = jnp.where(px >= 0.0, -1.0, 1.0)
-        candidate_x = jnp.clip(px + step_dir * 0.8, -HALF_FIELD + radius, HALF_FIELD - radius)
-        candidate_z = random.uniform(kz, (), minval=-4.0, maxval=4.0)
-        nx = jnp.where(blocked, candidate_x, px)
-        nz = jnp.where(blocked, candidate_z, pz)
-        return (
-            {**state_in,
-             "x": state_in["x"].at[idx].set(nx),
-             "z": state_in["z"].at[idx].set(nz)},
-            key_out,
-        )
-
-    state, key = repair_unit(state, chaser_idx, SOLDIER_RADIUS, k4)
-    state, key = repair_unit(state, runner_cmd_idx, COMMANDER_RADIUS, key)
-    # A second pass handles a rare case where the first shift still lands on a wall.
-    state, key = repair_unit(state, chaser_idx, SOLDIER_RADIUS, key)
-    state, key = repair_unit(state, runner_cmd_idx, COMMANDER_RADIUS, key)
-    del key
-    return state
 
 
-reset_tag_parallel = jax.jit(jax.vmap(reset_tag_one, in_axes=(0, 0)))
 
 
-def reset_tag_batch(key, n):
-    keys = random.split(key, n)
-    roles = jnp.arange(n, dtype=jnp.int32) % 2
-    return reset_tag_parallel(keys, roles), roles
 
 
-def tag_local_frame(state, team, indices):
-    blue = team.astype(jnp.float32) > 0.5
-    x = state["x"][indices]
-    z = state["z"][indices]
-    vx = state["vx"][indices]
-    vz = state["vz"][indices]
-    return (
-        jnp.where(blue, -x, x), z,
-        jnp.where(blue, -vx, vx), vz,
-        blue,
-    )
 
 
-def make_tag_soldier_features(state, role, terrain_local=None):
-    _, _, chaser_idx, runner_cmd_idx, chaser_cmd_idx = tag_role_indices(role)
-    lx, lz, lvx, lvz, blue = tag_local_frame(state, role, chaser_idx)
-
-    own_cmd_x = jnp.where(blue, -state["x"][chaser_cmd_idx], state["x"][chaser_cmd_idx])
-    own_cmd_z = state["z"][chaser_cmd_idx]
-    enemy_cmd_x = jnp.where(blue, -state["x"][runner_cmd_idx], state["x"][runner_cmd_idx])
-    enemy_cmd_z = state["z"][runner_cmd_idx]
-
-    base = jnp.stack([
-        lx / HALF_FIELD,
-        lz / HALF_FIELD,
-        lvx,
-        lvz,
-        state["hp"][chaser_idx],
-        jnp.ones_like(lx),
-        jnp.zeros_like(lx),
-        state["alive"][chaser_idx],
-    ], axis=-1)
-    nearest = relative_features(lx, lz, enemy_cmd_x, enemy_cmd_z)
-    own_cmd = relative_features(lx, lz, own_cmd_x, own_cmd_z)
-    enemy_cmd = relative_features(lx, lz, enemy_cmd_x, enemy_cmd_z)
-
-    if terrain_local is None:
-        terrain_local = jnp.where(
-            blue,
-            tag_terrain.reshape(TERRAIN_RES, TERRAIN_RES)[:, ::-1],
-            tag_terrain.reshape(TERRAIN_RES, TERRAIN_RES),
-        ).reshape(-1)
-    local_terrain = grid_8_features(lx, lz, terrain_local)
-    return jnp.concatenate([base, nearest, own_cmd, enemy_cmd, local_terrain], axis=-1)
 
 
-def make_tag_commander_features(state, role, terrain_local=None):
-    chaser_team, runner_team, chaser_idx, runner_cmd_idx, _ = tag_role_indices(role)
-    del runner_team
-    lx, lz, lvx, lvz, blue = tag_local_frame(state, role + 0, runner_cmd_idx)
-
-    # The runner is always own commander, so own=1 and commander_flag=1.
-    base = jnp.stack([
-        lx / HALF_FIELD,
-        lz / HALF_FIELD,
-        lvx,
-        lvz,
-        state["hp"][runner_cmd_idx],
-        jnp.ones_like(lx),
-        jnp.ones_like(lx),
-        state["alive"][runner_cmd_idx],
-    ], axis=-1)
-    nearest = relative_features(
-        lx,
-        lz,
-        jnp.where(blue, -state["x"][chaser_idx], state["x"][chaser_idx]),
-        state["z"][chaser_idx],
-    )
-    if terrain_local is None:
-        base_terrain_2d = tag_terrain.reshape(TERRAIN_RES, TERRAIN_RES)
-        terrain_local = jnp.where(
-            blue, base_terrain_2d[:, ::-1], base_terrain_2d
-        ).reshape(-1)
-    wall = commander_wall_features(lx, lz, terrain_local)
-    return jnp.concatenate([base, nearest, wall], axis=-1)
 
 
 def tag_micro_outputs(params, soldier_features, commander_features):
@@ -1774,39 +1631,8 @@ def tag_micro_outputs(params, soldier_features, commander_features):
     )
 
 
-def tag_target_vectors(state, role):
-    _, _, chaser_idx, runner_cmd_idx, _ = tag_role_indices(role)
-    chx = state["x"][chaser_idx]
-    chz = state["z"][chaser_idx]
-    rx = state["x"][runner_cmd_idx]
-    rz = state["z"][runner_cmd_idx]
-    to_runner = jnp.stack([rx - chx, rz - chz])
-    away = -to_runner
-    to_runner = to_runner / (jnp.linalg.norm(to_runner) + 1e-8)
-    away = away / (jnp.linalg.norm(away) + 1e-8)
-    dist = jnp.sqrt((rx - chx) ** 2 + (rz - chz) ** 2 + 1e-8)
-    return to_runner, away, dist
 
 
-def tag_update_loss(params, soldier_features, commander_features, target_chase, target_run, attack_target):
-    micro_s, micro_c = tag_micro_outputs(params, soldier_features, commander_features)
-    ps = jnp.tanh(micro_s[..., :2])
-    pc = jnp.tanh(micro_c[..., :2])
-    ps = ps / (jnp.linalg.norm(ps) + 1e-8)
-    pc = pc / (jnp.linalg.norm(pc) + 1e-8)
-
-    chase_dir_loss = 1.0 - jnp.sum(ps * target_chase)
-    run_dir_loss = 1.0 - jnp.sum(pc * target_run)
-    attack_target = attack_target.astype(jnp.float32)
-    attack_logit = micro_s[..., 2]
-    attack_bce = jnp.maximum(attack_logit, 0.0) - attack_logit * attack_target + jnp.log1p(jnp.exp(-jnp.abs(attack_logit)))
-    loss = jnp.mean(chase_dir_loss + run_dir_loss + 0.25 * attack_bce)
-    return loss, {
-        "tag_loss": loss,
-        "tag_chase_loss": jnp.mean(chase_dir_loss),
-        "tag_run_loss": jnp.mean(run_dir_loss),
-        "tag_attack_loss": jnp.mean(attack_bce),
-    }
 
 
 @jax.jit
@@ -1828,133 +1654,12 @@ def tag_update_minibatch(params, opt_state, soldier_features, commander_features
     return params, opt_state, metrics
 
 
-def tag_micro_local_action(params, soldier_features, commander_features):
-    micro_s, micro_c = tag_micro_outputs(params, soldier_features, commander_features)
-    s_vec = jnp.tanh(micro_s[..., :2])
-    s_vec = s_vec / (jnp.linalg.norm(s_vec) + 1e-8)
-    c_vec = jnp.tanh(micro_c)
-    c_vec = c_vec / (jnp.linalg.norm(c_vec) + 1e-8)
-    attack = (jax.nn.sigmoid(micro_s[..., 2]) >= 0.5).astype(jnp.float32)
-    return s_vec[..., 0], s_vec[..., 1], attack, c_vec[..., 0], c_vec[..., 1]
 
 
-def tag_step_one(state, role, chaser_dx, chaser_dz, chaser_attack, runner_dx, runner_dz):
-    _, _, chaser_idx, runner_cmd_idx, _ = tag_role_indices(role)
-    x, z = state["x"], state["z"]
-    chx, chz = x[chaser_idx], z[chaser_idx]
-    rx, rz = x[runner_cmd_idx], z[runner_cmd_idx]
-
-    old_dist = jnp.sqrt((rx - chx) ** 2 + (rz - chz) ** 2 + 1e-8)
-
-    ch_nx = chx + chaser_dx * TAG_CHASER_SPEED * DT
-    ch_nz = chz + chaser_dz * TAG_CHASER_SPEED * DT
-    r_nx = rx + runner_dx * TAG_RUNNER_SPEED * DT
-    r_nz = rz + runner_dz * TAG_RUNNER_SPEED * DT
-
-    ch_inside = (
-        (ch_nx >= -HALF_FIELD + SOLDIER_RADIUS)
-        & (ch_nx <= HALF_FIELD - SOLDIER_RADIUS)
-        & (ch_nz >= -HALF_FIELD + SOLDIER_RADIUS)
-        & (ch_nz <= HALF_FIELD - SOLDIER_RADIUS)
-    )
-    r_inside = (
-        (r_nx >= -HALF_FIELD + COMMANDER_RADIUS)
-        & (r_nx <= HALF_FIELD - COMMANDER_RADIUS)
-        & (r_nz >= -HALF_FIELD + COMMANDER_RADIUS)
-        & (r_nz <= HALF_FIELD - COMMANDER_RADIUS)
-    )
-    ch_blocked = tag_wall_blocked(ch_nx, ch_nz, SOLDIER_RADIUS)
-    r_blocked = tag_wall_blocked(r_nx, r_nz, COMMANDER_RADIUS)
-
-    ch_valid = ch_inside & (~ch_blocked)
-    r_valid = r_inside & (~r_blocked)
-    ch_nx = jnp.where(ch_valid, ch_nx, chx)
-    ch_nz = jnp.where(ch_valid, ch_nz, chz)
-    r_nx = jnp.where(r_valid, r_nx, rx)
-    r_nz = jnp.where(r_valid, r_nz, rz)
-
-    new_dist = jnp.sqrt((r_nx - ch_nx) ** 2 + (r_nz - ch_nz) ** 2 + 1e-8)
-    captured = new_dist <= ATTACK_RANGE
-    new_time = state["time"] + DT
-    timeout = new_time >= TAG_MAX_STEPS * DT
-    done = captured | timeout
-
-    nx = x.at[chaser_idx].set(ch_nx)
-    nz = z.at[chaser_idx].set(ch_nz)
-    nx = nx.at[runner_cmd_idx].set(r_nx)
-    nz = nz.at[runner_cmd_idx].set(r_nz)
-    nvx = state["vx"].at[chaser_idx].set(jnp.where(ch_valid, chaser_dx, 0.0))
-    nvz = state["vz"].at[chaser_idx].set(jnp.where(ch_valid, chaser_dz, 0.0))
-    nvx = nvx.at[runner_cmd_idx].set(jnp.where(r_valid, runner_dx, 0.0))
-    nvz = nvz.at[runner_cmd_idx].set(jnp.where(r_valid, runner_dz, 0.0))
-
-    reward_chaser = TAG_STEP_PENALTY + (TAG_CAPTURE_REWARD * captured.astype(jnp.float32))
-    reward_runner = TAG_STEP_PENALTY + (TAG_RUNNER_CAPTURE_REWARD * captured.astype(jnp.float32))
-    reward_chaser = reward_chaser + (old_dist - new_dist) * 0.05
-    reward_runner = reward_runner - (old_dist - new_dist) * 0.05
-
-    next_state = {
-        **state,
-        "x": nx,
-        "z": nz,
-        "vx": nvx,
-        "vz": nvz,
-        "time": new_time,
-        "done": done,
-    }
-    return next_state, reward_chaser, reward_runner, done, captured
 
 
-@jax.jit
-def tag_rollout_step(params, states, roles):
-    soldier_features = jax.vmap(make_tag_soldier_features)(states, roles)
-    commander_features = jax.vmap(make_tag_commander_features)(states, roles)
-    target_chase, target_run, dist_now = jax.vmap(tag_target_vectors)(states, roles)
-    # ``dist_now`` is already computed per environment by tag_target_vectors.
-    # Re-indexing states["x"] with a vector of unit indices here would index the
-    # batch dimension and incorrectly produce shape (BATCH, N_UNITS).
-    attack_target = (dist_now <= ATTACK_RANGE).astype(jnp.float32)
-    return soldier_features, commander_features, target_chase, target_run, attack_target
 
 
-def train_tag_game(params, key, steps=TAG_TRAIN_STEPS):
-    states, roles = reset_tag_batch(key, TAG_BATCH_SIZE)
-    opt_state = tag_optimizer.init(params)
-    metrics_list = []
-    captures = []
-    for i in range(steps):
-        key, reset_key = random.split(key)
-        soldier_features, commander_features, target_chase, target_run, attack_target = tag_rollout_step(
-            params, states, roles
-        )
-        params, opt_state, metrics = tag_update_minibatch(
-            params, opt_state,
-            soldier_features, commander_features,
-            target_chase, target_run, attack_target,
-        )
-        sdx, sdz, sat, cdx, cdz = tag_micro_local_action(
-            params, soldier_features, commander_features
-        )
-        states, _, _, done, captured = jax.vmap(tag_step_one)(
-            states, roles, sdx, sdz, sat, cdx, cdz
-        )
-        fresh = reset_tag_parallel(random.split(reset_key, TAG_BATCH_SIZE), roles)
-        def merge(old, new):
-            mask = done if old.ndim == 1 else done.reshape((TAG_BATCH_SIZE,) + (1,) * (old.ndim - 1))
-            return jnp.where(mask, new, old)
-        states = jax.tree_util.tree_map(merge, states, fresh)
-        metrics_list.append({k: float(v) for k, v in metrics.items()})
-        captures.append(int(jnp.sum(captured)))
-    if not metrics_list:
-        raise ValueError("TAG_TRAIN_STEPS must be at least 1")
-    metrics = {
-        k: float(np.mean([m[k] for m in metrics_list]))
-        for k in metrics_list[0]
-    }
-    metrics["tag_captures"] = int(sum(captures))
-    metrics["tag_batch"] = TAG_BATCH_SIZE
-    metrics["tag_steps"] = steps
-    return params, key, metrics
 
 
 # ============================================================
@@ -3183,155 +2888,6 @@ def choose_tag_seed_policy(production_elite):
     return production_elite, "production Elite"
 
 
-def run_tag_training(n_updates=TAG_UPDATES_PER_RUN, resume=True):
-    """Standalone tag-game training.
-
-    Only the encoder + Micro heads are updated.  The resulting full parameter
-    tree is saved separately under TAG_ELITE_DIR so production PPO can consume
-    it on the next run without modifying the production Elite in place.
-    """
-    if n_updates < 1:
-        raise ValueError("n_updates must be >= 1")
-
-    production_elite = find_latest_elite()
-    if production_elite is None:
-        key, ik = random.split(random.key(int(time.time()) & 0x7FFFFFFF))
-        params0 = init_policy(ik)
-        production_elite = save_params(
-            os.path.join(ELITE_DIR, "generation_0000.npz"),
-            params0,
-            {
-                "generation": 0,
-                "source": "random_init_for_tag_training",
-                "raw_obs_size": RAW_OBS_SIZE,
-                "global_input_size": GLOBAL_INPUT_SIZE,
-            },
-        )
-        del key
-        print("Created production Generation 0 Elite for tag training.")
-
-    start_path, start_source = choose_tag_seed_policy(production_elite)
-    params, _ = load_params(start_path)
-    master_key = random.key(int(time.time()) & 0x7FFFFFFF)
-    master_key, tag_key = random.split(master_key)
-
-    print()
-    print("============================================")
-    print("STANDALONE TAG TRAINING")
-    print("============================================")
-    print(f"Starting policy      : {os.path.basename(start_path)} ({start_source})")
-    print(f"Updates              : {n_updates}")
-    print(f"Batch                : {TAG_BATCH_SIZE}")
-    print(f"Field                : {FIELD_SIZE} x {FIELD_SIZE}")
-    print(f"Walls                : {len(TAG_WALL_LIST)}")
-    print(f"Chaser speed         : {TAG_CHASER_SPEED:.3f}")
-    print(f"Runner speed         : {TAG_RUNNER_SPEED:.3f}")
-    print(f"Max tag time         : {TAG_MAX_STEPS * DT:.1f} s")
-    print("Updated parameters   : Soldier/Commander Encoders + Micro heads")
-    print()
-
-    t0 = time.time()
-    params, tag_key, metrics = train_tag_game(
-        params, tag_key, steps=int(n_updates)
-    )
-    elapsed = time.time() - t0
-
-    existing = find_latest_tag_policy()
-    next_number = tag_policy_number(existing) + 1 if existing else 1
-    tag_policy_path = os.path.join(
-        TAG_ELITE_DIR, f"tag_policy_{next_number:06d}.npz"
-    )
-    save_params(
-        tag_policy_path,
-        params,
-        {
-            "source": "standalone_tag_training",
-            "source_policy": os.path.abspath(start_path),
-            "tag_updates": int(n_updates),
-            "tag_batch": TAG_BATCH_SIZE,
-            "tag_walls": TAG_WALL_LIST,
-        },
-    )
-
-    print(
-        f"Tag training done     | loss {metrics['tag_loss']:.4f} "
-        f"chase {metrics['tag_chase_loss']:.4f} "
-        f"run {metrics['tag_run_loss']:.4f} "
-        f"attack {metrics['tag_attack_loss']:.4f} "
-        f"grad {metrics['tag_grad_norm']:.3e} "
-        f"captures {metrics['tag_captures']} "
-        f"time {elapsed:.1f} s"
-    )
-    print(f"Tag policy saved      : {tag_policy_path}")
-
-    # Save multiple independent replays from the updated Micro policy so any
-    # representative tag game can be inspected later.
-    replay_paths = []
-    replay_records = []
-    for sample_index in range(TAG_REPLAY_SAMPLES_PER_RUN):
-        master_key, episode_key = random.split(master_key)
-        role = int(sample_index % 2)
-        role_j = jnp.array(role, dtype=jnp.int32)
-        tag_init = reset_tag_one(episode_key, role_j)
-        tag_bout = record_tag_bout(params, tag_init, role=role)
-        tag_bout["sample_index"] = sample_index
-        vx, vz = verify_tag_bout(
-            tag_init, role, tag_bout["chaser_actions"], tag_bout["runner_actions"]
-        )
-        err_x = float(np.max(np.abs(vx - tag_bout["x"])))
-        err_z = float(np.max(np.abs(vz - tag_bout["z"])))
-        verify_pass = err_x < 1e-6 and err_z < 1e-6
-        tag_bout["verification_pass"] = verify_pass
-        tag_bout["max_state_error"] = max(err_x, err_z)
-        bout_path = os.path.join(
-            TAG_BOUT_DIR,
-            f"tag_policy_{next_number:06d}_bout_{sample_index:03d}.npz",
-        )
-        save_tag_bout(
-            bout_path, int(next_number), tag_bout, verify_pass, max(err_x, err_z)
-        )
-        replay_path, _ = build_tag_replay_html(
-            bout_path,
-            os.path.join(
-                TAG_REPLAY_DIR,
-                f"tag_policy_{next_number:06d}_bout_{sample_index:03d}.html",
-            ),
-        )
-        replay_paths.append(replay_path)
-        replay_records.append(
-            {
-                "sample_index": sample_index,
-                "role": role,
-                "winner_code": int(tag_bout["winner_code"]),
-                "steps": int(tag_bout["end_step"]),
-                "bout_path": bout_path,
-                "replay_path": replay_path,
-            }
-        )
-        print(
-            f"Tag replay [{sample_index:02d}] : {replay_path} "
-            f"role={role} result={int(tag_bout['winner_code'])} "
-            f"{'PASS' if verify_pass else f'FAIL {max(err_x, err_z):.2e}'}"
-        )
-
-    # Backward-compatible representative replay: shortest captured game,
-    # otherwise sample 0 when all samples timeout.
-    decisive = [r for r in replay_records if r["winner_code"] == 1]
-    representative = min(decisive, key=lambda r: r["steps"]) if decisive else replay_records[0]
-    representative_npz = os.path.join(
-        TAG_BOUT_DIR, f"tag_policy_{next_number:06d}_best_bout.npz"
-    )
-    with open(representative["bout_path"], "rb") as src, open(representative_npz, "wb") as dst:
-        dst.write(src.read())
-    representative_html = os.path.join(
-        TAG_REPLAY_DIR, f"tag_policy_{next_number:06d}.html"
-    )
-    representative_html_path, _ = build_tag_replay_html(
-        representative_npz, representative_html
-    )
-    print(f"Tag replay representative : {representative_html_path}")
-    print(f"Tag replay samples        : {len(replay_paths)}")
-    return tag_policy_path, representative_html_path
 
 
 def train(n_generations=N_GENERATIONS, resume=True):
@@ -3485,6 +3041,7 @@ def train(n_generations=N_GENERATIONS, resume=True):
     print("                     Team win/loss -> Global + both Actors + Critic")
     print("                     Team win/loss -> encoders BLOCKED; micro heads are masked")
     print("Tag training        : external command only (not run inside PPO)")
+    print(f"Tag soldiers/team   : {TAG_SOLDIERS_PER_TEAM}")
     print(f"Tag updates/run     : {TAG_UPDATES_PER_RUN}, batch {TAG_BATCH_SIZE}")
     print(f"Tag walls           : {len(TAG_WALL_LIST)} entries")
     print(f"Warm-up            : 0 -> {WARMUP_MAX_STEPS} steps (not used for PPO)")
@@ -3904,6 +3461,15 @@ def build_replay_html(bout_path, out_path=None):
     if red_actions.shape[0] != end_step or blue_actions.shape[0] != end_step:
         raise ValueError("Action length does not match end_step.")
 
+    is_tag_replay = ("tag_policy_red" in d) or ("tag_policy_blue" in d) or ("tag_soldiers_per_team" in d)
+    if is_tag_replay:
+        if "tag_walls" in d:
+            saved_walls = d["tag_walls"].astype(np.float32).reshape((-1, 2)).tolist()
+        else:
+            saved_walls = [list(p) for p in TAG_WALL_LIST]
+    else:
+        saved_walls = [list(p) for p in WALL_LIST]
+
     payload = json.dumps(
         {
             "generation": generation,
@@ -3919,7 +3485,7 @@ def build_replay_html(bout_path, out_path=None):
             "maxStateError": max_state_error,
             "maxHpError": max_hp_error,
             "fieldSize": FIELD_SIZE,
-            "walls": WALL_LIST,
+            "walls": saved_walls,
             "x": np.round(x, 4).tolist(),
             "z": np.round(z, 4).tolist(),
             "hp": np.round(hp, 3).tolist(),
@@ -4072,145 +3638,12 @@ def show_replay(generation=None):
 # ============================================================
 
 
-def record_tag_bout(params, initial_state=None, role=0):
-    if initial_state is None:
-        initial_state = reset_tag_one(random.PRNGKey(20260917), jnp.array(role, dtype=jnp.int32))
-
-    state = initial_state
-    xs = [np.asarray(state["x"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]]]
-    zs = [np.asarray(state["z"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]]]
-    dones = []
-    chaser_actions = []
-    runner_actions = []
-    result = 0
-
-    for _ in range(TAG_MAX_STEPS):
-        sf = make_tag_soldier_features(state, jnp.array(role, dtype=jnp.int32))[None, :]
-        cf = make_tag_commander_features(state, jnp.array(role, dtype=jnp.int32))[None, :]
-        sdx, sdz, sat, cdx, cdz = tag_micro_local_action(params, sf, cf)
-        sdx = float(sdx[0]); sdz = float(sdz[0]); sat = float(sat[0])
-        cdx = float(cdx[0]); cdz = float(cdz[0])
-        chaser_actions.append([sdx, sdz, sat])
-        runner_actions.append([cdx, cdz])
-        state, _, _, done, captured = tag_step_one(
-            state, jnp.array(role, dtype=jnp.int32),
-            jnp.array(sdx, dtype=jnp.float32), jnp.array(sdz, dtype=jnp.float32), jnp.array(sat, dtype=jnp.float32),
-            jnp.array(cdx, dtype=jnp.float32), jnp.array(cdz, dtype=jnp.float32),
-        )
-        xs.append(np.asarray(state["x"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]])
-        zs.append(np.asarray(state["z"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]])
-        dones.append(int(done))
-        if bool(done):
-            result = 1 if bool(captured) else 3
-            break
-
-    return {
-        "generation": -1,
-        "role": int(role),
-        "winner_code": int(result),
-        "x": np.asarray(xs, dtype=np.float32),
-        "z": np.asarray(zs, dtype=np.float32),
-        "chaser_actions": np.asarray(chaser_actions, dtype=np.float32),
-        "runner_actions": np.asarray(runner_actions, dtype=np.float32),
-        "end_step": len(chaser_actions),
-        "dt": DT,
-        "field_size": FIELD_SIZE,
-        "terrain_res": TERRAIN_RES,
-        "tag_walls": TAG_WALL_LIST,
-    }
 
 
-def verify_tag_bout(initial_state, role, chaser_actions, runner_actions):
-    state = initial_state
-    xs = [np.asarray(state["x"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]]]
-    zs = [np.asarray(state["z"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]]]
-    for i in range(len(chaser_actions)):
-        ca = chaser_actions[i]
-        ra = runner_actions[i]
-        state, _, _, _, _ = tag_step_one(
-            state, jnp.array(role, dtype=jnp.int32),
-            jnp.array(ca[0], dtype=jnp.float32),
-            jnp.array(ca[1], dtype=jnp.float32),
-            jnp.array(ca[2], dtype=jnp.float32),
-            jnp.array(ra[0], dtype=jnp.float32),
-            jnp.array(ra[1], dtype=jnp.float32),
-        )
-        xs.append(np.asarray(state["x"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]])
-        zs.append(np.asarray(state["z"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]])
-    return np.asarray(xs, dtype=np.float32), np.asarray(zs, dtype=np.float32)
 
 
-def save_tag_bout(path, generation, bout, verification_pass=True, max_state_error=0.0):
-    np.savez_compressed(
-        path,
-        generation=np.array(generation, dtype=np.int32),
-        sample_index=np.array(int(bout.get("sample_index", 0)), dtype=np.int32),
-        role=np.array(bout["role"], dtype=np.int32),
-        winner_code=np.array(bout["winner_code"], dtype=np.int32),
-        end_step=np.array(bout["end_step"], dtype=np.int32),
-        dt=np.array(bout["dt"], dtype=np.float32),
-        field_size=np.array(bout["field_size"], dtype=np.float32),
-        terrain_res=np.array(bout["terrain_res"], dtype=np.int32),
-        tag_walls=np.asarray(bout["tag_walls"], dtype=np.float32).reshape((-1, 2)),
-        verification_pass=np.array(1 if verification_pass else 0, dtype=np.int32),
-        max_state_error=np.array(max_state_error, dtype=np.float32),
-        x=bout["x"], z=bout["z"],
-        chaser_actions=bout["chaser_actions"],
-        runner_actions=bout["runner_actions"],
-    )
-    return path
 
 
-def build_tag_replay_html(path, out_path=None):
-    d = np.load(path, allow_pickle=False)
-    generation = int(d["generation"])
-    sample_index = int(d["sample_index"]) if "sample_index" in d else 0
-    role = int(d["role"])
-    winner_code = int(d["winner_code"])
-    end_step = int(d["end_step"])
-    dt = float(d["dt"])
-    field_size = float(d["field_size"])
-    walls_data = d["tag_walls"].astype(np.float32).tolist()
-    x = d["x"].astype(np.float32)
-    z = d["z"].astype(np.float32)
-    ca = d["chaser_actions"].astype(np.float32)
-    ra = d["runner_actions"].astype(np.float32)
-    result_text = "CAUGHT" if winner_code == 1 else "TIMEOUT"
-    verification_pass = bool(int(d["verification_pass"])) if "verification_pass" in d else True
-    max_state_error = float(d["max_state_error"]) if "max_state_error" in d else 0.0
-    chaser_team = "Red" if role == 0 else "Blue"
-    runner_team = "Blue" if role == 0 else "Red"
-    payload = json.dumps({
-        "generation": generation,
-        "role": role,
-        "winner": result_text,
-        "chaserTeam": chaser_team,
-        "runnerTeam": runner_team,
-        "steps": end_step,
-        "dt": dt,
-        "fieldSize": field_size,
-        "walls": walls_data,
-        "x": np.round(x, 4).tolist(),
-        "z": np.round(z, 4).tolist(),
-        "chaserActions": np.round(ca, 3).tolist(),
-        "runnerActions": np.round(ra, 3).tolist(),
-        "attackRange": float(ATTACK_RANGE),
-        "verificationPass": verification_pass,
-        "maxStateError": max_state_error,
-    }, separators=(",", ":"))
-    html = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RTS Tag Game Replay</title><style>
-html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#101010;font-family:Arial,Helvetica,sans-serif}#info{position:absolute;left:14px;top:14px;z-index:10;padding:12px 15px;background:rgba(0,0,0,.74);color:#fff;border-radius:8px;line-height:1.5;font-size:14px}#controls{position:absolute;left:14px;bottom:14px;z-index:10;padding:10px 12px;background:rgba(0,0,0,.74);border-radius:8px;color:#fff}button{margin-right:5px;padding:5px 9px;border:0;border-radius:4px;cursor:pointer}#timeline{width:440px;max-width:45vw}.caught{color:#5fd97a;font-weight:bold}.run{color:#ffd95a;font-weight:bold}
-</style></head><body><div id="info"></div><div id="controls"><button id="play">Play</button><button id="pause">Pause</button><button id="reset">Reset</button><button data-speed="0.5">0.5x</button><button data-speed="1">1x</button><button data-speed="2">2x</button><br><br><input id="timeline" type="range" min="0" max="__MAX__" value="0" step="1"><span id="status"></span></div><script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}</script><script type="module">
-import * as THREE from 'three';import {OrbitControls} from 'three/addons/controls/OrbitControls.js';const D=__DATA__;const info=document.getElementById('info'),timeline=document.getElementById('timeline'),status=document.getElementById('status');let t=0,playing=false,speed=1,last=null;const scene=new THREE.Scene();scene.background=new THREE.Color(0x101010);const cam=new THREE.PerspectiveCamera(45,innerWidth/innerHeight,.1,250);cam.position.set(0,18,17);const renderer=new THREE.WebGLRenderer({antialias:true});renderer.setPixelRatio(Math.min(devicePixelRatio||1,2));renderer.setSize(innerWidth,innerHeight);document.body.appendChild(renderer.domElement);const ctl=new OrbitControls(cam,renderer.domElement);ctl.target.set(0,0,0);ctl.update();scene.add(new THREE.HemisphereLight(0xffffff,0x444444,2));scene.add(new THREE.DirectionalLight(0xffffff,1.2));const half=D.fieldSize/2;const ground=new THREE.Mesh(new THREE.PlaneGeometry(D.fieldSize,D.fieldSize),new THREE.MeshStandardMaterial({color:0x303030}));ground.rotation.x=-Math.PI/2;scene.add(ground);scene.add(new THREE.GridHelper(D.fieldSize,D.fieldSize,0x777777,0x444444));for(const p of D.walls){const w=new THREE.Mesh(new THREE.BoxGeometry(1,.7,1),new THREE.MeshStandardMaterial({color:0x777777}));w.position.set(p[0],.35,p[1]);scene.add(w)}const ch=new THREE.Mesh(new THREE.SphereGeometry(.28,20,20),new THREE.MeshStandardMaterial({color:0xff4b4b}));const rn=new THREE.Mesh(new THREE.BoxGeometry(.5,.8,.5),new THREE.MeshStandardMaterial({color:0x4b7bd9}));ch.position.y=.28;rn.position.y=.4;scene.add(ch,rn);function frame(){const raw=t/D.dt,i=Math.min(Math.floor(raw),D.steps),a=i>=D.steps?0:raw-i;const x0=D.x[i],z0=D.z[i],x1=i<D.steps?D.x[i+1]:x0,z1=i<D.steps?D.z[i+1]:z0;return{i,a,xc:x0[D.role===0?2:3]+(x1[D.role===0?2:3]-x0[D.role===0?2:3])*a,zc:z0[D.role===0?2:3]+(z1[D.role===0?2:3]-z0[D.role===0?2:3])*a,xr:x0[D.role===0?1:0]+(x1[D.role===0?1:0]-x0[D.role===0?1:0])*a,zr:z0[D.role===0?1:0]+(z1[D.role===0?1:0]-z0[D.role===0?1:0])*a}}function update(){const f=frame();ch.position.set(f.xc,0,f.zc);rn.position.set(f.xr,0,f.zr);timeline.value=String(f.i);const dist=Math.hypot(f.xc-f.xr,f.zc-f.zr);const cap=f.i>0&&D.chaserActions[f.i-1]&&D.chaserActions[f.i-1][2]>.5;const ver=D.verificationPass?'<span class="caught">Replay verification: PASS</span>':'<span style="color:#ff6a6a;font-weight:bold">Replay verification: FAIL ('+D.maxStateError.toExponential(2)+')</span>';info.innerHTML='<b>Generation '+D.generation+'</b><br>Chaser: <b>'+D.chaserTeam+'</b><br>Runner: <b>'+D.runnerTeam+'</b><br>Time: '+(f.i*D.dt).toFixed(2)+' s<br>Distance: '+dist.toFixed(3)+'<br><span class="run">Runner</span> vs <span class="caught">Chaser</span><br>Result: <b>'+D.winner+'</b><br>Attack output: '+(cap?'ON':'OFF')+'<br>'+ver;status.textContent='Tag Replay | '+(f.i*D.dt).toFixed(2)+' s'}document.getElementById('play').onclick=()=>playing=true;document.getElementById('pause').onclick=()=>playing=false;document.getElementById('reset').onclick=()=>{playing=false;t=0;update()};document.querySelectorAll('button[data-speed]').forEach(b=>b.onclick=()=>speed=parseFloat(b.dataset.speed));timeline.oninput=()=>{playing=false;t=parseInt(timeline.value)*D.dt;update()};addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});function anim(ts){requestAnimationFrame(anim);if(last===null)last=ts;const dt=Math.min(.05,(ts-last)/1000);last=ts;if(playing){t+=dt*speed;if(t>=D.steps*D.dt){t=D.steps*D.dt;playing=false}}update();ctl.update();renderer.render(scene,cam)}update();requestAnimationFrame(anim);
-</script></body></html>"""
-    html=html.replace('__MAX__',str(end_step)).replace('__DATA__',payload)
-    if out_path is None:
-        out_path=os.path.join(
-            TAG_REPLAY_DIR,
-            f'tag_replay_policy_{generation:06d}_bout_{sample_index:03d}.html',
-        )
-    Path(out_path).write_text(html,encoding='utf-8')
-    return out_path, html
 
 
 def tag_bout_filename(policy_number, bout_number):
@@ -4397,6 +3830,726 @@ def main(generations: int = N_GENERATIONS):
         with open(local_path, "w", encoding="utf-8") as f:
             f.write(html_content)
         print(f"手元のPCに本番リプレイを保存しました: {local_path}")
+
+
+# ============================================================
+# TAG CONFIG / OVERRIDES (standalone local tag only)
+# ============================================================
+
+TAG_SOLDIERS_PER_TEAM = 1
+
+
+def configure_tag_soldiers_per_team(n):
+    """Set the number of active chasers per team for standalone Tag training."""
+    global TAG_SOLDIERS_PER_TEAM
+    n = int(n)
+    if not 1 <= n <= N_SOLDIERS_PER_TEAM:
+        raise ValueError(
+            f"TAG_SOLDIERS_PER_TEAM must be between 1 and {N_SOLDIERS_PER_TEAM}, got {n}"
+        )
+    TAG_SOLDIERS_PER_TEAM = n
+
+
+def tag_role_indices(role):
+    """Return the N active chasers and the two relevant commanders."""
+    role = jnp.asarray(role, dtype=jnp.int32)
+    chaser_team = role
+    runner_team = 1 - chaser_team
+    start = jnp.where(
+        chaser_team == 0,
+        RED_SOLDIER_START,
+        BLUE_SOLDIER_START,
+    )
+    chaser_idx = start + jnp.arange(TAG_SOLDIERS_PER_TEAM, dtype=jnp.int32)
+    runner_cmd_idx = jnp.where(
+        runner_team == 0,
+        RED_COMMANDER_INDEX,
+        BLUE_COMMANDER_INDEX,
+    )
+    chaser_cmd_idx = jnp.where(
+        chaser_team == 0,
+        RED_COMMANDER_INDEX,
+        BLUE_COMMANDER_INDEX,
+    )
+    return chaser_team, runner_team, chaser_idx, runner_cmd_idx, chaser_cmd_idx
+
+
+def _tag_formation_offsets():
+    n = TAG_SOLDIERS_PER_TEAM
+    cols = max(1, int(np.ceil(np.sqrt(n))))
+    rows = int(np.ceil(n / cols))
+    idx = np.arange(n, dtype=np.float32)
+    c = idx % cols
+    r = np.floor(idx / cols)
+    ox = (c - (cols - 1) * 0.5) * 0.34
+    oz = (r - (rows - 1) * 0.5) * 0.34
+    return jnp.asarray(ox, dtype=jnp.float32), jnp.asarray(oz, dtype=jnp.float32)
+
+
+def reset_tag_one(key, role):
+    k1, k2, k3 = random.split(key, 3)
+    x = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    z = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    vx = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    vz = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    hp = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    alive = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    attack_timer = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    speed = jnp.zeros(N_UNITS, dtype=jnp.float32)
+
+    (
+        chaser_team,
+        runner_team,
+        chaser_idx,
+        runner_cmd_idx,
+        chaser_cmd_idx,
+    ) = tag_role_indices(role)
+
+    # Both commanders are present. Only the runner commander moves.
+    hp = hp.at[RED_COMMANDER_INDEX].set(0.30)
+    hp = hp.at[BLUE_COMMANDER_INDEX].set(0.30)
+    alive = alive.at[RED_COMMANDER_INDEX].set(1.0)
+    alive = alive.at[BLUE_COMMANDER_INDEX].set(1.0)
+
+    # Exactly N soldiers are active on the chasing team. The opposite team's
+    # soldier slots remain inactive, preserving the production observation shape.
+    ox, oz = _tag_formation_offsets()
+    chaser_x0 = jnp.where(chaser_team == 0, -6.0, 6.0)
+    chaser_z0 = random.uniform(k1, (), minval=-3.0, maxval=3.0)
+    runner_x = jnp.where(chaser_team == 0, 5.5, -5.5)
+    runner_z = random.uniform(k2, (), minval=-4.0, maxval=4.0)
+    own_cmd_x = jnp.where(chaser_team == 0, -5.8, 5.8)
+    own_cmd_z = random.uniform(k3, (), minval=-1.0, maxval=1.0)
+
+    # The formation is centered around the team's starting side and offset in z.
+    chaser_x = chaser_x0 + ox
+    chaser_z = chaser_z0 + oz
+
+    x = x.at[chaser_idx].set(chaser_x)
+    z = z.at[chaser_idx].set(chaser_z)
+    alive = alive.at[chaser_idx].set(1.0)
+    hp = hp.at[chaser_idx].set(1.0)
+    speed = speed.at[chaser_idx].set(TAG_CHASER_SPEED)
+
+    x = x.at[runner_cmd_idx].set(runner_x)
+    z = z.at[runner_cmd_idx].set(runner_z)
+    speed = speed.at[runner_cmd_idx].set(TAG_RUNNER_SPEED)
+
+    x = x.at[chaser_cmd_idx].set(own_cmd_x)
+    z = z.at[chaser_cmd_idx].set(own_cmd_z)
+    speed = speed.at[chaser_cmd_idx].set(0.0)
+
+    return {
+        "x": x,
+        "z": z,
+        "vx": vx,
+        "vz": vz,
+        "hp": hp,
+        "alive": alive,
+        "attack_timer": attack_timer,
+        "speed": speed,
+        "time": jnp.array(0.0, dtype=jnp.float32),
+        "done": jnp.array(False),
+    }
+
+
+reset_tag_parallel = jax.jit(jax.vmap(reset_tag_one, in_axes=(0, 0)))
+
+
+def reset_tag_batch(key, n):
+    keys = random.split(key, n)
+    roles = jnp.arange(n, dtype=jnp.int32) % 2
+    return reset_tag_parallel(keys, roles), roles
+
+
+def tag_local_frame(state, team, indices):
+    blue = jnp.asarray(team, dtype=jnp.float32) > 0.5
+    x = state["x"][indices]
+    z = state["z"][indices]
+    vx = state["vx"][indices]
+    vz = state["vz"][indices]
+    return (
+        jnp.where(blue, -x, x),
+        z,
+        jnp.where(blue, -vx, vx),
+        vz,
+        blue,
+    )
+
+
+def _tag_terrain_for_team(team):
+    base = tag_terrain.reshape(TERRAIN_RES, TERRAIN_RES)
+    blue = jnp.asarray(team, dtype=jnp.float32) > 0.5
+    return jnp.where(blue, base[:, ::-1], base).reshape(-1)
+
+
+def make_tag_soldier_features(state, role, terrain_local=None):
+    _, _, chaser_idx, runner_cmd_idx, chaser_cmd_idx = tag_role_indices(role)
+    lx, lz, lvx, lvz, blue = tag_local_frame(state, role, chaser_idx)
+
+    own_cmd_x = jnp.where(
+        blue,
+        -state["x"][chaser_cmd_idx],
+        state["x"][chaser_cmd_idx],
+    )
+    own_cmd_z = state["z"][chaser_cmd_idx]
+    enemy_cmd_x = jnp.where(
+        blue,
+        -state["x"][runner_cmd_idx],
+        state["x"][runner_cmd_idx],
+    )
+    enemy_cmd_z = state["z"][runner_cmd_idx]
+
+    base = jnp.stack([
+        lx / HALF_FIELD,
+        lz / HALF_FIELD,
+        lvx,
+        lvz,
+        state["hp"][chaser_idx],
+        jnp.ones_like(lx),
+        jnp.zeros_like(lx),
+        state["alive"][chaser_idx],
+    ], axis=-1)
+    nearest = relative_features(lx, lz, enemy_cmd_x, enemy_cmd_z)
+    own_cmd = relative_features(lx, lz, own_cmd_x, own_cmd_z)
+    enemy_cmd = relative_features(lx, lz, enemy_cmd_x, enemy_cmd_z)
+
+    if terrain_local is None:
+        terrain_local = _tag_terrain_for_team(role)
+    local_terrain = grid_8_features(lx, lz, terrain_local)
+    return jnp.concatenate([
+        base,
+        nearest,
+        own_cmd,
+        enemy_cmd,
+        local_terrain,
+    ], axis=-1)
+
+
+def make_tag_commander_features(state, role, terrain_local=None):
+    _, _, chaser_idx, runner_cmd_idx, _ = tag_role_indices(role)
+    lx, lz, lvx, lvz, blue = tag_local_frame(state, role, runner_cmd_idx)
+    nearest = jnp.sqrt(
+        jnp.min(
+            (jnp.where(blue, -state["x"][chaser_idx], state["x"][chaser_idx]) - lx) ** 2
+            + (state["z"][chaser_idx] - lz) ** 2
+        ) + 1e-8
+    )
+
+    if terrain_local is None:
+        terrain_local = _tag_terrain_for_team(role)
+    wall = commander_wall_features(lx, lz, terrain_local)
+    nearest_idx = jnp.argmin(
+        (jnp.where(blue, -state["x"][chaser_idx], state["x"][chaser_idx]) - lx) ** 2
+        + (state["z"][chaser_idx] - lz) ** 2
+    )
+    nearest_x = jnp.where(
+        blue,
+        -state["x"][chaser_idx[nearest_idx]],
+        state["x"][chaser_idx[nearest_idx]],
+    )
+    nearest_z = state["z"][chaser_idx[nearest_idx]]
+    nearest_features = relative_features(lx, lz, nearest_x, nearest_z)
+    base = jnp.stack([
+        lx / HALF_FIELD,
+        lz / HALF_FIELD,
+        lvx,
+        lvz,
+        state["hp"][runner_cmd_idx],
+        jnp.ones_like(lx),
+        jnp.ones_like(lx),
+        state["alive"][runner_cmd_idx],
+    ], axis=-1)
+    del nearest
+    return jnp.concatenate([base, nearest_features, wall], axis=-1)
+
+
+def tag_target_vectors(state, role):
+    chaser_team, runner_team, chaser_idx, runner_cmd_idx, _ = tag_role_indices(role)
+    chx = state["x"][chaser_idx]
+    chz = state["z"][chaser_idx]
+    rx = state["x"][runner_cmd_idx]
+    rz = state["z"][runner_cmd_idx]
+
+    # Soldier target in the chaser's local mirrored frame.
+    dx = rx - chx
+    dz = rz - chz
+    to_runner_x = jnp.where(chaser_team > 0, -dx, dx)
+    to_runner_z = dz
+    dist = jnp.sqrt(dx * dx + dz * dz + 1e-8)
+    target_chase = jnp.stack([to_runner_x, to_runner_z], axis=-1)
+    target_chase = target_chase / (jnp.linalg.norm(target_chase, axis=-1, keepdims=True) + 1e-8)
+
+    # Runner moves away from the nearest active chaser. Express the target in
+    # the runner commander's own local mirrored frame.
+    d2 = (chx - rx) ** 2 + (chz - rz) ** 2
+    nearest_i = jnp.argmin(d2)
+    nearest_x = chx[nearest_i]
+    nearest_z = chz[nearest_i]
+    away_x_world = rx - nearest_x
+    away_z_world = rz - nearest_z
+    runner_is_blue = runner_team > 0
+    away_x_local = jnp.where(runner_is_blue, -away_x_world, away_x_world)
+    target_run = jnp.array([away_x_local, away_z_world], dtype=jnp.float32)
+    target_run = target_run / (jnp.linalg.norm(target_run) + 1e-8)
+    return target_chase, target_run, dist
+
+
+def tag_update_loss(params, soldier_features, commander_features, target_chase, target_run, attack_target):
+    micro_s, micro_c = tag_micro_outputs(params, soldier_features, commander_features)
+    ps = jnp.tanh(micro_s[..., :2])
+    ps = ps / (jnp.linalg.norm(ps, axis=-1, keepdims=True) + 1e-8)
+    pc = jnp.tanh(micro_c)
+    pc = pc / (jnp.linalg.norm(pc, axis=-1, keepdims=True) + 1e-8)
+
+    chase_dir_loss = 1.0 - jnp.sum(ps * target_chase, axis=-1)
+    run_dir_loss = 1.0 - jnp.sum(pc * target_run, axis=-1)
+    attack_logit = micro_s[..., 2]
+    attack_target = attack_target.astype(jnp.float32)
+    attack_bce = (
+        jnp.maximum(attack_logit, 0.0)
+        - attack_logit * attack_target
+        + jnp.log1p(jnp.exp(-jnp.abs(attack_logit)))
+    )
+
+    loss = (
+        jnp.mean(chase_dir_loss)
+        + jnp.mean(run_dir_loss)
+        + 0.25 * jnp.mean(attack_bce)
+    )
+    return loss, {
+        "tag_loss": loss,
+        "tag_chase_loss": jnp.mean(chase_dir_loss),
+        "tag_run_loss": jnp.mean(run_dir_loss),
+        "tag_attack_loss": jnp.mean(attack_bce),
+    }
+
+
+@jax.jit
+def tag_micro_local_action(params, soldier_features, commander_features):
+    micro_s, micro_c = tag_micro_outputs(params, soldier_features, commander_features)
+    s_vec = jnp.tanh(micro_s[..., :2])
+    s_vec = s_vec / (jnp.linalg.norm(s_vec, axis=-1, keepdims=True) + 1e-8)
+    c_vec = jnp.tanh(micro_c)
+    c_vec = c_vec / (jnp.linalg.norm(c_vec, axis=-1, keepdims=True) + 1e-8)
+    attack = (jax.nn.sigmoid(micro_s[..., 2]) >= 0.5).astype(jnp.float32)
+    return s_vec[..., 0], s_vec[..., 1], attack, c_vec[..., 0], c_vec[..., 1]
+
+
+def tag_step_one(state, role, chaser_dx, chaser_dz, chaser_attack, runner_dx, runner_dz):
+    _, _, chaser_idx, runner_cmd_idx, _ = tag_role_indices(role)
+    x, z = state["x"], state["z"]
+    chx, chz = x[chaser_idx], z[chaser_idx]
+    rx, rz = x[runner_cmd_idx], z[runner_cmd_idx]
+
+    old_dist = jnp.sqrt((rx - chx) ** 2 + (rz - chz) ** 2 + 1e-8)
+    ch_nx = chx + chaser_dx * TAG_CHASER_SPEED * DT
+    ch_nz = chz + chaser_dz * TAG_CHASER_SPEED * DT
+    r_nx = rx + runner_dx * TAG_RUNNER_SPEED * DT
+    r_nz = rz + runner_dz * TAG_RUNNER_SPEED * DT
+
+    ch_inside = (
+        (ch_nx >= -HALF_FIELD + SOLDIER_RADIUS)
+        & (ch_nx <= HALF_FIELD - SOLDIER_RADIUS)
+        & (ch_nz >= -HALF_FIELD + SOLDIER_RADIUS)
+        & (ch_nz <= HALF_FIELD - SOLDIER_RADIUS)
+    )
+    r_inside = (
+        (r_nx >= -HALF_FIELD + COMMANDER_RADIUS)
+        & (r_nx <= HALF_FIELD - COMMANDER_RADIUS)
+        & (r_nz >= -HALF_FIELD + COMMANDER_RADIUS)
+        & (r_nz <= HALF_FIELD - COMMANDER_RADIUS)
+    )
+    ch_blocked = jax.vmap(lambda px, pz: tag_wall_blocked(px, pz, SOLDIER_RADIUS))(ch_nx, ch_nz)
+    r_blocked = tag_wall_blocked(r_nx, r_nz, COMMANDER_RADIUS)
+    ch_valid = ch_inside & (~ch_blocked)
+    r_valid = r_inside & (~r_blocked)
+
+    ch_nx = jnp.where(ch_valid, ch_nx, chx)
+    ch_nz = jnp.where(ch_valid, ch_nz, chz)
+    r_nx = jnp.where(r_valid, r_nx, rx)
+    r_nz = jnp.where(r_valid, r_nz, rz)
+
+    new_dist = jnp.sqrt((r_nx - ch_nx) ** 2 + (r_nz - ch_nz) ** 2 + 1e-8)
+    captured = jnp.any(new_dist <= ATTACK_RANGE)
+    new_time = state["time"] + DT
+    timeout = new_time >= TAG_MAX_STEPS * DT
+    done = captured | timeout
+
+    nx = x.at[chaser_idx].set(ch_nx)
+    nz = z.at[chaser_idx].set(ch_nz)
+    nx = nx.at[runner_cmd_idx].set(r_nx)
+    nz = nz.at[runner_cmd_idx].set(r_nz)
+    nvx = state["vx"].at[chaser_idx].set(jnp.where(ch_valid, chaser_dx, 0.0))
+    nvz = state["vz"].at[chaser_idx].set(jnp.where(ch_valid, chaser_dz, 0.0))
+    nvx = nvx.at[runner_cmd_idx].set(jnp.where(r_valid, runner_dx, 0.0))
+    nvz = nvz.at[runner_cmd_idx].set(jnp.where(r_valid, runner_dz, 0.0))
+
+    progress = jnp.mean(old_dist - new_dist)
+    reward_chaser = TAG_STEP_PENALTY + TAG_CAPTURE_REWARD * captured.astype(jnp.float32) + 0.05 * progress
+    reward_runner = TAG_STEP_PENALTY + TAG_RUNNER_CAPTURE_REWARD * captured.astype(jnp.float32) - 0.05 * progress
+
+    next_state = {
+        **state,
+        "x": nx,
+        "z": nz,
+        "vx": nvx,
+        "vz": nvz,
+        "time": new_time,
+        "done": done,
+    }
+    return next_state, reward_chaser, reward_runner, done, captured
+
+
+@jax.jit
+def tag_rollout_step(params, states, roles):
+    soldier_features = jax.vmap(make_tag_soldier_features)(states, roles)
+    commander_features = jax.vmap(make_tag_commander_features)(states, roles)
+    target_chase, target_run, dist_now = jax.vmap(tag_target_vectors)(states, roles)
+    attack_target = (dist_now <= ATTACK_RANGE).astype(jnp.float32)
+    return soldier_features, commander_features, target_chase, target_run, attack_target
+
+
+def train_tag_game(params, key, steps=TAG_UPDATES_PER_RUN):
+    states, roles = reset_tag_batch(key, TAG_BATCH_SIZE)
+    opt_state = tag_optimizer.init(params)
+    metrics_list = []
+    captures = []
+    for _ in range(int(steps)):
+        key, reset_key = random.split(key)
+        soldier_features, commander_features, target_chase, target_run, attack_target = tag_rollout_step(
+            params, states, roles
+        )
+        params, opt_state, metrics = tag_update_minibatch(
+            params, opt_state,
+            soldier_features, commander_features,
+            target_chase, target_run, attack_target,
+        )
+        sdx, sdz, sat, cdx, cdz = tag_micro_local_action(
+            params, soldier_features, commander_features
+        )
+        states, _, _, done, captured = jax.vmap(tag_step_one)(
+            states, roles, sdx, sdz, sat, cdx, cdz
+        )
+        fresh = reset_tag_parallel(random.split(reset_key, TAG_BATCH_SIZE), roles)
+        def merge(old, new):
+            mask = done if old.ndim == 1 else done.reshape((TAG_BATCH_SIZE,) + (1,) * (old.ndim - 1))
+            return jnp.where(mask, new, old)
+        states = jax.tree_util.tree_map(merge, states, fresh)
+        metrics_list.append({k: float(v) for k, v in metrics.items()})
+        captures.append(int(jnp.sum(captured)))
+
+    if not metrics_list:
+        raise ValueError("TAG updates must be at least 1")
+    metrics = {
+        k: float(np.mean([m[k] for m in metrics_list]))
+        for k in metrics_list[0]
+    }
+    metrics["tag_captures"] = int(sum(captures))
+    metrics["tag_batch"] = TAG_BATCH_SIZE
+    metrics["tag_updates"] = int(steps)
+    return params, key, metrics
+
+
+def record_tag_bout(params, initial_state=None, role=0, rng_key=None):
+    if initial_state is None:
+        if rng_key is None:
+            rng_key = random.PRNGKey(20260917)
+        initial_state = reset_tag_one(rng_key, jnp.array(role, dtype=jnp.int32))
+
+    role_j = jnp.array(role, dtype=jnp.int32)
+    _, _, chaser_idx, runner_cmd_idx, _ = tag_role_indices(role_j)
+    chaser_idx_np = np.asarray(chaser_idx)
+    state = initial_state
+    chaser_x = [np.asarray(state["x"])[chaser_idx_np]]
+    chaser_z = [np.asarray(state["z"])[chaser_idx_np]]
+    runner_x = [float(np.asarray(state["x"])[int(runner_cmd_idx)])]
+    runner_z = [float(np.asarray(state["z"])[int(runner_cmd_idx)])]
+    chaser_actions = []
+    runner_actions = []
+    winner_code = 0
+
+    for _ in range(TAG_MAX_STEPS):
+        sf = make_tag_soldier_features(state, role_j)[None, ...]
+        cf = make_tag_commander_features(state, role_j)[None, ...]
+        sdx, sdz, sat, cdx, cdz = tag_micro_local_action(params, sf, cf)
+        sdx_np = np.asarray(sdx[0])
+        sdz_np = np.asarray(sdz[0])
+        sat_np = np.asarray(sat[0])
+        cdx_f = float(np.asarray(cdx[0]))
+        cdz_f = float(np.asarray(cdz[0]))
+        chaser_actions.append(np.stack([sdx_np, sdz_np, sat_np], axis=-1))
+        runner_actions.append([cdx_f, cdz_f])
+        state, _, _, done, captured = tag_step_one(
+            state,
+            role_j,
+            jnp.asarray(sdx_np, dtype=jnp.float32),
+            jnp.asarray(sdz_np, dtype=jnp.float32),
+            jnp.asarray(sat_np, dtype=jnp.float32),
+            jnp.array(cdx_f, dtype=jnp.float32),
+            jnp.array(cdz_f, dtype=jnp.float32),
+        )
+        chaser_x.append(np.asarray(state["x"])[chaser_idx_np])
+        chaser_z.append(np.asarray(state["z"])[chaser_idx_np])
+        runner_x.append(float(np.asarray(state["x"])[int(runner_cmd_idx)]))
+        runner_z.append(float(np.asarray(state["z"])[int(runner_cmd_idx)]))
+        if bool(done):
+            winner_code = 1 if bool(captured) else 3
+            break
+
+    return {
+        "generation": -1,
+        "role": int(role),
+        "chaser_team": int(role),
+        "runner_team": int(1 - role),
+        "tag_soldiers_per_team": int(TAG_SOLDIERS_PER_TEAM),
+        "winner_code": int(winner_code),
+        "chaser_x": np.asarray(chaser_x, dtype=np.float32),
+        "chaser_z": np.asarray(chaser_z, dtype=np.float32),
+        "runner_x": np.asarray(runner_x, dtype=np.float32),
+        "runner_z": np.asarray(runner_z, dtype=np.float32),
+        "chaser_actions": np.asarray(chaser_actions, dtype=np.float32),
+        "runner_actions": np.asarray(runner_actions, dtype=np.float32),
+        "end_step": len(chaser_actions),
+        "dt": DT,
+        "field_size": FIELD_SIZE,
+        "terrain_res": TERRAIN_RES,
+        "tag_walls": TAG_WALL_LIST,
+    }
+
+
+def verify_tag_bout(initial_state, role, chaser_actions, runner_actions):
+    role_j = jnp.array(role, dtype=jnp.int32)
+    _, _, chaser_idx, runner_cmd_idx, _ = tag_role_indices(role_j)
+    chaser_idx_np = np.asarray(chaser_idx)
+    runner_idx = int(runner_cmd_idx)
+    state = initial_state
+    cx = [np.asarray(state["x"])[chaser_idx_np]]
+    cz = [np.asarray(state["z"])[chaser_idx_np]]
+    rx = [float(np.asarray(state["x"])[runner_idx])]
+    rz = [float(np.asarray(state["z"])[runner_idx])]
+    for i in range(len(chaser_actions)):
+        ca = chaser_actions[i]
+        ra = runner_actions[i]
+        state, _, _, _, _ = tag_step_one(
+            state,
+            role_j,
+            jnp.asarray(ca[:, 0], dtype=jnp.float32),
+            jnp.asarray(ca[:, 1], dtype=jnp.float32),
+            jnp.asarray(ca[:, 2], dtype=jnp.float32),
+            jnp.array(ra[0], dtype=jnp.float32),
+            jnp.array(ra[1], dtype=jnp.float32),
+        )
+        cx.append(np.asarray(state["x"])[chaser_idx_np])
+        cz.append(np.asarray(state["z"])[chaser_idx_np])
+        rx.append(float(np.asarray(state["x"])[runner_idx]))
+        rz.append(float(np.asarray(state["z"])[runner_idx]))
+    return np.asarray(cx, dtype=np.float32), np.asarray(cz, dtype=np.float32), np.asarray(rx, dtype=np.float32), np.asarray(rz, dtype=np.float32)
+
+
+def save_tag_bout(path, generation, bout, verification_pass=True, max_state_error=0.0):
+    np.savez_compressed(
+        path,
+        generation=np.array(generation, dtype=np.int32),
+        sample_index=np.array(int(bout.get("sample_index", 0)), dtype=np.int32),
+        role=np.array(bout["role"], dtype=np.int32),
+        chaser_team=np.array(bout["chaser_team"], dtype=np.int32),
+        runner_team=np.array(bout["runner_team"], dtype=np.int32),
+        tag_soldiers_per_team=np.array(bout["tag_soldiers_per_team"], dtype=np.int32),
+        winner_code=np.array(bout["winner_code"], dtype=np.int32),
+        end_step=np.array(bout["end_step"], dtype=np.int32),
+        dt=np.array(bout["dt"], dtype=np.float32),
+        field_size=np.array(bout["field_size"], dtype=np.float32),
+        terrain_res=np.array(bout["terrain_res"], dtype=np.int32),
+        tag_walls=np.asarray(bout["tag_walls"], dtype=np.float32).reshape((-1, 2)),
+        verification_pass=np.array(1 if verification_pass else 0, dtype=np.int32),
+        max_state_error=np.array(max_state_error, dtype=np.float32),
+        chaser_x=bout["chaser_x"],
+        chaser_z=bout["chaser_z"],
+        runner_x=bout["runner_x"],
+        runner_z=bout["runner_z"],
+        chaser_actions=bout["chaser_actions"],
+        runner_actions=bout["runner_actions"],
+    )
+    return path
+
+
+def build_tag_replay_html(path, out_path=None):
+    d = np.load(path, allow_pickle=False)
+    generation = int(d["generation"])
+    sample_index = int(d["sample_index"]) if "sample_index" in d else 0
+    chaser_team = int(d["chaser_team"]) if "chaser_team" in d else int(d["role"])
+    runner_team = int(d["runner_team"]) if "runner_team" in d else 1 - chaser_team
+    winner_code = int(d["winner_code"])
+    end_step = int(d["end_step"])
+    dt = float(d["dt"])
+    field_size = float(d["field_size"])
+    walls_data = d["tag_walls"].astype(np.float32).tolist()
+    if "chaser_x" in d:
+        n_soldiers = int(d["tag_soldiers_per_team"]) if "tag_soldiers_per_team" in d else 1
+        chx = d["chaser_x"].astype(np.float32)
+        chz = d["chaser_z"].astype(np.float32)
+        rx = d["runner_x"].astype(np.float32)
+        rz = d["runner_z"].astype(np.float32)
+        ca = d["chaser_actions"].astype(np.float32)
+    else:
+        # Backward compatibility with the old single-chaser format.
+        n_soldiers = 1
+        role_legacy = int(d["role"])
+        full_x = d["x"].astype(np.float32)
+        full_z = d["z"].astype(np.float32)
+        if role_legacy == 0:
+            ch_index, runner_index = RED_SOLDIER_START, BLUE_COMMANDER_INDEX
+        else:
+            ch_index, runner_index = BLUE_SOLDIER_START, RED_COMMANDER_INDEX
+        chx = full_x[:, [ch_index]]
+        chz = full_z[:, [ch_index]]
+        rx = full_x[:, runner_index]
+        rz = full_z[:, runner_index]
+        ca = d["chaser_actions"].astype(np.float32)[:, None, :]
+    verification_pass = bool(int(d["verification_pass"])) if "verification_pass" in d else True
+    max_state_error = float(d["max_state_error"]) if "max_state_error" in d else 0.0
+    result_text = "CAUGHT" if winner_code == 1 else "TIMEOUT"
+    payload = json.dumps({
+        "generation": generation,
+        "sampleIndex": sample_index,
+        "chaserTeam": "Red" if chaser_team == 0 else "Blue",
+        "runnerTeam": "Red" if runner_team == 0 else "Blue",
+        "soldiers": n_soldiers,
+        "winner": result_text,
+        "steps": end_step,
+        "dt": dt,
+        "fieldSize": field_size,
+        "walls": walls_data,
+        "chaserX": np.round(chx, 4).tolist(),
+        "chaserZ": np.round(chz, 4).tolist(),
+        "runnerX": np.round(rx, 4).tolist(),
+        "runnerZ": np.round(rz, 4).tolist(),
+        "chaserActions": np.round(ca, 3).tolist(),
+        "attackRange": float(ATTACK_RANGE),
+        "verificationPass": verification_pass,
+        "maxStateError": max_state_error,
+    }, separators=(",", ":"))
+
+    html = r'''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RTS Tag Replay</title><style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#101010;font-family:Arial,Helvetica,sans-serif}#info{position:absolute;left:14px;top:14px;z-index:10;padding:12px 15px;background:rgba(0,0,0,.74);color:#fff;border-radius:8px;line-height:1.5;font-size:14px}#controls{position:absolute;left:14px;bottom:14px;z-index:10;padding:10px 12px;background:rgba(0,0,0,.74);border-radius:8px;color:#fff}button{margin-right:5px;padding:5px 9px;border:0;border-radius:4px;cursor:pointer}#timeline{width:440px;max-width:45vw}.ok{color:#5fd97a;font-weight:bold}
+</style></head><body><div id="info"></div><div id="controls"><button id="play">Play</button><button id="pause">Pause</button><button id="reset">Reset</button><button data-speed="0.5">0.5x</button><button data-speed="1">1x</button><button data-speed="2">2x</button><br><br><input id="timeline" type="range" min="0" max="__MAX__" value="0" step="1"><span id="status"></span></div><script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}</script><script type="module">
+import * as THREE from 'three';import {OrbitControls} from 'three/addons/controls/OrbitControls.js';const D=__DATA__;const info=document.getElementById('info'),timeline=document.getElementById('timeline'),status=document.getElementById('status');let t=0,playing=false,speed=1,last=null;const scene=new THREE.Scene();scene.background=new THREE.Color(0x101010);const cam=new THREE.PerspectiveCamera(45,innerWidth/innerHeight,.1,250);cam.position.set(0,18,17);const renderer=new THREE.WebGLRenderer({antialias:true});renderer.setPixelRatio(Math.min(devicePixelRatio||1,2));renderer.setSize(innerWidth,innerHeight);document.body.appendChild(renderer.domElement);const ctl=new OrbitControls(cam,renderer.domElement);ctl.target.set(0,0,0);ctl.update();scene.add(new THREE.HemisphereLight(0xffffff,0x444444,2));const dl=new THREE.DirectionalLight(0xffffff,1.2);dl.position.set(6,14,8);scene.add(dl);const half=D.fieldSize/2;const ground=new THREE.Mesh(new THREE.PlaneGeometry(D.fieldSize,D.fieldSize),new THREE.MeshStandardMaterial({color:0x303030}));ground.rotation.x=-Math.PI/2;scene.add(ground);scene.add(new THREE.GridHelper(D.fieldSize,D.fieldSize,0x777777,0x444444));for(const p of D.walls){const w=new THREE.Mesh(new THREE.BoxGeometry(1,.7,1),new THREE.MeshStandardMaterial({color:0x777777}));w.position.set(p[0],.35,p[1]);scene.add(w)}const chMat=new THREE.MeshStandardMaterial({color:D.chaserTeam===0?0xd94b4b:0x4b7bd9}),runMat=new THREE.MeshStandardMaterial({color:D.runnerTeam===0?0xd94b4b:0x4b7bd9});const ch=[];for(let k=0;k<D.soldiers;k++){const m=new THREE.Mesh(new THREE.SphereGeometry(.17,16,16),chMat);m.position.y=.17;scene.add(m);ch.push(m)}const runner=new THREE.Mesh(new THREE.BoxGeometry(.44,.8,.44),runMat);runner.position.y=.4;scene.add(runner);function frame(){const raw=t/D.dt,i=Math.min(Math.floor(raw),D.steps),a=i>=D.steps?0:raw-i;return{i,a}}function update(){const f=frame(),i=f.i,a=f.a;for(let k=0;k<D.soldiers;k++){const x0=D.chaserX[i][k],z0=D.chaserZ[i][k],x1=i<D.steps?D.chaserX[i+1][k]:x0,z1=i<D.steps?D.chaserZ[i+1][k]:z0;ch[k].position.set(x0+(x1-x0)*a,.17,z0+(z1-z0)*a)}const rx0=D.runnerX[i],rz0=D.runnerZ[i],rx1=i<D.steps?D.runnerX[i+1]:rx0,rz1=i<D.steps?D.runnerZ[i+1]:rz0;runner.position.set(rx0+(rx1-rx0)*a,.4,rz0+(rz1-rz0)*a);const minD=Math.min(...ch.map((m)=>Math.hypot(m.position.x-runner.position.x,m.position.z-runner.position.z)));timeline.value=String(i);info.innerHTML='<b>Tag policy '+D.generation+'</b><br>Chaser: <b>'+D.chaserTeam+'</b> ('+D.soldiers+' soldiers)<br>Runner: <b>'+D.runnerTeam+' Commander</b><br>Time: '+(i*D.dt).toFixed(2)+' s<br>Nearest distance: '+minD.toFixed(3)+'<br>Result: <b>'+D.winner+'</b><br>'+((D.verificationPass)?'<span class="ok">Replay verification: PASS</span>':'<span style="color:#ff6a6a;font-weight:bold">Replay verification: FAIL ('+D.maxStateError.toExponential(2)+')</span>');status.textContent='Tag Replay | '+(i*D.dt).toFixed(2)+' s'}document.getElementById('play').onclick=()=>playing=true;document.getElementById('pause').onclick=()=>playing=false;document.getElementById('reset').onclick=()=>{playing=false;t=0;update()};document.querySelectorAll('button[data-speed]').forEach(b=>b.onclick=()=>speed=parseFloat(b.dataset.speed));timeline.oninput=()=>{playing=false;t=parseInt(timeline.value)*D.dt;update()};addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});function anim(ts){requestAnimationFrame(anim);if(last===null)last=ts;const dt=Math.min(.05,(ts-last)/1000);last=ts;if(playing){t+=dt*speed;if(t>=D.steps*D.dt){t=D.steps*D.dt;playing=false}}update();ctl.update();renderer.render(scene,cam)}update();requestAnimationFrame(anim);
+</script></body></html>'''
+    html = html.replace("__MAX__", str(end_step)).replace("__DATA__", payload)
+    if out_path is None:
+        out_path = os.path.join(
+            TAG_REPLAY_DIR,
+            f"tag_replay_policy_{generation:06d}_bout_{sample_index:03d}.html",
+        )
+    Path(out_path).write_text(html, encoding="utf-8")
+    return out_path, html
+
+
+def run_tag_training(n_updates=TAG_UPDATES_PER_RUN, resume=True):
+    """Standalone Tag training. No HTML replay is generated here."""
+    if n_updates < 1:
+        raise ValueError("n_updates must be >= 1")
+
+    production_elite = find_latest_elite()
+    if production_elite is None:
+        key, ik = random.split(random.key(int(time.time()) & 0x7FFFFFFF))
+        params0 = init_policy(ik)
+        production_elite = save_params(
+            os.path.join(ELITE_DIR, "generation_0000.npz"),
+            params0,
+            {
+                "generation": 0,
+                "source": "random_init_for_tag_training",
+                "raw_obs_size": RAW_OBS_SIZE,
+                "global_input_size": GLOBAL_INPUT_SIZE,
+            },
+        )
+
+    start_path, start_source = choose_tag_seed_policy(production_elite)
+    params, _ = load_params(start_path)
+    master_key = random.key(int(time.time()) & 0x7FFFFFFF)
+    master_key, tag_key = random.split(master_key)
+
+    print()
+    print("============================================")
+    print("STANDALONE TAG TRAINING")
+    print("============================================")
+    print(f"Starting policy      : {os.path.basename(start_path)} ({start_source})")
+    print(f"Soldiers per team    : {TAG_SOLDIERS_PER_TEAM}")
+    print(f"Updates              : {n_updates}")
+    print(f"Batch                : {TAG_BATCH_SIZE}")
+    print(f"Field                : {FIELD_SIZE} x {FIELD_SIZE}")
+    print(f"Walls                : {len(TAG_WALL_LIST)}")
+    print(f"Chaser speed         : {TAG_CHASER_SPEED:.3f}")
+    print(f"Runner speed         : {TAG_RUNNER_SPEED:.3f}")
+    print(f"Max tag time         : {TAG_MAX_STEPS * DT:.1f} s")
+    print("Updated parameters   : Soldier/Commander Encoders + Micro heads")
+    print("Replay HTML          : only generated by an explicit --replay command")
+    print()
+
+    t0 = time.time()
+    params, tag_key, metrics = train_tag_game(params, tag_key, steps=int(n_updates))
+    elapsed = time.time() - t0
+
+    existing = find_latest_tag_policy()
+    next_number = tag_policy_number(existing) + 1 if existing else 1
+    tag_policy_path = os.path.join(TAG_ELITE_DIR, f"tag_policy_{next_number:06d}.npz")
+    save_params(
+        tag_policy_path,
+        params,
+        {
+            "source": "standalone_tag_training",
+            "source_policy": os.path.abspath(start_path),
+            "tag_updates": int(n_updates),
+            "tag_batch": TAG_BATCH_SIZE,
+            "tag_soldiers_per_team": int(TAG_SOLDIERS_PER_TEAM),
+            "tag_walls": TAG_WALL_LIST,
+        },
+    )
+
+    print(
+        f"Tag training done     | loss {metrics['tag_loss']:.4f} "
+        f"chase {metrics['tag_chase_loss']:.4f} "
+        f"run {metrics['tag_run_loss']:.4f} "
+        f"attack {metrics['tag_attack_loss']:.4f} "
+        f"grad {metrics['tag_grad_norm']:.3e} "
+        f"captures {metrics['tag_captures']} "
+        f"time {elapsed:.1f} s"
+    )
+    print(f"Tag policy saved      : {tag_policy_path}")
+
+    # Save raw episode data only. HTML is intentionally created later by --replay.
+    for sample_index in range(TAG_REPLAY_SAMPLES_PER_RUN):
+        master_key, episode_key = random.split(master_key)
+        role = int(sample_index % 2)
+        tag_init = reset_tag_one(episode_key, jnp.array(role, dtype=jnp.int32))
+        tag_bout = record_tag_bout(params, tag_init, role=role)
+        tag_bout["sample_index"] = sample_index
+        cx, cz, rx, rz = verify_tag_bout(
+            tag_init, role, tag_bout["chaser_actions"], tag_bout["runner_actions"]
+        )
+        max_err = float(max(
+            np.max(np.abs(cx - tag_bout["chaser_x"])),
+            np.max(np.abs(cz - tag_bout["chaser_z"])),
+            np.max(np.abs(rx - tag_bout["runner_x"])),
+            np.max(np.abs(rz - tag_bout["runner_z"])),
+        ))
+        verify_pass = max_err < 1e-6
+        save_tag_bout(
+            os.path.join(
+                TAG_BOUT_DIR,
+                f"tag_policy_{next_number:06d}_bout_{sample_index:03d}.npz",
+            ),
+            int(next_number),
+            tag_bout,
+            verify_pass,
+            max_err,
+        )
+
+    print(f"Raw Tag bouts saved   : {TAG_REPLAY_SAMPLES_PER_RUN}")
+    print("No Tag HTML replay generated during training.")
+    return tag_policy_path, None
 
 
 def _run_local_cli():
