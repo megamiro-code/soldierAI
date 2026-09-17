@@ -4271,6 +4271,100 @@ def show_tag_replay(policy_number=None, bout_number=None):
     return out_path
 
 
+
+# ============================================================
+# LOCAL PRODUCTION REPLAY
+# ============================================================
+
+LOCAL_REPLAY_BASE_DIR = os.path.abspath(os.path.join(os.getcwd(), "PPO_RTS"))
+LOCAL_REPLAY_BOUT_DIR = os.path.join(LOCAL_REPLAY_BASE_DIR, "elite_bouts")
+LOCAL_REPLAY_HTML_DIR = os.path.join(LOCAL_REPLAY_BASE_DIR, "replay")
+os.makedirs(LOCAL_REPLAY_BOUT_DIR, exist_ok=True)
+os.makedirs(LOCAL_REPLAY_HTML_DIR, exist_ok=True)
+
+
+def _production_replay_name(generation):
+    return f"generation_{int(generation):04d}_best_bout.npz"
+
+
+def _list_remote_production_replays():
+    """List production Best Bout files stored in the Modal Volume."""
+    remote_volume = modal.Volume.from_name("rts-storage")
+    entries = remote_volume.iterdir("/PPO_RTS/elite_bouts", recursive=False)
+    files = []
+    pattern = re.compile(r"generation_(\d+)_best_bout\.npz$")
+    for entry in entries:
+        name = os.path.basename(str(entry.path))
+        m = pattern.fullmatch(name)
+        if m:
+            files.append((int(m.group(1)), str(entry.path)))
+    return sorted(files, key=lambda x: x[0])
+
+
+def _download_volume_file(remote_path, local_path):
+    """Download exactly one file from the production Modal Volume."""
+    remote_volume = modal.Volume.from_name("rts-storage")
+    os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+    with open(local_path, "wb") as f:
+        for chunk in remote_volume.read_file(remote_path):
+            f.write(chunk)
+    return local_path
+
+
+def replay_production_locally(generation=None):
+    """Fetch one production Best Bout from Modal Volume and open a local HTML replay.
+
+    generation=None means the newest generation currently stored in the remote Volume.
+    Only the selected .npz file is downloaded; the Volume is never copied wholesale.
+    """
+    remote_files = _list_remote_production_replays()
+    if not remote_files:
+        raise FileNotFoundError(
+            "No production Best Bout found in Modal Volume: /PPO_RTS/elite_bouts"
+        )
+
+    if generation is None:
+        selected_generation, remote_path = remote_files[-1]
+    else:
+        selected_generation = int(generation)
+        expected_name = _production_replay_name(selected_generation)
+        matches = [
+            (g, p) for g, p in remote_files
+            if g == selected_generation
+        ]
+        if not matches:
+            raise FileNotFoundError(
+                f"Generation {selected_generation} Best Bout was not found in the Modal Volume. "
+                f"Latest available generation is {remote_files[-1][0]}."
+            )
+        selected_generation, remote_path = matches[0]
+
+    local_npz = os.path.join(
+        LOCAL_REPLAY_BOUT_DIR,
+        _production_replay_name(selected_generation),
+    )
+    local_html = os.path.join(
+        LOCAL_REPLAY_HTML_DIR,
+        f"replay_generation_{selected_generation:04d}.html",
+    )
+
+    print(f"Downloading production replay: generation {selected_generation}")
+    print(f"  Remote : {remote_path}")
+    print(f"  Local  : {local_npz}")
+    _download_volume_file(remote_path, local_npz)
+
+    out_path, _html = build_replay_html(local_npz, out_path=local_html)
+    print(f"Local replay written: {os.path.abspath(out_path)}")
+
+    try:
+        webbrowser.open(Path(out_path).resolve().as_uri())
+        print("Opened the replay in the default browser.")
+    except Exception as exc:
+        print(f"Browser auto-open skipped: {exc}")
+        print(f"Open manually: {os.path.abspath(out_path)}")
+
+    return out_path
+
 # ============================================================
 # ENTRY POINT : PRODUCTION RTS ONLY
 # ============================================================
@@ -4303,3 +4397,42 @@ def main(generations: int = N_GENERATIONS):
         with open(local_path, "w", encoding="utf-8") as f:
             f.write(html_content)
         print(f"手元のPCに本番リプレイを保存しました: {local_path}")
+
+
+def _run_local_cli():
+    """Local-only utilities. This path is used by `python main.py ...`, not Modal."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Local utilities for the production RTS replay."
+    )
+    parser.add_argument(
+        "--replay",
+        nargs="?",
+        const="latest",
+        default=None,
+        help=(
+            "Download and open a production Best Bout locally. "
+            "With no value, fetch the latest generation; with a number, fetch that generation."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.replay is None:
+        parser.print_help()
+        return
+
+    if args.replay == "latest":
+        replay_production_locally(None)
+    else:
+        try:
+            generation = int(args.replay)
+        except ValueError as exc:
+            raise SystemExit(
+                f"--replay expects a generation number or no value; got {args.replay!r}"
+            ) from exc
+        replay_production_locally(generation)
+
+
+if __name__ == "__main__":
+    _run_local_cli()
