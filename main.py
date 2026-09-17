@@ -36,6 +36,7 @@ print("Devices     :", jax.devices())
 # スクリプト（a.txtなど）が存在するディレクトリの絶対パスを取得
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
 # どこから実行しても、必ずスクリプトと同じ階層（soldierAIの中）にPPO_RTSを作る
 BASE_DIR = os.environ.get("RTS_BASE_DIR", "/data/PPO_RTS")
 
