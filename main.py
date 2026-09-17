@@ -8,6 +8,9 @@ import glob
 import json
 import time
 import functools
+import argparse
+import re
+from pathlib import Path
 import numpy as np
 
 import jax
@@ -44,8 +47,14 @@ CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
 ELITE_DIR = os.path.join(BASE_DIR, "elite")
 BOUT_DIR = os.path.join(BASE_DIR, "elite_bouts")
 REPLAY_DIR = os.path.join(BASE_DIR, "replay")
+TAG_ELITE_DIR = os.path.join(BASE_DIR, "tag_elite")
+TAG_BOUT_DIR = os.path.join(BASE_DIR, "tag_bouts")
+TAG_REPLAY_DIR = os.path.join(BASE_DIR, "tag_replay")
 
-for d in (CHECKPOINT_DIR, ELITE_DIR, BOUT_DIR, REPLAY_DIR):
+for d in (
+    CHECKPOINT_DIR, ELITE_DIR, BOUT_DIR, REPLAY_DIR,
+    TAG_ELITE_DIR, TAG_BOUT_DIR, TAG_REPLAY_DIR,
+):
     os.makedirs(d, exist_ok=True)
 
 # ============================================================
@@ -86,7 +95,8 @@ TERRAIN_SIZE = TERRAIN_RES * TERRAIN_RES
 #   nearest enemy: distance, sin(theta), cos(theta)     = 3
 #   own commander: distance, sin(theta), cos(theta)     = 3
 #   enemy commander: distance, sin(theta), cos(theta)   = 3
-#   total = 17
+#   adjacent 8 terrain cells                            = 8
+#   total = 25
 #
 # Commander:
 #   x, z, vx, vz, hp, own, commander_flag, alive       = 8
@@ -94,14 +104,14 @@ TERRAIN_SIZE = TERRAIN_RES * TERRAIN_RES
 #   surrounding 8 cells: wall / not wall                = 8
 #   total = 19
 #
-# Raw observation = terrain + 200*17 + 2*19 = 3694
+# Raw observation = terrain + 200*25 + 2*19 = 5294
 # Hierarchical encoder output = terrain + 200*64 + 2*64 = 13184
 # Self-attention is applied independently to each team's 100 soldiers,
 # preserving the 100-action symmetry while keeping both teams' embeddings.
 # The policy observes all 200 soldiers (100 own + 100 enemy).
 # ------------------------------------------------------------
 
-SOLDIER_FEATURES = 17
+SOLDIER_FEATURES = 25
 COMMANDER_FEATURES = 19
 LOCAL_EMBED_SIZE = 64
 LOCAL_HIDDEN_SIZE = 64
@@ -158,9 +168,22 @@ ALL_SOLDIER_INDICES = jnp.arange(RED_SOLDIER_START, BLUE_SOLDIER_END)
 ALL_UNIT_INDICES = jnp.arange(N_UNITS)
 
 WALL_LIST = [
+    # Production RTS walls: e.g. (-2.0, 0.0), (0.0, 2.0)
 ]
 
 walls = jnp.asarray(WALL_LIST, dtype=jnp.float32).reshape((-1, 2))
+
+# ------------------------------------------------------------
+# Tag-game-only walls
+# These walls are used only by the auxiliary "soldier vs enemy
+# commander" chase task and its replay. They do not affect the
+# main RTS environment.
+# ------------------------------------------------------------
+TAG_WALL_LIST = [
+    # Example: (-2.0, 0.0), (0.0, 2.0), (2.0, -1.0)
+]
+
+tag_walls = jnp.asarray(TAG_WALL_LIST, dtype=jnp.float32).reshape((-1, 2))
 
 teams = jnp.concatenate([
     jnp.array([0.0, 1.0]),
@@ -197,6 +220,27 @@ def make_terrain():
 
 
 terrain = make_terrain()
+
+
+def make_terrain_from_walls(wall_array):
+    centers_1d = (
+        jnp.arange(TERRAIN_RES, dtype=jnp.float32)
+        - HALF_FIELD
+        + 0.5
+    )
+    xx, zz = jnp.meshgrid(centers_1d, centers_1d)
+    centers = jnp.stack([xx.reshape(-1), zz.reshape(-1)], axis=-1)
+
+    def blocked(i):
+        cell = centers[i]
+        d = jnp.abs(cell[None, :] - wall_array)
+        return jnp.any(jnp.all(d < 0.5, axis=1))
+
+    t = jax.vmap(blocked)(jnp.arange(TERRAIN_SIZE))
+    return t.astype(jnp.float32)
+
+
+tag_terrain = make_terrain_from_walls(tag_walls)
 
 # ============================================================
 # RESET
@@ -633,11 +677,9 @@ def relative_features(source_x, source_z, target_x, target_z):
 def nearest_enemy_indices(state):
     x, z = state["x"], state["z"]
     alive = state["alive"]
-
     dx = x[None, :] - x[:, None]
     dz = z[None, :] - z[:, None]
     dist2 = dx * dx + dz * dz
-
     valid = (
         (teams[None, :] != teams[:, None])
         & (alive[None, :] > 0)
@@ -651,14 +693,18 @@ def nearest_enemy_features(local_x, local_z, nearest_idx):
     return relative_features(local_x, local_z, nearest_x, nearest_z)
 
 
-def commander_wall_features(cmd_x, cmd_z, terrain_local):
-    # [NW, N, NE, W, E, SW, S, SE] in the local/mirrored frame.
+def grid_8_features(local_x, local_z, terrain_local):
+    """Return the eight neighboring terrain cells for each soldier.
+
+    Order: [NW, N, NE, W, E, SW, S, SE]. Outside the field is treated as
+    blocked, matching commander local-wall features.
+    """
     dc = jnp.array([-1, 0, 1, -1, 1, -1, 0, 1], dtype=jnp.int32)
     dr = jnp.array([-1, -1, -1, 0, 0, 1, 1, 1], dtype=jnp.int32)
 
-    def one(cx, cz):
-        col = jnp.floor(cx + HALF_FIELD).astype(jnp.int32)
-        row = jnp.floor(cz + HALF_FIELD).astype(jnp.int32)
+    def one(px, pz):
+        col = jnp.floor(px + HALF_FIELD).astype(jnp.int32)
+        row = jnp.floor(pz + HALF_FIELD).astype(jnp.int32)
         cols = col + dc
         rows = row + dr
         inside = (
@@ -669,19 +715,28 @@ def commander_wall_features(cmd_x, cmd_z, terrain_local):
         safe_rows = jnp.clip(rows, 0, TERRAIN_RES - 1)
         idx = safe_rows * TERRAIN_RES + safe_cols
         vals = terrain_local[idx]
-        # Outside the battlefield is treated as blocked for local navigation.
         return jnp.where(inside, vals, 1.0)
 
-    return jax.vmap(one)(cmd_x, cmd_z)
+    # This helper is used in two contexts:
+    #   1) batched soldier features: (N,) -> (N, 8)
+    #   2) single tag-game unit features: scalar -> (8,)
+    # The previous implementation always vmapped, which crashed for the
+    # scalar tag-game case with: "vmap ... rank should be at least 1".
+    if local_x.ndim == 0:
+        return one(local_x, local_z)
+    return jax.vmap(one)(local_x, local_z)
 
 
-def make_observation(state, perspective_team, nearest_idx=None):
+def commander_wall_features(cmd_x, cmd_z, terrain_local):
+    return grid_8_features(cmd_x, cmd_z, terrain_local)
+
+
+def make_observation(state, perspective_team, nearest_idx=None, terrain_override=None):
     x, z = state["x"], state["z"]
     vx, vz = state["vx"], state["vz"]
     hp, alive = state["hp"], state["alive"]
 
     blue = (perspective_team == 1.0)
-
     local_x = jnp.where(blue, -x, x)
     local_z = z
     local_vx = jnp.where(blue, -vx, vx)
@@ -732,6 +787,14 @@ def make_observation(state, perspective_team, nearest_idx=None):
         soldier_x, soldier_z, enemy_cmd_x, enemy_cmd_z
     )
 
+    terrain_source = terrain if terrain_override is None else terrain_override
+    terrain_2d = terrain_source.reshape(TERRAIN_RES, TERRAIN_RES)
+    terrain_local_2d = jnp.where(blue, terrain_2d[:, ::-1], terrain_2d)
+    terrain_local = terrain_local_2d.reshape(-1)
+    soldier_local_terrain = grid_8_features(
+        soldier_x, soldier_z, terrain_local
+    )
+
     soldier_base = base[soldier_idx]
     soldier_nearest = nearest[soldier_idx]
     soldier_features = jnp.concatenate([
@@ -739,16 +802,12 @@ def make_observation(state, perspective_team, nearest_idx=None):
         soldier_nearest,
         own_cmd_features,
         enemy_cmd_features,
+        soldier_local_terrain,
     ], axis=-1)
 
     cmd_idx = jnp.array([RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX], dtype=jnp.int32)
     cmd_base = base[cmd_idx]
     cmd_nearest = nearest[cmd_idx]
-
-    terrain_2d = terrain.reshape(TERRAIN_RES, TERRAIN_RES)
-    terrain_local_2d = jnp.where(blue, terrain_2d[:, ::-1], terrain_2d)
-    terrain_local = terrain_local_2d.reshape(-1)
-
     cmd_wall_features = commander_wall_features(
         local_x[cmd_idx], local_z[cmd_idx], terrain_local
     )
@@ -766,22 +825,22 @@ def make_observation(state, perspective_team, nearest_idx=None):
     ])
 
 
-def make_observation_batch(state, perspective_team):
+def make_observation_batch(state, perspective_team, terrain_override=None):
     nearest_idx = jax.vmap(nearest_enemy_indices)(state)
     return jax.vmap(
-        make_observation, in_axes=(0, None, 0)
-    )(state, perspective_team, nearest_idx)
+        make_observation,
+        in_axes=(0, None, 0, None),
+    )(state, perspective_team, nearest_idx, terrain_override)
 
 
-def make_observation_pair_batch(state):
-    """Build Red and Blue observations from one shared nearest-enemy calculation."""
+def make_observation_pair_batch(state, terrain_override=None):
     nearest_idx = jax.vmap(nearest_enemy_indices)(state)
     red_obs = jax.vmap(
-        make_observation, in_axes=(0, None, 0)
-    )(state, 0.0, nearest_idx)
+        make_observation, in_axes=(0, None, 0, None)
+    )(state, 0.0, nearest_idx, terrain_override)
     blue_obs = jax.vmap(
-        make_observation, in_axes=(0, None, 0)
-    )(state, 1.0, nearest_idx)
+        make_observation, in_axes=(0, None, 0, None)
+    )(state, 1.0, nearest_idx, terrain_override)
     return red_obs, blue_obs
 
 
@@ -805,6 +864,7 @@ def local_to_world_action(action, perspective_team):
     out = out.at[..., SOLDIER_ACTION_SIZE + 1].set(cmd_dz)
     return out
 
+
 print()
 print("Raw observation size :", RAW_OBS_SIZE)
 print("Global network input :", GLOBAL_INPUT_SIZE)
@@ -814,13 +874,12 @@ print("Total units           :", N_UNITS)
 
 # ============================================================
 # PART 2 : POLICY NETWORK
-# Hierarchical encoders + 2-layer team-wise self-attention
-# + shared global encoder + split Actor/Critic branches
+# Micro branch (local skill) + Macro branch (global coordination)
 # ============================================================
 
-HIDDEN1 = 512
-ACTOR_HIDDEN = 512
-CRITIC_HIDDEN = 512
+HIDDEN1 = 384
+ACTOR_HIDDEN = 384
+CRITIC_HIDDEN = 384
 
 GAMMA = 0.999
 GAE_LAMBDA = 0.97
@@ -839,36 +898,46 @@ LOGSTD_REG_COEF = 0.01
 
 PPO_EPOCHS = 4
 MINIBATCHES = 8
-
-# Stop PPO epoch/update early when the full-action KL grows too large.
-# This KL is summed over the full RTS action, so it is intentionally
-# looser than typical single-action PPO thresholds.
 TARGET_KL = 0.30
-
 PPO_ROLLOUT_STEPS = 512
 ROLLOUT_STEPS = PPO_ROLLOUT_STEPS
 BATCH_SIZE = ROLLOUT_STEPS * N_ENVS * 2
 MINIBATCH_SIZE = BATCH_SIZE // MINIBATCHES
-
 PPO_UPDATES_PER_GENERATION = 20
 N_GENERATIONS = 10000
 EVAL_GAMES_PER_SIDE = 32
 EVAL_GAMES = EVAL_GAMES_PER_SIDE * 2
-
-# Stagger generation starts so PPO 1 is not forced to begin with every
-# environment at t=0. Warm-up data is never used as PPO training data.
 WARMUP_MAX_STEPS = MAX_STEPS
+
+# Auxiliary tag-game training. This is intentionally lightweight so the A10G
+# spends almost all time on the main PPO loop.
+TAG_BATCH_SIZE = 512
+# One standalone tag command performs this many optimizer updates.
+# This is intentionally independent from PPO generations.
+TAG_UPDATES_PER_RUN = 200
+TAG_TRAIN_STEPS = 8  # retained as an internal/default diagnostic label
+TAG_MAX_STEPS = 240
+TAG_LEARNING_RATE = 2e-4
+TAG_STEP_PENALTY = -0.002
+TAG_CAPTURE_REWARD = 1.0
+TAG_RUNNER_CAPTURE_REWARD = -1.0
+TAG_CHASER_SPEED = INITIAL_SOLDIER_SPEED * 1.20
+TAG_RUNNER_SPEED = INITIAL_SOLDIER_SPEED * 0.75
+TAG_WALL_MARGIN = 0.02
+TAG_REPLAY_SAMPLES_PER_RUN = 16
 
 EVAL_Z_OFFSETS = jnp.array(
     [-0.72, -0.48, -0.24, 0.00, 0.24, 0.48, 0.72, 0.00],
     dtype=jnp.float32,
 )
 
-ANGLE_MEAN_IDX = jnp.arange(0, SOLDIER_ACTION_SIZE, 3)
-ANGLE_LOGSTD_IDX = jnp.arange(1, SOLDIER_ACTION_SIZE, 3)
-ATTACK_IDX = jnp.arange(2, SOLDIER_ACTION_SIZE, 3)
-COMMANDER_MEAN_IDX = SOLDIER_ACTION_SIZE
-COMMANDER_LOGSTD_IDX = SOLDIER_ACTION_SIZE + 1
+# Final action remains [dx, dz, attack] x 100 + [cmd_dx, cmd_dz].
+# Macro soldier output is [x, z, attack, ratio] x 100.
+# ratio is the macro-adoption ratio: 0 => all micro, 1 => all macro.
+MACRO_SOLDIER_OUTPUT_SIZE = N_SOLDIERS_PER_TEAM * 4
+MACRO_COMMANDER_OUTPUT_SIZE = 2
+MICRO_SOLDIER_OUTPUT_SIZE = N_SOLDIERS_PER_TEAM * 3
+MICRO_COMMANDER_OUTPUT_SIZE = 2
 
 
 def glorot_uniform(key, shape):
@@ -897,25 +966,22 @@ def self_attention_block(x, params, prefix):
     q = split_heads(x @ params[f"{prefix}_Wq"] + params[f"{prefix}_bq"])
     k = split_heads(x @ params[f"{prefix}_Wk"] + params[f"{prefix}_bk"])
     v = split_heads(x @ params[f"{prefix}_Wv"] + params[f"{prefix}_bv"])
-
     scores = jnp.einsum("bnhd,bmhd->bhnm", q, k)
     scores = scores / jnp.sqrt(float(ATTENTION_HEAD_DIM))
     weights = jax.nn.softmax(scores, axis=-1)
     attended = jnp.einsum("bhnm,bmhd->bnhd", weights, v)
     attended = merge_heads(attended)
     attended = attended @ params[f"{prefix}_Wo"] + params[f"{prefix}_bo"]
-
-    x = layer_norm(
+    return layer_norm(
         x + attended,
         params[f"{prefix}_ln_gamma"],
         params[f"{prefix}_ln_beta"],
     )
-    return x
 
 
 def init_attention_block(key, prefix):
     keys = random.split(key, 8)
-    p = {
+    return {
         f"{prefix}_Wq": glorot_uniform(keys[0], (LOCAL_EMBED_SIZE, LOCAL_EMBED_SIZE)),
         f"{prefix}_bq": jnp.zeros((LOCAL_EMBED_SIZE,)),
         f"{prefix}_Wk": glorot_uniform(keys[1], (LOCAL_EMBED_SIZE, LOCAL_EMBED_SIZE)),
@@ -927,44 +993,57 @@ def init_attention_block(key, prefix):
         f"{prefix}_ln_gamma": jnp.ones((LOCAL_EMBED_SIZE,)),
         f"{prefix}_ln_beta": jnp.zeros((LOCAL_EMBED_SIZE,)),
     }
-    return p
 
 
 def init_policy(key):
-    keys = random.split(key, 32)
+    keys = random.split(key, 40)
     p = {
+        # Local encoders
         "Ws1": glorot_uniform(keys[0], (SOLDIER_FEATURES, LOCAL_HIDDEN_SIZE)),
         "bs1": jnp.zeros((LOCAL_HIDDEN_SIZE,)),
         "Ws2": glorot_uniform(keys[1], (LOCAL_HIDDEN_SIZE, LOCAL_EMBED_SIZE)),
         "bs2": jnp.zeros((LOCAL_EMBED_SIZE,)),
         "Wc": glorot_uniform(keys[2], (COMMANDER_FEATURES, LOCAL_EMBED_SIZE)),
         "bc": jnp.zeros((LOCAL_EMBED_SIZE,)),
-        "Wg1": glorot_uniform(keys[3], (GLOBAL_INPUT_SIZE, HIDDEN1)),
+        # Micro outputs: x,z,attack for Soldiers; x,z for Commander.
+        "W_micro_s": random.normal(keys[3], (LOCAL_EMBED_SIZE, 3)) * 0.02,
+        "b_micro_s": jnp.zeros((3,)),
+        "W_micro_c": random.normal(keys[4], (LOCAL_EMBED_SIZE, 2)) * 0.02,
+        "b_micro_c": jnp.zeros((2,)),
+        # Smaller global network for macro decisions.
+        "Wg1": glorot_uniform(keys[5], (GLOBAL_INPUT_SIZE, HIDDEN1)),
         "bg1": jnp.zeros((HIDDEN1,)),
-        "W_actor_s": glorot_uniform(keys[4], (HIDDEN1, ACTOR_HIDDEN)),
+        "W_actor_s": glorot_uniform(keys[6], (HIDDEN1 + LOCAL_EMBED_SIZE, ACTOR_HIDDEN)),
         "b_actor_s": jnp.zeros((ACTOR_HIDDEN,)),
-        "W_actor_c": glorot_uniform(keys[5], (HIDDEN1, ACTOR_HIDDEN)),
+        "W_actor_c": glorot_uniform(keys[7], (HIDDEN1 + LOCAL_EMBED_SIZE, ACTOR_HIDDEN)),
         "b_actor_c": jnp.zeros((ACTOR_HIDDEN,)),
-        "W_critic": glorot_uniform(keys[6], (HIDDEN1, CRITIC_HIDDEN)),
+        "W_critic": glorot_uniform(keys[8], (HIDDEN1, CRITIC_HIDDEN)),
         "b_critic": jnp.zeros((CRITIC_HIDDEN,)),
-        "Wa_s": random.normal(keys[7], (ACTOR_HIDDEN, SOLDIER_ACTION_SIZE)) * 0.01,
-        "ba_s": jnp.zeros((SOLDIER_ACTION_SIZE,)),
-        "Wa_c": random.normal(keys[8], (ACTOR_HIDDEN, COMMANDER_ACTION_SIZE)) * 0.01,
-        "ba_c": jnp.zeros((COMMANDER_ACTION_SIZE,)),
-        "Wv": random.normal(keys[9], (CRITIC_HIDDEN, 1)) * 0.01,
+        # Macro soldier output: x,z,attack,ratio for each of 100 Soldiers.
+        "Wa_s_macro": random.normal(keys[9], (ACTOR_HIDDEN, MACRO_SOLDIER_OUTPUT_SIZE)) * 0.01,
+        "ba_s_macro": jnp.zeros((MACRO_SOLDIER_OUTPUT_SIZE,)),
+        "Wa_c_macro": random.normal(keys[10], (ACTOR_HIDDEN, MACRO_COMMANDER_OUTPUT_SIZE)) * 0.01,
+        "ba_c_macro": jnp.zeros((MACRO_COMMANDER_OUTPUT_SIZE,)),
+        # Value branch
+        "Wv": random.normal(keys[11], (CRITIC_HIDDEN, 1)) * 0.01,
         "bv": jnp.zeros((1,)),
+        # Exploration is kept outside the macro/micro outputs.
+        "logstd_s": jnp.full((N_SOLDIERS_PER_TEAM,), LOGSTD_INIT, dtype=jnp.float32),
+        "logstd_c": jnp.array(LOGSTD_INIT, dtype=jnp.float32),
     }
-    p.update(init_attention_block(keys[10], "attn1"))
-    p.update(init_attention_block(keys[11], "attn2"))
-
-    # Soldier layout: [angle_mean, angle_logstd, attack] x 100.
-    p["ba_s"] = p["ba_s"].at[ANGLE_LOGSTD_IDX].set(LOGSTD_INIT)
-    # Commander layout: [angle_mean, angle_logstd].
-    p["ba_c"] = p["ba_c"].at[COMMANDER_LOGSTD_IDX - SOLDIER_ACTION_SIZE].set(LOGSTD_INIT)
+    p.update(init_attention_block(keys[12], "attn1"))
+    p.update(init_attention_block(keys[13], "attn2"))
     return p
 
 
-def policy_forward(params, obs, detach_encoders=False):
+def infer_blue_from_obs(obs, soldier_part):
+    # In each local observation, the 100 own soldiers have own=1. Red
+    # perspective stores them in the first 100 slots, Blue in the last 100.
+    first_mean = jnp.mean(soldier_part[:, :N_SOLDIERS_PER_TEAM, 5], axis=1)
+    return first_mean < 0.5
+
+
+def raw_policy_outputs(params, obs, detach_encoders=False):
     terrain_part = obs[:, :TERRAIN_SIZE]
     soldier_start = TERRAIN_SIZE
     soldier_end = soldier_start + N_SOLDIERS_TOTAL * SOLDIER_FEATURES
@@ -975,49 +1054,146 @@ def policy_forward(params, obs, detach_encoders=False):
         obs.shape[0], N_COMMANDERS, COMMANDER_FEATURES
     )
 
-    soldier_h = jnp.tanh(soldier_part @ params["Ws1"] + params["bs1"])
-    soldier_emb = jnp.tanh(soldier_h @ params["Ws2"] + params["bs2"])
+    soldier_emb_pre = jnp.tanh(soldier_part @ params["Ws1"] + params["bs1"])
+    soldier_emb_pre = jnp.tanh(soldier_emb_pre @ params["Ws2"] + params["bs2"])
     commander_emb = jnp.tanh(commander_part @ params["Wc"] + params["bc"])
 
-    red_soldier_emb = soldier_emb[:, :N_SOLDIERS_PER_TEAM, :]
-    blue_soldier_emb = soldier_emb[:, N_SOLDIERS_PER_TEAM:, :]
+    micro_s_all = soldier_emb_pre @ params["W_micro_s"] + params["b_micro_s"]
+    micro_c_all = commander_emb @ params["W_micro_c"] + params["b_micro_c"]
+
+    if detach_encoders:
+        soldier_attention_in = lax.stop_gradient(soldier_emb_pre)
+        commander_global = lax.stop_gradient(commander_emb)
+    else:
+        soldier_attention_in = soldier_emb_pre
+        commander_global = commander_emb
+
+    red_soldier_emb = soldier_attention_in[:, :N_SOLDIERS_PER_TEAM, :]
+    blue_soldier_emb = soldier_attention_in[:, N_SOLDIERS_PER_TEAM:, :]
 
     red_soldier_emb = self_attention_block(red_soldier_emb, params, "attn1")
     blue_soldier_emb = self_attention_block(blue_soldier_emb, params, "attn1")
     red_soldier_emb = self_attention_block(red_soldier_emb, params, "attn2")
     blue_soldier_emb = self_attention_block(blue_soldier_emb, params, "attn2")
-    soldier_emb = jnp.concatenate([red_soldier_emb, blue_soldier_emb], axis=1)
-
-    if detach_encoders:
-        soldier_global = lax.stop_gradient(soldier_emb)
-        commander_global = lax.stop_gradient(commander_emb)
-    else:
-        soldier_global = soldier_emb
-        commander_global = commander_emb
+    soldier_global = jnp.concatenate([red_soldier_emb, blue_soldier_emb], axis=1)
 
     global_input = jnp.concatenate([
         terrain_part,
         soldier_global.reshape(obs.shape[0], -1),
         commander_global.reshape(obs.shape[0], -1),
     ], axis=-1)
-
     h_shared = jnp.tanh(global_input @ params["Wg1"] + params["bg1"])
+    blue = infer_blue_from_obs(obs, soldier_part)
 
-    soldier_h_actor = jnp.tanh(
-        h_shared @ params["W_actor_s"] + params["b_actor_s"]
+    # Macro branch is conditioned on both global context and the individual
+    # unit's local embedding. This keeps each Soldier's macro action distinct
+    # without restoring the much larger pre-redesign 512-wide head.
+    own_soldier_global = jnp.where(
+        blue[:, None, None],
+        soldier_global[:, N_SOLDIERS_PER_TEAM:, :],
+        soldier_global[:, :N_SOLDIERS_PER_TEAM, :],
     )
-    commander_h_actor = jnp.tanh(
-        h_shared @ params["W_actor_c"] + params["b_actor_c"]
+    soldier_macro_input = jnp.concatenate(
+        [
+            jnp.broadcast_to(
+                h_shared[:, None, :],
+                (obs.shape[0], N_SOLDIERS_PER_TEAM, HIDDEN1),
+            ),
+            own_soldier_global,
+        ],
+        axis=-1,
+    )
+    soldier_h_macro = jnp.tanh(
+        soldier_macro_input @ params["W_actor_s"] + params["b_actor_s"]
+    )
+
+    own_commander_global = jnp.where(
+        blue[:, None, None],
+        commander_global[:, 1:2, :],
+        commander_global[:, :1, :],
+    )
+    commander_macro_input = jnp.concatenate(
+        [h_shared[:, None, :], own_commander_global], axis=-1
+    )
+    commander_h_macro = jnp.tanh(
+        commander_macro_input @ params["W_actor_c"] + params["b_actor_c"]
     )
     critic_h = jnp.tanh(
         h_shared @ params["W_critic"] + params["b_critic"]
     )
 
-    soldier_output = soldier_h_actor @ params["Wa_s"] + params["ba_s"]
-    commander_output = commander_h_actor @ params["Wa_c"] + params["ba_c"]
-    action_output = jnp.concatenate([soldier_output, commander_output], axis=-1)
+    macro_s = (
+        soldier_h_macro @ params["Wa_s_macro"] + params["ba_s_macro"]
+    )
+    macro_c_own = (
+        commander_h_macro @ params["Wa_c_macro"] + params["ba_c_macro"]
+    )[:, 0, :]
+
+    own_micro_s = jnp.where(
+        blue[:, None, None],
+        micro_s_all[:, N_SOLDIERS_PER_TEAM:, :],
+        micro_s_all[:, :N_SOLDIERS_PER_TEAM, :],
+    )
+    own_micro_c = jnp.where(
+        blue[:, None],
+        micro_c_all[:, 1, :],
+        micro_c_all[:, 0, :],
+    )
+
     value = (critic_h @ params["Wv"] + params["bv"])[..., 0]
-    return action_output, value
+    return own_micro_s, own_micro_c, macro_s, macro_c_own, value
+
+
+def compose_final_policy(params, micro_s, micro_c, macro_s, macro_c):
+    micro_vec = jnp.tanh(micro_s[..., :2])
+    macro_vec = jnp.tanh(macro_s[..., :2])
+    ratio = jax.nn.sigmoid(macro_s[..., 3])
+
+    blended_vec = (1.0 - ratio[..., None]) * micro_vec + ratio[..., None] * macro_vec
+    blended_norm = jnp.sqrt(jnp.sum(blended_vec * blended_vec, axis=-1, keepdims=True) + 1e-8)
+    blended_vec = blended_vec / blended_norm
+    soldier_mean = jnp.arctan2(blended_vec[..., 1], blended_vec[..., 0])
+
+    micro_attack_p = jax.nn.sigmoid(micro_s[..., 2])
+    macro_attack_p = jax.nn.sigmoid(macro_s[..., 2])
+    attack_p = jnp.clip(
+        (1.0 - ratio) * micro_attack_p + ratio * macro_attack_p,
+        1e-5,
+        1.0 - 1e-5,
+    )
+    soldier_attack_logit = jnp.log(attack_p) - jnp.log1p(-attack_p)
+
+    # Commander has the same micro -> macro composition, but no ratio output
+    # is exposed to the user; use a fixed 50/50 blend so the commander micro
+    # branch is a real policy path during production as well.
+    micro_c_vec = jnp.tanh(micro_c)
+    macro_c_vec = jnp.tanh(macro_c)
+    cmd_blend = 0.5 * micro_c_vec + 0.5 * macro_c_vec
+    cmd_norm = jnp.sqrt(jnp.sum(cmd_blend * cmd_blend, axis=-1, keepdims=True) + 1e-8)
+    cmd_blend = cmd_blend / cmd_norm
+    commander_mean = jnp.arctan2(cmd_blend[..., 1], cmd_blend[..., 0])
+
+    return {
+        "soldier_mean": soldier_mean,
+        "soldier_attack_logit": soldier_attack_logit,
+        "soldier_ratio": ratio,
+        "commander_mean": commander_mean,
+        "logstd_s": jnp.clip(params["logstd_s"], LOGSTD_MIN, LOGSTD_MAX),
+        "logstd_c": jnp.clip(params["logstd_c"], LOGSTD_MIN, LOGSTD_MAX),
+        "micro_s": micro_s,
+        "micro_c": micro_c,
+        "macro_s": macro_s,
+        "macro_c": macro_c,
+    }
+
+
+def policy_forward(params, obs, detach_encoders=False):
+    micro_s, micro_c, macro_s, macro_c, value = raw_policy_outputs(
+        params, obs, detach_encoders=detach_encoders
+    )
+    out = compose_final_policy(params, micro_s, micro_c, macro_s, macro_c)
+    out["value"] = value
+    return out
 
 
 policy_forward_jit = jax.jit(policy_forward)
@@ -1027,36 +1203,32 @@ def wrap_angle(a):
     return (a + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
 
-def action_logprob_components(action_output, local_action):
-    soldier_output = action_output[:, :SOLDIER_ACTION_SIZE]
-    commander_output = action_output[:, SOLDIER_ACTION_SIZE:]
-
-    angle_mean = soldier_output[:, ANGLE_MEAN_IDX]
-    logstd = jnp.clip(soldier_output[:, ANGLE_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX)
+def action_logprob_components(policy_out, local_action):
+    angle_mean = policy_out["soldier_mean"]
+    logstd = policy_out["logstd_s"][None, :]
     std = jnp.exp(logstd)
 
     soldier_action = local_action[:, :SOLDIER_ACTION_SIZE]
     dx = soldier_action[:, 0::3]
     dz = soldier_action[:, 1::3]
+    at = soldier_action[:, 2::3]
     a = jnp.arctan2(dz, dx)
     diff = wrap_angle(a - angle_mean)
-
     lp_angle = (
         -0.5 * (diff / std) ** 2
         - logstd
         - 0.5 * jnp.log(2.0 * jnp.pi)
     )
 
-    logits = soldier_output[:, ATTACK_IDX]
-    at = soldier_action[:, 2::3]
+    logits = policy_out["soldier_attack_logit"]
     lp_attack = (
         at * (-jnp.logaddexp(0.0, -logits))
         + (1.0 - at) * (-jnp.logaddexp(0.0, logits))
     )
     soldier_lp = lp_angle + lp_attack
 
-    cmd_mean = commander_output[:, 0]
-    cmd_logstd = jnp.clip(commander_output[:, 1], LOGSTD_MIN, LOGSTD_MAX)
+    cmd_mean = policy_out["commander_mean"]
+    cmd_logstd = policy_out["logstd_c"]
     cmd_std = jnp.exp(cmd_logstd)
     cmd_dx = local_action[:, SOLDIER_ACTION_SIZE]
     cmd_dz = local_action[:, SOLDIER_ACTION_SIZE + 1]
@@ -1067,60 +1239,48 @@ def action_logprob_components(action_output, local_action):
         - cmd_logstd
         - 0.5 * jnp.log(2.0 * jnp.pi)
     )
-
     team_lp = jnp.sum(soldier_lp, axis=1) + commander_lp
     return soldier_lp, commander_lp, team_lp
 
 
-def action_logprob(action_output, local_action):
-    _, _, team_lp = action_logprob_components(action_output, local_action)
+def action_logprob(policy_out, local_action):
+    _, _, team_lp = action_logprob_components(policy_out, local_action)
     return team_lp
 
 
-def policy_entropy(action_output):
-    soldier_output = action_output[:, :SOLDIER_ACTION_SIZE]
-    commander_output = action_output[:, SOLDIER_ACTION_SIZE:]
-
-    logstd = jnp.clip(soldier_output[:, ANGLE_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX)
+def policy_entropy(policy_out):
+    logstd = policy_out["logstd_s"][None, :]
     e_angle = jnp.sum(
         logstd + 0.5 * jnp.log(2.0 * jnp.pi * jnp.e), axis=1
     )
-
-    p = jax.nn.sigmoid(soldier_output[:, ATTACK_IDX])
+    p = jax.nn.sigmoid(policy_out["soldier_attack_logit"])
     e_attack = -(
         p * jnp.log(p + 1e-8)
         + (1.0 - p) * jnp.log(1.0 - p + 1e-8)
     )
     e_attack = jnp.sum(e_attack, axis=1)
-
-    cmd_logstd = jnp.clip(commander_output[:, 1], LOGSTD_MIN, LOGSTD_MAX)
-    e_cmd = cmd_logstd + 0.5 * jnp.log(2.0 * jnp.pi * jnp.e)
+    e_cmd = policy_out["logstd_c"] + 0.5 * jnp.log(2.0 * jnp.pi * jnp.e)
     return e_angle + e_attack + e_cmd
 
 
 def sample_action(params, obs, key):
-    action_output, value = policy_forward(params, obs)
+    out = policy_forward(params, obs)
     B = obs.shape[0]
     k_noise_soldier, k_attack, k_noise_cmd = random.split(key, 3)
 
-    soldier_output = action_output[:, :SOLDIER_ACTION_SIZE]
-    commander_output = action_output[:, SOLDIER_ACTION_SIZE:]
-
-    mean = soldier_output[:, ANGLE_MEAN_IDX]
-    logstd = jnp.clip(soldier_output[:, ANGLE_LOGSTD_IDX], LOGSTD_MIN, LOGSTD_MAX)
+    mean = out["soldier_mean"]
+    logstd = out["logstd_s"][None, :]
     std = jnp.exp(logstd)
-
     angle = mean + std * random.normal(
         k_noise_soldier, (B, N_SOLDIERS_PER_TEAM)
     )
     dx, dz = jnp.cos(angle), jnp.sin(angle)
 
-    prob = jax.nn.sigmoid(soldier_output[:, ATTACK_IDX])
+    prob = jax.nn.sigmoid(out["soldier_attack_logit"])
     at = random.bernoulli(k_attack, prob).astype(jnp.float32)
 
-    cmd_mean = commander_output[:, 0]
-    cmd_logstd = jnp.clip(commander_output[:, 1], LOGSTD_MIN, LOGSTD_MAX)
-    cmd_std = jnp.exp(cmd_logstd)
+    cmd_mean = out["commander_mean"]
+    cmd_std = jnp.exp(out["logstd_c"])
     cmd_angle = cmd_mean + cmd_std * random.normal(k_noise_cmd, (B,))
     cmd_dx, cmd_dz = jnp.cos(cmd_angle), jnp.sin(cmd_angle)
 
@@ -1131,20 +1291,17 @@ def sample_action(params, obs, key):
     la = la.at[:, SOLDIER_ACTION_SIZE].set(cmd_dx)
     la = la.at[:, SOLDIER_ACTION_SIZE + 1].set(cmd_dz)
 
-    soldier_lp, commander_lp, team_lp = action_logprob_components(action_output, la)
-    return la, soldier_lp, commander_lp, team_lp, value
+    soldier_lp, commander_lp, team_lp = action_logprob_components(out, la)
+    return la, soldier_lp, commander_lp, team_lp, out["value"]
 
 
 def deterministic_local_action(params, obs):
-    action_output, value = policy_forward(params, obs)
-    soldier_output = action_output[:, :SOLDIER_ACTION_SIZE]
-    commander_output = action_output[:, SOLDIER_ACTION_SIZE:]
-
-    mean = soldier_output[:, ANGLE_MEAN_IDX]
+    out = policy_forward(params, obs)
+    mean = out["soldier_mean"]
     dx, dz = jnp.cos(mean), jnp.sin(mean)
-    at = (jax.nn.sigmoid(soldier_output[:, ATTACK_IDX]) >= 0.5).astype(jnp.float32)
+    at = (jax.nn.sigmoid(out["soldier_attack_logit"]) >= 0.5).astype(jnp.float32)
 
-    cmd_mean = commander_output[:, 0]
+    cmd_mean = out["commander_mean"]
     cmd_dx = jnp.cos(cmd_mean)
     cmd_dz = jnp.sin(cmd_mean)
 
@@ -1154,7 +1311,7 @@ def deterministic_local_action(params, obs):
     la = la.at[:, 2:SOLDIER_ACTION_SIZE:3].set(at)
     la = la.at[:, SOLDIER_ACTION_SIZE].set(cmd_dx)
     la = la.at[:, SOLDIER_ACTION_SIZE + 1].set(cmd_dz)
-    return la, value
+    return la, out["value"]
 
 
 def deterministic_world_action_batch(params, state, team):
@@ -1168,13 +1325,18 @@ def deterministic_world_action_single(params, state, team):
     la, _ = deterministic_local_action(params, obs)
     return local_to_world_action(la, team)[0]
 
+
 # ============================================================
-# PART 3 : OPTIMIZER / PPO
+# PART 3 : OPTIMIZER / PPO + AUXILIARY TAG TRAINING
 # ============================================================
 
 optimizer = optax.chain(
     optax.clip_by_global_norm(0.5),
     optax.adam(LEARNING_RATE),
+)
+tag_optimizer = optax.chain(
+    optax.clip_by_global_norm(0.5),
+    optax.adam(TAG_LEARNING_RATE),
 )
 
 
@@ -1202,12 +1364,6 @@ def compute_gae(rewards, values, dones, last_value):
 
 
 def compute_discounted_returns(rewards, dones):
-    """Monte-Carlo reward-to-go for local skill rewards.
-
-    ``dones`` is environment-level with shape ``(batch,)`` while local
-    Soldier rewards can be ``(batch, 100)``. Expand the done mask to match
-    the reward tensor so each Soldier/Commander stream resets at episode end.
-    """
     def rev(carry, xs):
         ret = carry
         r_t, d_t = xs
@@ -1225,26 +1381,32 @@ def compute_discounted_returns(rewards, dones):
     return returns[::-1]
 
 
-# Gradient ownership for the three reward systems.
 SOLDIER_LOCAL_KEYS = (
     "Ws1", "bs1", "Ws2", "bs2",
+    "W_micro_s", "b_micro_s",
     "attn1_Wq", "attn1_bq", "attn1_Wk", "attn1_bk",
     "attn1_Wv", "attn1_bv", "attn1_Wo", "attn1_bo",
     "attn1_ln_gamma", "attn1_ln_beta",
     "attn2_Wq", "attn2_bq", "attn2_Wk", "attn2_bk",
     "attn2_Wv", "attn2_bv", "attn2_Wo", "attn2_bo",
     "attn2_ln_gamma", "attn2_ln_beta",
-    "W_actor_s", "b_actor_s", "Wa_s", "ba_s",
+    "W_actor_s", "b_actor_s", "Wa_s_macro", "ba_s_macro",
 )
 COMMANDER_LOCAL_KEYS = (
-    "Wc", "bc",
-    "W_actor_c", "b_actor_c", "Wa_c", "ba_c",
+    "Wc", "bc", "W_micro_c", "b_micro_c",
+    "W_actor_c", "b_actor_c", "Wa_c_macro", "ba_c_macro",
 )
 TEAM_KEYS = (
     "Wg1", "bg1",
-    "W_actor_s", "b_actor_s", "Wa_s", "ba_s",
-    "W_actor_c", "b_actor_c", "Wa_c", "ba_c",
+    "W_actor_s", "b_actor_s", "Wa_s_macro", "ba_s_macro",
+    "W_actor_c", "b_actor_c", "Wa_c_macro", "ba_c_macro",
     "W_critic", "b_critic", "Wv", "bv",
+    "logstd_s", "logstd_c",
+)
+TAG_ENCODER_KEYS = (
+    "Ws1", "bs1", "Ws2", "bs2",
+    "W_micro_s", "b_micro_s",
+    "Wc", "bc", "W_micro_c", "b_micro_c",
 )
 
 
@@ -1269,67 +1431,49 @@ def ppo_loss_parts(
     returns,
     ent_coef,
 ):
-    """Build the three losses without mixing reward ownership."""
-    # For the team loss, detach both local encoders. This makes the global
-    # network/actor/critic learn from WIN/LOSS without sending that signal back
-    # into Soldier/Commander encoders.
-    team_action_output, team_values = policy_forward(
-        params, obs, detach_encoders=True
-    )
+    team_out = policy_forward(params, obs, detach_encoders=True)
     team_soldier_lp, team_commander_lp, team_lp = action_logprob_components(
-        team_action_output, local_actions
+        team_out, local_actions
     )
 
-    # Local skill losses use the full graph so their own encoder receives only
-    # their own reward signal after gradient masking.
-    local_action_output, _ = policy_forward(
-        params, obs, detach_encoders=False
-    )
+    local_out = policy_forward(params, obs, detach_encoders=False)
     soldier_lp, commander_lp, _ = action_logprob_components(
-        local_action_output, local_actions
+        local_out, local_actions
     )
 
-    # Soldier-specific PPO objective: one ratio per soldier.
     soldier_ratio = jnp.exp(soldier_lp - old_soldier_log_prob)
     soldier_unclipped = soldier_ratio * soldier_advantages
     soldier_clipped = (
         jnp.clip(soldier_ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS)
         * soldier_advantages
     )
-    soldier_policy_loss = -jnp.mean(
-        jnp.minimum(soldier_unclipped, soldier_clipped)
-    )
+    soldier_policy_loss = -jnp.mean(jnp.minimum(soldier_unclipped, soldier_clipped))
 
-    # Commander-specific PPO objective.
     commander_ratio = jnp.exp(commander_lp - old_commander_log_prob)
     commander_unclipped = commander_ratio * commander_advantages
     commander_clipped = (
         jnp.clip(commander_ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS)
         * commander_advantages
     )
-    commander_policy_loss = -jnp.mean(
-        jnp.minimum(commander_unclipped, commander_clipped)
-    )
+    commander_policy_loss = -jnp.mean(jnp.minimum(commander_unclipped, commander_clipped))
 
-    # Team objective: the full action is judged by WIN/LOSS.
     team_ratio = jnp.exp(team_lp - old_team_log_prob)
     team_unclipped = team_ratio * team_advantages
     team_clipped = (
         jnp.clip(team_ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS)
         * team_advantages
     )
-    team_policy_loss = -jnp.mean(
-        jnp.minimum(team_unclipped, team_clipped)
+    team_policy_loss = -jnp.mean(jnp.minimum(team_unclipped, team_clipped))
+
+    entropy = jnp.mean(policy_entropy(team_out))
+    soldier_logstd = team_out["logstd_s"]
+    commander_logstd = team_out["logstd_c"]
+    logstd_reg = (
+        0.5 * jnp.mean((soldier_logstd - LOGSTD_TARGET) ** 2)
+        + 0.5 * (commander_logstd - LOGSTD_TARGET) ** 2
     )
 
-    entropy = jnp.mean(policy_entropy(team_action_output))
-    soldier_logstd = team_action_output[:, :SOLDIER_ACTION_SIZE][:, ANGLE_LOGSTD_IDX]
-    commander_logstd = team_action_output[:, SOLDIER_ACTION_SIZE + 1]
-    soldier_logstd_reg = jnp.mean((soldier_logstd - LOGSTD_TARGET) ** 2)
-    commander_logstd_reg = jnp.mean((commander_logstd - LOGSTD_TARGET) ** 2)
-    logstd_reg = 0.5 * soldier_logstd_reg + 0.5 * commander_logstd_reg
-
-    value_loss = 0.5 * jnp.mean((returns - team_values) ** 2)
+    value_loss = 0.5 * jnp.mean((returns - team_out["value"]) ** 2)
     team_total_loss = (
         team_policy_loss
         + VALUE_COEF * value_loss
@@ -1345,15 +1489,14 @@ def ppo_loss_parts(
         "value_loss": value_loss,
         "entropy": entropy,
         "entropy_per_soldier": entropy / float(N_SOLDIERS_PER_TEAM),
-        "logstd_mean": jnp.mean(jnp.clip(soldier_logstd, LOGSTD_MIN, LOGSTD_MAX)),
-        "commander_logstd_mean": jnp.mean(
-            jnp.clip(commander_logstd, LOGSTD_MIN, LOGSTD_MAX)
-        ),
+        "logstd_mean": jnp.mean(soldier_logstd),
+        "commander_logstd_mean": commander_logstd,
         "logstd_reg": logstd_reg,
+        "macro_ratio_mean": jnp.mean(local_out["soldier_ratio"]),
+        "micro_attack_prob": jnp.mean(jax.nn.sigmoid(local_out["micro_s"][..., 2])),
+        "macro_attack_prob": jnp.mean(jax.nn.sigmoid(local_out["macro_s"][..., 2])),
         "approx_kl": jnp.mean(old_team_log_prob - team_lp),
-        "clip_fraction": jnp.mean(
-            (jnp.abs(team_ratio - 1.0) > CLIP_EPS).astype(jnp.float32)
-        ),
+        "clip_fraction": jnp.mean((jnp.abs(team_ratio - 1.0) > CLIP_EPS).astype(jnp.float32)),
         "team_total_loss": team_total_loss,
     }
     return metrics
@@ -1375,57 +1518,30 @@ def ppo_update_minibatch(
     ent_coef,
 ):
     def soldier_loss_fn(p):
-        m = ppo_loss_parts(
+        return ppo_loss_parts(
             p, obs, local_actions,
-            old_soldier_log_prob,
-            old_commander_log_prob,
-            old_team_log_prob,
-            soldier_advantages,
-            commander_advantages,
-            team_advantages,
-            returns,
-            ent_coef,
-        )
-        return m["soldier_policy_loss"]
+            old_soldier_log_prob, old_commander_log_prob, old_team_log_prob,
+            soldier_advantages, commander_advantages, team_advantages, returns, ent_coef,
+        )["soldier_policy_loss"]
 
     def commander_loss_fn(p):
-        m = ppo_loss_parts(
+        return ppo_loss_parts(
             p, obs, local_actions,
-            old_soldier_log_prob,
-            old_commander_log_prob,
-            old_team_log_prob,
-            soldier_advantages,
-            commander_advantages,
-            team_advantages,
-            returns,
-            ent_coef,
-        )
-        return m["commander_policy_loss"]
+            old_soldier_log_prob, old_commander_log_prob, old_team_log_prob,
+            soldier_advantages, commander_advantages, team_advantages, returns, ent_coef,
+        )["commander_policy_loss"]
 
     def team_loss_fn(p):
         m = ppo_loss_parts(
             p, obs, local_actions,
-            old_soldier_log_prob,
-            old_commander_log_prob,
-            old_team_log_prob,
-            soldier_advantages,
-            commander_advantages,
-            team_advantages,
-            returns,
-            ent_coef,
+            old_soldier_log_prob, old_commander_log_prob, old_team_log_prob,
+            soldier_advantages, commander_advantages, team_advantages, returns, ent_coef,
         )
         return m["team_total_loss"], m
 
-    soldier_value, soldier_grads = jax.value_and_grad(
-        soldier_loss_fn
-    )(params)
-    commander_value, commander_grads = jax.value_and_grad(
-        commander_loss_fn
-    )(params)
-    (team_value, metrics), team_grads = jax.value_and_grad(
-        team_loss_fn, has_aux=True
-    )(params)
-    del soldier_value, commander_value, team_value
+    _, soldier_grads = jax.value_and_grad(soldier_loss_fn)(params)
+    _, commander_grads = jax.value_and_grad(commander_loss_fn)(params)
+    (_, metrics), team_grads = jax.value_and_grad(team_loss_fn, has_aux=True)(params)
 
     soldier_grads = masked_tree(soldier_grads, SOLDIER_LOCAL_KEYS)
     commander_grads = masked_tree(commander_grads, COMMANDER_LOCAL_KEYS)
@@ -1433,9 +1549,7 @@ def ppo_update_minibatch(
 
     def grad_l2(tree):
         leaves = jax.tree_util.tree_leaves(tree)
-        return jnp.sqrt(
-            sum(jnp.sum(x * x) for x in leaves) + jnp.float32(1e-12)
-        )
+        return jnp.sqrt(sum(jnp.sum(x * x) for x in leaves) + jnp.float32(1e-12))
 
     metrics = dict(metrics)
     metrics["grad_norm_soldier_local"] = grad_l2(soldier_grads)
@@ -1446,10 +1560,402 @@ def ppo_update_minibatch(
         k: soldier_grads[k] + commander_grads[k] + team_grads[k]
         for k in params
     }
-
     updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
     return params, opt_state, metrics
+
+
+# ============================================================
+# TAG GAME AUXILIARY TASK
+# ============================================================
+
+
+def tag_wall_blocked(x, z, radius):
+    """Return a scalar bool for scalar tag-game coordinates."""
+    x = jnp.asarray(x)
+    z = jnp.asarray(z)
+    radius = jnp.asarray(radius)
+    wx = tag_walls[:, 0]
+    wz = tag_walls[:, 1]
+    cx = jnp.clip(x, wx - 0.5, wx + 0.5)
+    cz = jnp.clip(z, wz - 0.5, wz + 0.5)
+    dx, dz = x - cx, z - cz
+    blocked = jnp.any(
+        dx * dx + dz * dz < (radius + TAG_WALL_MARGIN) ** 2,
+        axis=0,
+    )
+    return jnp.asarray(blocked, dtype=jnp.bool_)
+
+
+def tag_role_indices(role):
+    # role=0: Red soldier chases Blue commander; role=1: Blue soldier chases Red commander.
+    chaser_team = role.astype(jnp.int32)
+    runner_team = 1 - chaser_team
+    chaser_idx = jnp.where(chaser_team == 0, RED_SOLDIER_START, BLUE_SOLDIER_START)
+    runner_cmd_idx = jnp.where(runner_team == 0, RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX)
+    chaser_cmd_idx = jnp.where(chaser_team == 0, RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX)
+    return chaser_team, runner_team, chaser_idx, runner_cmd_idx, chaser_cmd_idx
+
+
+def reset_tag_one(key, role):
+    k1, k2, k3, k4 = random.split(key, 4)
+    x = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    z = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    vx = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    vz = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    hp = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    alive = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    attack_timer = jnp.zeros(N_UNITS, dtype=jnp.float32)
+    speed = jnp.zeros(N_UNITS, dtype=jnp.float32)
+
+    # Both commanders exist for observation consistency; only the enemy-team
+    # commander is the tag-game runner. The chaser team's commander is static.
+    red_cmd_alive = jnp.ones(())
+    blue_cmd_alive = jnp.ones(())
+    alive = alive.at[RED_COMMANDER_INDEX].set(red_cmd_alive)
+    alive = alive.at[BLUE_COMMANDER_INDEX].set(blue_cmd_alive)
+    hp = hp.at[RED_COMMANDER_INDEX].set(0.30)
+    hp = hp.at[BLUE_COMMANDER_INDEX].set(0.30)
+
+    z_runner = random.uniform(k1, (), minval=-4.0, maxval=4.0)
+    z_chaser = random.uniform(k2, (), minval=-4.0, maxval=4.0)
+    chaser_team, runner_team, chaser_idx, runner_cmd_idx, chaser_cmd_idx = tag_role_indices(role)
+
+    chaser_x = jnp.where(chaser_team == 0, -5.5, 5.5)
+    runner_x = jnp.where(chaser_team == 0, 5.5, -5.5)
+    own_cmd_x = jnp.where(chaser_team == 0, -5.8, 5.8)
+    own_cmd_z = jnp.where(chaser_team == 0, 0.0, 0.0)
+    enemy_cmd_x = runner_x
+
+    # Tiny randomized center offset for the chaser's own commander so the
+    # encoder cannot memorize one exact geometry.
+    own_cmd_z = own_cmd_z + random.uniform(k3, (), minval=-1.0, maxval=1.0)
+
+    x = x.at[chaser_idx].set(chaser_x)
+    z = z.at[chaser_idx].set(z_chaser)
+    x = x.at[runner_cmd_idx].set(runner_x)
+    z = z.at[runner_cmd_idx].set(z_runner)
+    x = x.at[chaser_cmd_idx].set(own_cmd_x)
+    z = z.at[chaser_cmd_idx].set(own_cmd_z)
+
+    alive = alive.at[chaser_idx].set(1.0)
+    hp = hp.at[chaser_idx].set(1.0)
+    speed = speed.at[chaser_idx].set(TAG_CHASER_SPEED)
+    speed = speed.at[runner_cmd_idx].set(TAG_RUNNER_SPEED)
+    speed = speed.at[chaser_cmd_idx].set(0.0)
+
+    # Keep active units out of user-defined tag walls at reset without Python-side
+    # dict mutation, so the function remains JAX-jittable under vmap.
+    state = {
+        "x": x, "z": z, "vx": vx, "vz": vz, "hp": hp, "alive": alive,
+        "attack_timer": attack_timer, "speed": speed,
+        "time": jnp.array(0.0, dtype=jnp.float32), "done": jnp.array(False),
+    }
+
+    def repair_unit(state_in, idx, radius, key_in):
+        px = state_in["x"][idx]
+        pz = state_in["z"][idx]
+        blocked = tag_wall_blocked(px, pz, radius)
+        key_out, kz = random.split(key_in)
+        step_dir = jnp.where(px >= 0.0, -1.0, 1.0)
+        candidate_x = jnp.clip(px + step_dir * 0.8, -HALF_FIELD + radius, HALF_FIELD - radius)
+        candidate_z = random.uniform(kz, (), minval=-4.0, maxval=4.0)
+        nx = jnp.where(blocked, candidate_x, px)
+        nz = jnp.where(blocked, candidate_z, pz)
+        return (
+            {**state_in,
+             "x": state_in["x"].at[idx].set(nx),
+             "z": state_in["z"].at[idx].set(nz)},
+            key_out,
+        )
+
+    state, key = repair_unit(state, chaser_idx, SOLDIER_RADIUS, k4)
+    state, key = repair_unit(state, runner_cmd_idx, COMMANDER_RADIUS, key)
+    # A second pass handles a rare case where the first shift still lands on a wall.
+    state, key = repair_unit(state, chaser_idx, SOLDIER_RADIUS, key)
+    state, key = repair_unit(state, runner_cmd_idx, COMMANDER_RADIUS, key)
+    del key
+    return state
+
+
+reset_tag_parallel = jax.jit(jax.vmap(reset_tag_one, in_axes=(0, 0)))
+
+
+def reset_tag_batch(key, n):
+    keys = random.split(key, n)
+    roles = jnp.arange(n, dtype=jnp.int32) % 2
+    return reset_tag_parallel(keys, roles), roles
+
+
+def tag_local_frame(state, team, indices):
+    blue = team.astype(jnp.float32) > 0.5
+    x = state["x"][indices]
+    z = state["z"][indices]
+    vx = state["vx"][indices]
+    vz = state["vz"][indices]
+    return (
+        jnp.where(blue, -x, x), z,
+        jnp.where(blue, -vx, vx), vz,
+        blue,
+    )
+
+
+def make_tag_soldier_features(state, role, terrain_local=None):
+    _, _, chaser_idx, runner_cmd_idx, chaser_cmd_idx = tag_role_indices(role)
+    lx, lz, lvx, lvz, blue = tag_local_frame(state, role, chaser_idx)
+
+    own_cmd_x = jnp.where(blue, -state["x"][chaser_cmd_idx], state["x"][chaser_cmd_idx])
+    own_cmd_z = state["z"][chaser_cmd_idx]
+    enemy_cmd_x = jnp.where(blue, -state["x"][runner_cmd_idx], state["x"][runner_cmd_idx])
+    enemy_cmd_z = state["z"][runner_cmd_idx]
+
+    base = jnp.stack([
+        lx / HALF_FIELD,
+        lz / HALF_FIELD,
+        lvx,
+        lvz,
+        state["hp"][chaser_idx],
+        jnp.ones_like(lx),
+        jnp.zeros_like(lx),
+        state["alive"][chaser_idx],
+    ], axis=-1)
+    nearest = relative_features(lx, lz, enemy_cmd_x, enemy_cmd_z)
+    own_cmd = relative_features(lx, lz, own_cmd_x, own_cmd_z)
+    enemy_cmd = relative_features(lx, lz, enemy_cmd_x, enemy_cmd_z)
+
+    if terrain_local is None:
+        terrain_local = jnp.where(
+            blue,
+            tag_terrain.reshape(TERRAIN_RES, TERRAIN_RES)[:, ::-1],
+            tag_terrain.reshape(TERRAIN_RES, TERRAIN_RES),
+        ).reshape(-1)
+    local_terrain = grid_8_features(lx, lz, terrain_local)
+    return jnp.concatenate([base, nearest, own_cmd, enemy_cmd, local_terrain], axis=-1)
+
+
+def make_tag_commander_features(state, role, terrain_local=None):
+    chaser_team, runner_team, chaser_idx, runner_cmd_idx, _ = tag_role_indices(role)
+    del runner_team
+    lx, lz, lvx, lvz, blue = tag_local_frame(state, role + 0, runner_cmd_idx)
+
+    # The runner is always own commander, so own=1 and commander_flag=1.
+    base = jnp.stack([
+        lx / HALF_FIELD,
+        lz / HALF_FIELD,
+        lvx,
+        lvz,
+        state["hp"][runner_cmd_idx],
+        jnp.ones_like(lx),
+        jnp.ones_like(lx),
+        state["alive"][runner_cmd_idx],
+    ], axis=-1)
+    nearest = relative_features(
+        lx,
+        lz,
+        jnp.where(blue, -state["x"][chaser_idx], state["x"][chaser_idx]),
+        state["z"][chaser_idx],
+    )
+    if terrain_local is None:
+        base_terrain_2d = tag_terrain.reshape(TERRAIN_RES, TERRAIN_RES)
+        terrain_local = jnp.where(
+            blue, base_terrain_2d[:, ::-1], base_terrain_2d
+        ).reshape(-1)
+    wall = commander_wall_features(lx, lz, terrain_local)
+    return jnp.concatenate([base, nearest, wall], axis=-1)
+
+
+def tag_micro_outputs(params, soldier_features, commander_features):
+    sh = jnp.tanh(soldier_features @ params["Ws1"] + params["bs1"])
+    semb = jnp.tanh(sh @ params["Ws2"] + params["bs2"])
+    ch = jnp.tanh(commander_features @ params["Wc"] + params["bc"])
+    return (
+        semb @ params["W_micro_s"] + params["b_micro_s"],
+        ch @ params["W_micro_c"] + params["b_micro_c"],
+    )
+
+
+def tag_target_vectors(state, role):
+    _, _, chaser_idx, runner_cmd_idx, _ = tag_role_indices(role)
+    chx = state["x"][chaser_idx]
+    chz = state["z"][chaser_idx]
+    rx = state["x"][runner_cmd_idx]
+    rz = state["z"][runner_cmd_idx]
+    to_runner = jnp.stack([rx - chx, rz - chz])
+    away = -to_runner
+    to_runner = to_runner / (jnp.linalg.norm(to_runner) + 1e-8)
+    away = away / (jnp.linalg.norm(away) + 1e-8)
+    dist = jnp.sqrt((rx - chx) ** 2 + (rz - chz) ** 2 + 1e-8)
+    return to_runner, away, dist
+
+
+def tag_update_loss(params, soldier_features, commander_features, target_chase, target_run, attack_target):
+    micro_s, micro_c = tag_micro_outputs(params, soldier_features, commander_features)
+    ps = jnp.tanh(micro_s[..., :2])
+    pc = jnp.tanh(micro_c[..., :2])
+    ps = ps / (jnp.linalg.norm(ps) + 1e-8)
+    pc = pc / (jnp.linalg.norm(pc) + 1e-8)
+
+    chase_dir_loss = 1.0 - jnp.sum(ps * target_chase)
+    run_dir_loss = 1.0 - jnp.sum(pc * target_run)
+    attack_target = attack_target.astype(jnp.float32)
+    attack_logit = micro_s[..., 2]
+    attack_bce = jnp.maximum(attack_logit, 0.0) - attack_logit * attack_target + jnp.log1p(jnp.exp(-jnp.abs(attack_logit)))
+    loss = jnp.mean(chase_dir_loss + run_dir_loss + 0.25 * attack_bce)
+    return loss, {
+        "tag_loss": loss,
+        "tag_chase_loss": jnp.mean(chase_dir_loss),
+        "tag_run_loss": jnp.mean(run_dir_loss),
+        "tag_attack_loss": jnp.mean(attack_bce),
+    }
+
+
+@jax.jit
+def tag_update_minibatch(params, opt_state, soldier_features, commander_features, target_chase, target_run, attack_target):
+    def loss_fn(p):
+        return tag_update_loss(
+            p, soldier_features, commander_features,
+            target_chase, target_run, attack_target,
+        )
+    (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    del loss
+    grads = masked_tree(grads, TAG_ENCODER_KEYS)
+    updates, opt_state = tag_optimizer.update(grads, opt_state, params)
+    params = optax.apply_updates(params, updates)
+    metrics = dict(metrics)
+    metrics["tag_grad_norm"] = jnp.sqrt(
+        sum(jnp.sum(x * x) for x in jax.tree_util.tree_leaves(grads)) + 1e-12
+    )
+    return params, opt_state, metrics
+
+
+def tag_micro_local_action(params, soldier_features, commander_features):
+    micro_s, micro_c = tag_micro_outputs(params, soldier_features, commander_features)
+    s_vec = jnp.tanh(micro_s[..., :2])
+    s_vec = s_vec / (jnp.linalg.norm(s_vec) + 1e-8)
+    c_vec = jnp.tanh(micro_c)
+    c_vec = c_vec / (jnp.linalg.norm(c_vec) + 1e-8)
+    attack = (jax.nn.sigmoid(micro_s[..., 2]) >= 0.5).astype(jnp.float32)
+    return s_vec[..., 0], s_vec[..., 1], attack, c_vec[..., 0], c_vec[..., 1]
+
+
+def tag_step_one(state, role, chaser_dx, chaser_dz, chaser_attack, runner_dx, runner_dz):
+    _, _, chaser_idx, runner_cmd_idx, _ = tag_role_indices(role)
+    x, z = state["x"], state["z"]
+    chx, chz = x[chaser_idx], z[chaser_idx]
+    rx, rz = x[runner_cmd_idx], z[runner_cmd_idx]
+
+    old_dist = jnp.sqrt((rx - chx) ** 2 + (rz - chz) ** 2 + 1e-8)
+
+    ch_nx = chx + chaser_dx * TAG_CHASER_SPEED * DT
+    ch_nz = chz + chaser_dz * TAG_CHASER_SPEED * DT
+    r_nx = rx + runner_dx * TAG_RUNNER_SPEED * DT
+    r_nz = rz + runner_dz * TAG_RUNNER_SPEED * DT
+
+    ch_inside = (
+        (ch_nx >= -HALF_FIELD + SOLDIER_RADIUS)
+        & (ch_nx <= HALF_FIELD - SOLDIER_RADIUS)
+        & (ch_nz >= -HALF_FIELD + SOLDIER_RADIUS)
+        & (ch_nz <= HALF_FIELD - SOLDIER_RADIUS)
+    )
+    r_inside = (
+        (r_nx >= -HALF_FIELD + COMMANDER_RADIUS)
+        & (r_nx <= HALF_FIELD - COMMANDER_RADIUS)
+        & (r_nz >= -HALF_FIELD + COMMANDER_RADIUS)
+        & (r_nz <= HALF_FIELD - COMMANDER_RADIUS)
+    )
+    ch_blocked = tag_wall_blocked(ch_nx, ch_nz, SOLDIER_RADIUS)
+    r_blocked = tag_wall_blocked(r_nx, r_nz, COMMANDER_RADIUS)
+
+    ch_valid = ch_inside & (~ch_blocked)
+    r_valid = r_inside & (~r_blocked)
+    ch_nx = jnp.where(ch_valid, ch_nx, chx)
+    ch_nz = jnp.where(ch_valid, ch_nz, chz)
+    r_nx = jnp.where(r_valid, r_nx, rx)
+    r_nz = jnp.where(r_valid, r_nz, rz)
+
+    new_dist = jnp.sqrt((r_nx - ch_nx) ** 2 + (r_nz - ch_nz) ** 2 + 1e-8)
+    captured = new_dist <= ATTACK_RANGE
+    new_time = state["time"] + DT
+    timeout = new_time >= TAG_MAX_STEPS * DT
+    done = captured | timeout
+
+    nx = x.at[chaser_idx].set(ch_nx)
+    nz = z.at[chaser_idx].set(ch_nz)
+    nx = nx.at[runner_cmd_idx].set(r_nx)
+    nz = nz.at[runner_cmd_idx].set(r_nz)
+    nvx = state["vx"].at[chaser_idx].set(jnp.where(ch_valid, chaser_dx, 0.0))
+    nvz = state["vz"].at[chaser_idx].set(jnp.where(ch_valid, chaser_dz, 0.0))
+    nvx = nvx.at[runner_cmd_idx].set(jnp.where(r_valid, runner_dx, 0.0))
+    nvz = nvz.at[runner_cmd_idx].set(jnp.where(r_valid, runner_dz, 0.0))
+
+    reward_chaser = TAG_STEP_PENALTY + (TAG_CAPTURE_REWARD * captured.astype(jnp.float32))
+    reward_runner = TAG_STEP_PENALTY + (TAG_RUNNER_CAPTURE_REWARD * captured.astype(jnp.float32))
+    reward_chaser = reward_chaser + (old_dist - new_dist) * 0.05
+    reward_runner = reward_runner - (old_dist - new_dist) * 0.05
+
+    next_state = {
+        **state,
+        "x": nx,
+        "z": nz,
+        "vx": nvx,
+        "vz": nvz,
+        "time": new_time,
+        "done": done,
+    }
+    return next_state, reward_chaser, reward_runner, done, captured
+
+
+@jax.jit
+def tag_rollout_step(params, states, roles):
+    soldier_features = jax.vmap(make_tag_soldier_features)(states, roles)
+    commander_features = jax.vmap(make_tag_commander_features)(states, roles)
+    target_chase, target_run, dist_now = jax.vmap(tag_target_vectors)(states, roles)
+    # ``dist_now`` is already computed per environment by tag_target_vectors.
+    # Re-indexing states["x"] with a vector of unit indices here would index the
+    # batch dimension and incorrectly produce shape (BATCH, N_UNITS).
+    attack_target = (dist_now <= ATTACK_RANGE).astype(jnp.float32)
+    return soldier_features, commander_features, target_chase, target_run, attack_target
+
+
+def train_tag_game(params, key, steps=TAG_TRAIN_STEPS):
+    states, roles = reset_tag_batch(key, TAG_BATCH_SIZE)
+    opt_state = tag_optimizer.init(params)
+    metrics_list = []
+    captures = []
+    for i in range(steps):
+        key, reset_key = random.split(key)
+        soldier_features, commander_features, target_chase, target_run, attack_target = tag_rollout_step(
+            params, states, roles
+        )
+        params, opt_state, metrics = tag_update_minibatch(
+            params, opt_state,
+            soldier_features, commander_features,
+            target_chase, target_run, attack_target,
+        )
+        sdx, sdz, sat, cdx, cdz = tag_micro_local_action(
+            params, soldier_features, commander_features
+        )
+        states, _, _, done, captured = jax.vmap(tag_step_one)(
+            states, roles, sdx, sdz, sat, cdx, cdz
+        )
+        fresh = reset_tag_parallel(random.split(reset_key, TAG_BATCH_SIZE), roles)
+        def merge(old, new):
+            mask = done if old.ndim == 1 else done.reshape((TAG_BATCH_SIZE,) + (1,) * (old.ndim - 1))
+            return jnp.where(mask, new, old)
+        states = jax.tree_util.tree_map(merge, states, fresh)
+        metrics_list.append({k: float(v) for k, v in metrics.items()})
+        captures.append(int(jnp.sum(captured)))
+    if not metrics_list:
+        raise ValueError("TAG_TRAIN_STEPS must be at least 1")
+    metrics = {
+        k: float(np.mean([m[k] for m in metrics_list]))
+        for k in metrics_list[0]
+    }
+    metrics["tag_captures"] = int(sum(captures))
+    metrics["tag_batch"] = TAG_BATCH_SIZE
+    metrics["tag_steps"] = steps
+    return params, key, metrics
+
 
 # ============================================================
 # ROLLOUT
@@ -1639,8 +2145,8 @@ def collect_rollout(params, state, key):
     ) = traj
 
     f_red_obs, f_blue_obs = make_observation_pair_batch(final_state)
-    _, red_last_v = policy_forward(params, f_red_obs)
-    _, blue_last_v = policy_forward(params, f_blue_obs)
+    red_last_v = policy_forward(params, f_red_obs)["value"]
+    blue_last_v = policy_forward(params, f_blue_obs)["value"]
 
     red_team_adv, red_ret = compute_gae(
         red_team_r, red_v, dones, red_last_v
@@ -1862,6 +2368,7 @@ def run_ppo_update(params, opt_state, state, key, global_update, total_updates):
         stats,
         metrics,
     )
+
 
 # ============================================================
 # PART 4 : EVALUATION
@@ -2334,7 +2841,6 @@ def save_params(path, params, metadata=None):
     return path
 
 
-
 def save_checkpoint(
     path,
     params,
@@ -2347,30 +2853,23 @@ def save_checkpoint(
     entropy_schedule_total_updates=None,
 ):
     data = {f"param_{k}": np.asarray(v) for k, v in params.items()}
-
     leaves = jax.tree_util.tree_leaves(opt_state)
     for i, leaf in enumerate(leaves):
         data[f"opt_{i}"] = np.asarray(leaf)
     data["opt_n_leaves"] = np.array(len(leaves), dtype=np.int32)
-
     data["generation"] = np.array(generation, dtype=np.int32)
     data["ppo_index"] = np.array(ppo_index, dtype=np.int32)
     data["elite_path"] = np.array(elite_path if elite_path else "")
     data["master_key"] = np.asarray(random.key_data(master_key))
     if entropy_schedule_start_generation is not None:
-        data["entropy_schedule_start_generation"] = np.array(
-            entropy_schedule_start_generation, dtype=np.int32
-        )
+        data["entropy_schedule_start_generation"] = np.array(entropy_schedule_start_generation, dtype=np.int32)
     if entropy_schedule_total_updates is not None:
-        data["entropy_schedule_total_updates"] = np.array(
-            entropy_schedule_total_updates, dtype=np.int32
-        )
-
+        data["entropy_schedule_total_updates"] = np.array(entropy_schedule_total_updates, dtype=np.int32)
     np.savez(path, **data)
     return path
 
 
-def required_new_policy_shapes():
+def required_policy_shapes():
     required_shapes = {
         "Ws1": (SOLDIER_FEATURES, LOCAL_HIDDEN_SIZE),
         "bs1": (LOCAL_HIDDEN_SIZE,),
@@ -2378,20 +2877,26 @@ def required_new_policy_shapes():
         "bs2": (LOCAL_EMBED_SIZE,),
         "Wc": (COMMANDER_FEATURES, LOCAL_EMBED_SIZE),
         "bc": (LOCAL_EMBED_SIZE,),
+        "W_micro_s": (LOCAL_EMBED_SIZE, 3),
+        "b_micro_s": (3,),
+        "W_micro_c": (LOCAL_EMBED_SIZE, 2),
+        "b_micro_c": (2,),
         "Wg1": (GLOBAL_INPUT_SIZE, HIDDEN1),
         "bg1": (HIDDEN1,),
-        "W_actor_s": (HIDDEN1, ACTOR_HIDDEN),
+        "W_actor_s": (HIDDEN1 + LOCAL_EMBED_SIZE, ACTOR_HIDDEN),
         "b_actor_s": (ACTOR_HIDDEN,),
-        "W_actor_c": (HIDDEN1, ACTOR_HIDDEN),
+        "W_actor_c": (HIDDEN1 + LOCAL_EMBED_SIZE, ACTOR_HIDDEN),
         "b_actor_c": (ACTOR_HIDDEN,),
         "W_critic": (HIDDEN1, CRITIC_HIDDEN),
         "b_critic": (CRITIC_HIDDEN,),
-        "Wa_s": (ACTOR_HIDDEN, SOLDIER_ACTION_SIZE),
-        "ba_s": (SOLDIER_ACTION_SIZE,),
-        "Wa_c": (ACTOR_HIDDEN, COMMANDER_ACTION_SIZE),
-        "ba_c": (COMMANDER_ACTION_SIZE,),
+        "Wa_s_macro": (ACTOR_HIDDEN, MACRO_SOLDIER_OUTPUT_SIZE),
+        "ba_s_macro": (MACRO_SOLDIER_OUTPUT_SIZE,),
+        "Wa_c_macro": (ACTOR_HIDDEN, MACRO_COMMANDER_OUTPUT_SIZE),
+        "ba_c_macro": (MACRO_COMMANDER_OUTPUT_SIZE,),
         "Wv": (CRITIC_HIDDEN, 1),
         "bv": (1,),
+        "logstd_s": (N_SOLDIERS_PER_TEAM,),
+        "logstd_c": (),
     }
     for prefix in ("attn1", "attn2"):
         required_shapes.update({
@@ -2409,37 +2914,36 @@ def required_new_policy_shapes():
     return required_shapes
 
 
-def required_old_policy_shapes():
+def required_legacy_shapes():
     required_shapes = {
-        "Ws1": (SOLDIER_FEATURES, LOCAL_HIDDEN_SIZE),
+        "Ws1": (17, LOCAL_HIDDEN_SIZE),
         "bs1": (LOCAL_HIDDEN_SIZE,),
         "Ws2": (LOCAL_HIDDEN_SIZE, LOCAL_EMBED_SIZE),
         "bs2": (LOCAL_EMBED_SIZE,),
         "Wc": (COMMANDER_FEATURES, LOCAL_EMBED_SIZE),
         "bc": (LOCAL_EMBED_SIZE,),
-        "Wg1": (GLOBAL_INPUT_SIZE, HIDDEN1),
-        "bg1": (HIDDEN1,),
-        "W_actor": (HIDDEN1, ACTOR_HIDDEN),
-        "b_actor": (ACTOR_HIDDEN,),
-        "W_critic": (HIDDEN1, CRITIC_HIDDEN),
-        "b_critic": (CRITIC_HIDDEN,),
-        "Wa": (ACTOR_HIDDEN, ACTION_SIZE),
-        "ba": (ACTION_SIZE,),
-        "Wv": (CRITIC_HIDDEN, 1),
+        "Wg1": (13184, 512),
+        "bg1": (512,),
+        "W_actor_s": (512, 512),
+        "b_actor_s": (512,),
+        "W_actor_c": (512, 512),
+        "b_actor_c": (512,),
+        "W_critic": (512, 512),
+        "b_critic": (512,),
+        "Wa_s": (512, 300),
+        "ba_s": (300,),
+        "Wa_c": (512, 2),
+        "ba_c": (2,),
+        "Wv": (512, 1),
         "bv": (1,),
     }
     for prefix in ("attn1", "attn2"):
         required_shapes.update({
-            f"{prefix}_Wq": (LOCAL_EMBED_SIZE, LOCAL_EMBED_SIZE),
-            f"{prefix}_bq": (LOCAL_EMBED_SIZE,),
-            f"{prefix}_Wk": (LOCAL_EMBED_SIZE, LOCAL_EMBED_SIZE),
-            f"{prefix}_bk": (LOCAL_EMBED_SIZE,),
-            f"{prefix}_Wv": (LOCAL_EMBED_SIZE, LOCAL_EMBED_SIZE),
-            f"{prefix}_bv": (LOCAL_EMBED_SIZE,),
-            f"{prefix}_Wo": (LOCAL_EMBED_SIZE, LOCAL_EMBED_SIZE),
-            f"{prefix}_bo": (LOCAL_EMBED_SIZE,),
-            f"{prefix}_ln_gamma": (LOCAL_EMBED_SIZE,),
-            f"{prefix}_ln_beta": (LOCAL_EMBED_SIZE,),
+            f"{prefix}_Wq": (64, 64), f"{prefix}_bq": (64,),
+            f"{prefix}_Wk": (64, 64), f"{prefix}_bk": (64,),
+            f"{prefix}_Wv": (64, 64), f"{prefix}_bv": (64,),
+            f"{prefix}_Wo": (64, 64), f"{prefix}_bo": (64,),
+            f"{prefix}_ln_gamma": (64,), f"{prefix}_ln_beta": (64,),
         })
     return required_shapes
 
@@ -2451,42 +2955,75 @@ def _shapes_match(params, shapes):
 
 
 def policy_params_compatible(params):
-    return (
-        _shapes_match(params, required_new_policy_shapes())
-        or _shapes_match(params, required_old_policy_shapes())
-    )
+    return _shapes_match(params, required_policy_shapes()) or _shapes_match(params, required_legacy_shapes())
 
 
 def migrate_policy_params(params):
-    """Upgrade the previous shared-actor checkpoint layout to two actor branches."""
-    if _shapes_match(params, required_new_policy_shapes()):
+    if _shapes_match(params, required_policy_shapes()):
         return params, False
-    if not _shapes_match(params, required_old_policy_shapes()):
+    if not _shapes_match(params, required_legacy_shapes()):
         raise ValueError("Incompatible policy parameter shapes")
 
-    new_params = {
-        k: v for k, v in params.items()
-        if k not in ("W_actor", "b_actor", "Wa", "ba")
-    }
-    new_params["W_actor_s"] = params["W_actor"].copy()
-    new_params["b_actor_s"] = params["b_actor"].copy()
-    new_params["W_actor_c"] = params["W_actor"].copy()
-    new_params["b_actor_c"] = params["b_actor"].copy()
-    new_params["Wa_s"] = params["Wa"][:, :SOLDIER_ACTION_SIZE].copy()
-    new_params["ba_s"] = params["ba"][:SOLDIER_ACTION_SIZE].copy()
-    new_params["Wa_c"] = params["Wa"][:, SOLDIER_ACTION_SIZE:].copy()
-    new_params["ba_c"] = params["ba"][SOLDIER_ACTION_SIZE:].copy()
+    # Start from fresh micro/macro architecture and retain the old learned
+    # local encoder, attention, global trunk, critic, and shared actor where
+    # dimensions overlap. The extra 8 soldier terrain inputs are freshly
+    # initialized, while old 17-feature weights are copied intact.
+    seed = random.PRNGKey(1234567)
+    new_params = init_policy(seed)
+    new_params["Ws1"] = new_params["Ws1"].at[:17, :].set(params["Ws1"])
+    for k in ("bs1", "Ws2", "bs2", "Wc", "bc"):
+        new_params[k] = params[k].copy()
+    for prefix in ("attn1", "attn2"):
+        for suffix in ("Wq","bq","Wk","bk","Wv","bv","Wo","bo","ln_gamma","ln_beta"):
+            k = f"{prefix}_{suffix}"
+            new_params[k] = params[k].copy()
+
+    # Shrink old 512-wide trunks into the new 384-wide trunks by taking the
+    # corresponding top-left blocks.
+    h = HIDDEN1
+    ah = ACTOR_HIDDEN
+    ch = CRITIC_HIDDEN
+    new_params["Wg1"] = new_params["Wg1"].at[:, :h].set(params["Wg1"][:, :h])
+    new_params["bg1"] = new_params["bg1"].at[:h].set(params["bg1"][:h])
+    for actor in ("W_actor_s", "W_actor_c"):
+        new_params[actor] = new_params[actor].at[:h, :ah].set(params[actor][:h, :ah])
+    new_params["W_critic"] = new_params["W_critic"].at[:h, :ch].set(params["W_critic"][:h, :ch])
+    for actor_b in ("b_actor_s", "b_actor_c", "b_critic"):
+        new_params[actor_b] = new_params[actor_b].at[:ah].set(params[actor_b][:ah])
+    new_params["Wv"] = new_params["Wv"].at[:ch, :].set(params["Wv"][:ch, :])
+    new_params["bv"] = params["bv"].copy()
+
+    # Initialize the new macro heads. Preserve old angle/attack heads in the
+    # corresponding macro x/z/attack positions, and set ratio to mild micro
+    # preference so the inherited policy is not discarded immediately.
+    old_ws = params["Wa_s"][:ah, :]
+    old_bs = params["ba_s"][:]
+    for i in range(N_SOLDIERS_PER_TEAM):
+        old_base = 3 * i
+        new_base = 4 * i
+        # Old output is [angle_mean, angle_logstd, attack]. We map angle_mean
+        # into a directional x component and keep attack. z starts at zero.
+        new_params["Wa_s_macro"] = new_params["Wa_s_macro"].at[:, new_base].set(old_ws[:, old_base])
+        new_params["Wa_s_macro"] = new_params["Wa_s_macro"].at[:, new_base + 2].set(old_ws[:, old_base + 2])
+        new_params["ba_s_macro"] = new_params["ba_s_macro"].at[new_base].set(old_bs[old_base])
+        new_params["ba_s_macro"] = new_params["ba_s_macro"].at[new_base + 2].set(old_bs[old_base + 2])
+        new_params["ba_s_macro"] = new_params["ba_s_macro"].at[new_base + 3].set(-2.1972246)  # sigmoid ~= 0.10
+
+    old_cmd_w = params["Wa_c"][:ah, :]
+    old_cmd_b = params["ba_c"]
+    new_params["Wa_c_macro"] = new_params["Wa_c_macro"].at[:,:].set(old_cmd_w)
+    new_params["ba_c_macro"] = new_params["ba_c_macro"].at[:].set(old_cmd_b)
+
+    old_s_logstd = params["ba_s"]
+    new_params["logstd_s"] = new_params["logstd_s"].at[:].set(old_s_logstd[1::3])
+    new_params["logstd_c"] = old_cmd_b[1]
     return new_params, True
 
 
 def saved_policy_file_compatible(path):
     try:
         with np.load(path, allow_pickle=False) as d:
-            params = {
-                k[len("param_"):]: d[k]
-                for k in d.files
-                if k.startswith("param_")
-            }
+            params = {k[len("param_"):]: d[k] for k in d.files if k.startswith("param_")}
         return policy_params_compatible(params)
     except Exception:
         return False
@@ -2494,14 +3031,10 @@ def saved_policy_file_compatible(path):
 
 def load_params(path):
     d = np.load(path, allow_pickle=False)
-    raw_params = {
-        k[len("param_"):]: jnp.asarray(d[k])
-        for k in d.files
-        if k.startswith("param_")
-    }
+    raw_params = {k[len("param_"):]: jnp.asarray(d[k]) for k in d.files if k.startswith("param_")}
     params, migrated = migrate_policy_params(raw_params)
     if migrated:
-        print(f"Migrated legacy shared Actor checkpoint: {os.path.basename(path)}")
+        print(f"Migrated legacy checkpoint into micro/macro architecture: {os.path.basename(path)}")
     meta = {}
     if "metadata_json" in d.files:
         try:
@@ -2513,21 +3046,10 @@ def load_params(path):
 
 def load_checkpoint(path):
     d = np.load(path, allow_pickle=False)
-
-    raw_params = {
-        k[len("param_"):]: jnp.asarray(d[k])
-        for k in d.files
-        if k.startswith("param_")
-    }
+    raw_params = {k[len("param_"):]: jnp.asarray(d[k]) for k in d.files if k.startswith("param_")}
     params, migrated = migrate_policy_params(raw_params)
-
     if migrated:
-        # Optimizer moments from the old parameter tree cannot be mapped safely
-        # to the new split Actor tree. Reinitialize Adam for this one resume.
-        print(
-            "Legacy checkpoint architecture detected; migrating parameters "
-            "and reinitializing optimizer state."
-        )
+        print("Legacy checkpoint architecture detected; migrated parameters and reinitialized PPO optimizer state.")
         opt_state = optimizer.init(params)
     else:
         template = optimizer.init(params)
@@ -2535,17 +3057,12 @@ def load_checkpoint(path):
         treedef = jax.tree_util.tree_structure(template)
         n = int(d["opt_n_leaves"])
         if n != len(template_leaves):
-            raise ValueError(
-                f"Incompatible optimizer state in checkpoint: {path}"
-            )
-
+            raise ValueError(f"Incompatible optimizer state in checkpoint: {path}")
         leaves = []
         for i, template_leaf in enumerate(template_leaves):
             leaf = jnp.asarray(d[f"opt_{i}"])
             if tuple(leaf.shape) != tuple(template_leaf.shape):
-                raise ValueError(
-                    f"Incompatible optimizer leaf {i} in checkpoint: {path}"
-                )
+                raise ValueError(f"Incompatible optimizer leaf {i} in checkpoint: {path}")
             leaves.append(leaf)
         opt_state = jax.tree_util.tree_unflatten(treedef, leaves)
 
@@ -2553,29 +3070,14 @@ def load_checkpoint(path):
     ppo_index = int(d["ppo_index"])
     elite_path = str(d["elite_path"]) if "elite_path" in d.files else ""
     master_key = random.wrap_key_data(jnp.asarray(d["master_key"]))
-    schedule_start_generation = (
-        int(d["entropy_schedule_start_generation"])
-        if "entropy_schedule_start_generation" in d.files
-        else generation
-    )
-    schedule_total_updates = (
-        int(d["entropy_schedule_total_updates"])
-        if "entropy_schedule_total_updates" in d.files
-        else None
-    )
+    schedule_start_generation = int(d["entropy_schedule_start_generation"]) if "entropy_schedule_start_generation" in d.files else generation
+    schedule_total_updates = int(d["entropy_schedule_total_updates"]) if "entropy_schedule_total_updates" in d.files else None
+    return params, opt_state, generation, ppo_index, elite_path, master_key, schedule_start_generation, schedule_total_updates
 
-    return (
-        params, opt_state, generation, ppo_index, elite_path, master_key,
-        schedule_start_generation, schedule_total_updates
-    )
 
 def generation_number(path):
-    try:
-        return int(
-            os.path.basename(path).split("generation_")[1].split(".npz")[0]
-        )
-    except Exception:
-        return -1
+    m = re.search(r"generation_(\d+)", os.path.basename(path))
+    return int(m.group(1)) if m else -1
 
 
 def checkpoint_number(path):
@@ -2590,18 +3092,19 @@ def checkpoint_number(path):
 
 def find_latest_elite():
     files = glob.glob(os.path.join(ELITE_DIR, "generation_*.npz"))
-    
-    # 世代番号が新しい順（降順）に並び替える
-    files_sorted = sorted(files, key=generation_number, reverse=True)
-    
-    # 最新のものから順番に1つずつチェックし、OKなら即座に返す
+    files_sorted = sorted(
+        files,
+        key=lambda f: (
+            generation_number(f),
+            1 if "_micro_macro_migrated" in os.path.basename(f) else 0,
+        ),
+        reverse=True,
+    )
     for f in files_sorted:
         if saved_policy_file_compatible(f):
             return f
-            
-    # もし使えるファイルが1つも無ければ None
     if files:
-        print(f"Ignoring incompatible Elite file(s) (current global input={GLOBAL_INPUT_SIZE}).")
+        print(f"Ignoring incompatible Elite file(s); starting from a migrated/new architecture.")
     return None
 
 
@@ -2609,22 +3112,15 @@ def find_latest_checkpoint():
     files = glob.glob(os.path.join(CHECKPOINT_DIR, "checkpoint_*.npz"))
     compatible = []
     incompatible = []
-
     for path in files:
         if saved_policy_file_compatible(path):
             compatible.append(path)
         else:
             incompatible.append(path)
-
     if incompatible:
-        print(
-            f"Ignoring {len(incompatible)} incompatible checkpoint(s) "
-            f"(current global input={GLOBAL_INPUT_SIZE})."
-        )
-
+        print(f"Ignoring {len(incompatible)} incompatible checkpoint(s).")
     if not compatible:
         return None
-
     return sorted(compatible, key=checkpoint_number)[-1]
 
 
@@ -2646,6 +3142,196 @@ def prune_checkpoints(keep_path=None):
 # ============================================================
 
 LAST_COMPLETED_GENERATION = None
+
+
+def tag_policy_number(path):
+    try:
+        name = os.path.basename(path)
+        tail = name.split("tag_policy_", 1)[1]
+        tail = tail.split("_bout_", 1)[0]
+        tail = tail.split(".npz", 1)[0]
+        return int(tail)
+    except Exception:
+        return -1
+
+
+def find_latest_tag_policy():
+    files = glob.glob(os.path.join(TAG_ELITE_DIR, "tag_policy_*.npz"))
+    if not files:
+        return None
+    return sorted(files, key=tag_policy_number)[-1]
+
+
+def choose_tag_seed_policy(production_elite):
+    """Return the newer of the production Elite and standalone Tag Elite.
+
+    Tag training writes a full parameter tree, but only TAG_ENCODER_KEYS are
+    modified.  A Tag Elite is therefore a safe initialization source for the
+    next production run.  File mtime is used intentionally: once production
+    creates a newer Elite, the old Tag Elite is no longer preferred.
+    """
+    tag_path = find_latest_tag_policy()
+    if tag_path is None:
+        return production_elite, "production Elite"
+    if production_elite is None:
+        return tag_path, "Tag Elite"
+    try:
+        if os.path.getmtime(tag_path) > os.path.getmtime(production_elite):
+            return tag_path, "Tag Elite"
+    except OSError:
+        pass
+    return production_elite, "production Elite"
+
+
+def run_tag_training(n_updates=TAG_UPDATES_PER_RUN, resume=True):
+    """Standalone tag-game training.
+
+    Only the encoder + Micro heads are updated.  The resulting full parameter
+    tree is saved separately under TAG_ELITE_DIR so production PPO can consume
+    it on the next run without modifying the production Elite in place.
+    """
+    if n_updates < 1:
+        raise ValueError("n_updates must be >= 1")
+
+    production_elite = find_latest_elite()
+    if production_elite is None:
+        key, ik = random.split(random.key(int(time.time()) & 0x7FFFFFFF))
+        params0 = init_policy(ik)
+        production_elite = save_params(
+            os.path.join(ELITE_DIR, "generation_0000.npz"),
+            params0,
+            {
+                "generation": 0,
+                "source": "random_init_for_tag_training",
+                "raw_obs_size": RAW_OBS_SIZE,
+                "global_input_size": GLOBAL_INPUT_SIZE,
+            },
+        )
+        del key
+        print("Created production Generation 0 Elite for tag training.")
+
+    start_path, start_source = choose_tag_seed_policy(production_elite)
+    params, _ = load_params(start_path)
+    master_key = random.key(int(time.time()) & 0x7FFFFFFF)
+    master_key, tag_key = random.split(master_key)
+
+    print()
+    print("============================================")
+    print("STANDALONE TAG TRAINING")
+    print("============================================")
+    print(f"Starting policy      : {os.path.basename(start_path)} ({start_source})")
+    print(f"Updates              : {n_updates}")
+    print(f"Batch                : {TAG_BATCH_SIZE}")
+    print(f"Field                : {FIELD_SIZE} x {FIELD_SIZE}")
+    print(f"Walls                : {len(TAG_WALL_LIST)}")
+    print(f"Chaser speed         : {TAG_CHASER_SPEED:.3f}")
+    print(f"Runner speed         : {TAG_RUNNER_SPEED:.3f}")
+    print(f"Max tag time         : {TAG_MAX_STEPS * DT:.1f} s")
+    print("Updated parameters   : Soldier/Commander Encoders + Micro heads")
+    print()
+
+    t0 = time.time()
+    params, tag_key, metrics = train_tag_game(
+        params, tag_key, steps=int(n_updates)
+    )
+    elapsed = time.time() - t0
+
+    existing = find_latest_tag_policy()
+    next_number = tag_policy_number(existing) + 1 if existing else 1
+    tag_policy_path = os.path.join(
+        TAG_ELITE_DIR, f"tag_policy_{next_number:06d}.npz"
+    )
+    save_params(
+        tag_policy_path,
+        params,
+        {
+            "source": "standalone_tag_training",
+            "source_policy": os.path.abspath(start_path),
+            "tag_updates": int(n_updates),
+            "tag_batch": TAG_BATCH_SIZE,
+            "tag_walls": TAG_WALL_LIST,
+        },
+    )
+
+    print(
+        f"Tag training done     | loss {metrics['tag_loss']:.4f} "
+        f"chase {metrics['tag_chase_loss']:.4f} "
+        f"run {metrics['tag_run_loss']:.4f} "
+        f"attack {metrics['tag_attack_loss']:.4f} "
+        f"grad {metrics['tag_grad_norm']:.3e} "
+        f"captures {metrics['tag_captures']} "
+        f"time {elapsed:.1f} s"
+    )
+    print(f"Tag policy saved      : {tag_policy_path}")
+
+    # Save multiple independent replays from the updated Micro policy so any
+    # representative tag game can be inspected later.
+    replay_paths = []
+    replay_records = []
+    for sample_index in range(TAG_REPLAY_SAMPLES_PER_RUN):
+        master_key, episode_key = random.split(master_key)
+        role = int(sample_index % 2)
+        role_j = jnp.array(role, dtype=jnp.int32)
+        tag_init = reset_tag_one(episode_key, role_j)
+        tag_bout = record_tag_bout(params, tag_init, role=role)
+        tag_bout["sample_index"] = sample_index
+        vx, vz = verify_tag_bout(
+            tag_init, role, tag_bout["chaser_actions"], tag_bout["runner_actions"]
+        )
+        err_x = float(np.max(np.abs(vx - tag_bout["x"])))
+        err_z = float(np.max(np.abs(vz - tag_bout["z"])))
+        verify_pass = err_x < 1e-6 and err_z < 1e-6
+        tag_bout["verification_pass"] = verify_pass
+        tag_bout["max_state_error"] = max(err_x, err_z)
+        bout_path = os.path.join(
+            TAG_BOUT_DIR,
+            f"tag_policy_{next_number:06d}_bout_{sample_index:03d}.npz",
+        )
+        save_tag_bout(
+            bout_path, int(next_number), tag_bout, verify_pass, max(err_x, err_z)
+        )
+        replay_path, _ = build_tag_replay_html(
+            bout_path,
+            os.path.join(
+                TAG_REPLAY_DIR,
+                f"tag_policy_{next_number:06d}_bout_{sample_index:03d}.html",
+            ),
+        )
+        replay_paths.append(replay_path)
+        replay_records.append(
+            {
+                "sample_index": sample_index,
+                "role": role,
+                "winner_code": int(tag_bout["winner_code"]),
+                "steps": int(tag_bout["end_step"]),
+                "bout_path": bout_path,
+                "replay_path": replay_path,
+            }
+        )
+        print(
+            f"Tag replay [{sample_index:02d}] : {replay_path} "
+            f"role={role} result={int(tag_bout['winner_code'])} "
+            f"{'PASS' if verify_pass else f'FAIL {max(err_x, err_z):.2e}'}"
+        )
+
+    # Backward-compatible representative replay: shortest captured game,
+    # otherwise sample 0 when all samples timeout.
+    decisive = [r for r in replay_records if r["winner_code"] == 1]
+    representative = min(decisive, key=lambda r: r["steps"]) if decisive else replay_records[0]
+    representative_npz = os.path.join(
+        TAG_BOUT_DIR, f"tag_policy_{next_number:06d}_best_bout.npz"
+    )
+    with open(representative["bout_path"], "rb") as src, open(representative_npz, "wb") as dst:
+        dst.write(src.read())
+    representative_html = os.path.join(
+        TAG_REPLAY_DIR, f"tag_policy_{next_number:06d}.html"
+    )
+    representative_html_path, _ = build_tag_replay_html(
+        representative_npz, representative_html
+    )
+    print(f"Tag replay representative : {representative_html_path}")
+    print(f"Tag replay samples        : {len(replay_paths)}")
+    return tag_policy_path, representative_html_path
 
 
 def train(n_generations=N_GENERATIONS, resume=True):
@@ -2706,7 +3392,7 @@ def train(n_generations=N_GENERATIONS, resume=True):
                 "source": "random_init",
                 "raw_obs_size": RAW_OBS_SIZE,
                 "global_input_size": GLOBAL_INPUT_SIZE,
-                "architecture": "hierarchical_64_attention2_role_separated_actor_rewards",
+                "architecture": "micro_macro_25feat_64_attention2_tag_aux_role_separated",
                 "ppo_rollout_steps": PPO_ROLLOUT_STEPS,
             },
         )
@@ -2714,8 +3400,52 @@ def train(n_generations=N_GENERATIONS, resume=True):
     else:
         print("Existing Elite found:", os.path.basename(latest_elite))
 
+        # If the latest available Elite is from the old architecture, migrate it
+        # once and persist that migrated parameter tree. Otherwise every new
+        # generation would repeatedly restart from random micro heads and the
+        # tag-trained encoder progress would be discarded whenever the Candidate
+        # failed to replace Elite.
+        try:
+            with np.load(latest_elite, allow_pickle=False) as d_probe:
+                raw_probe = {
+                    k[len("param_"):]: d_probe[k]
+                    for k in d_probe.files
+                    if k.startswith("param_")
+                }
+            if _shapes_match(raw_probe, required_legacy_shapes()):
+                migrated_params, _ = migrate_policy_params(
+                    {k: jnp.asarray(v) for k, v in raw_probe.items()}
+                )
+                migrated_path = os.path.join(
+                    ELITE_DIR,
+                    f"generation_{generation_number(latest_elite):04d}_micro_macro_migrated.npz",
+                )
+                latest_elite = save_params(
+                    migrated_path,
+                    migrated_params,
+                    {
+                        "source": "legacy_elite_migrated_once",
+                        "base_elite": os.path.basename(latest_elite),
+                        "architecture": "micro_macro_25feat_64_attention2_tag_aux_role_separated",
+                    },
+                )
+                print("Persisted migrated Elite:", os.path.basename(latest_elite))
+        except Exception as exc:
+            print(f"Elite migration persistence skipped: {exc}")
+
     if entropy_schedule_start_generation is None:
         entropy_schedule_start_generation = start_generation
+
+    # Standalone tag training is deliberately outside PPO.  If a newer Tag
+    # Elite exists, consume it only as the initial Candidate for this run.
+    tag_seed_path, tag_seed_source = choose_tag_seed_policy(latest_elite)
+    use_tag_seed = (
+        resumed_params is None
+        and os.path.abspath(tag_seed_path) != os.path.abspath(latest_elite)
+    )
+    if use_tag_seed:
+        print(f"Initial Candidate seed : {os.path.basename(tag_seed_path)} ({tag_seed_source})")
+
     if entropy_schedule_total_updates is None:
         entropy_schedule_total_updates = n_generations * PPO_UPDATES_PER_GENERATION
 
@@ -2735,10 +3465,13 @@ def train(n_generations=N_GENERATIONS, resume=True):
     print(f"Elite eval games   : {EVAL_GAMES}")
     print(f"Soldier encoder    : {SOLDIER_FEATURES} -> {LOCAL_HIDDEN_SIZE} -> {LOCAL_EMBED_SIZE}")
     print(f"Commander encoder  : {COMMANDER_FEATURES} -> {LOCAL_EMBED_SIZE}")
+    print("Micro Soldier      : 64 -> [x,z,attack]")
+    print("Micro Commander    : 64 -> [x,z]")
     print(f"Self-attention     : {N_SOLDIERS_PER_TEAM} soldiers/team, {ATTENTION_HEADS} heads x 2 layers")
     print(f"Global network     : {GLOBAL_INPUT_SIZE} -> {HIDDEN1}")
-    print(f"Soldier actor      : {HIDDEN1} -> {ACTOR_HIDDEN} -> {SOLDIER_ACTION_SIZE}")
-    print(f"Commander actor    : {HIDDEN1} -> {ACTOR_HIDDEN} -> {COMMANDER_ACTION_SIZE}")
+    print(f"Soldier macro       : [global {HIDDEN1} + local {LOCAL_EMBED_SIZE}] -> {ACTOR_HIDDEN} -> 4  ([x,z,attack,ratio] x {N_SOLDIERS_PER_TEAM})")
+    print(f"Commander macro     : [global {HIDDEN1} + local {LOCAL_EMBED_SIZE}] -> {ACTOR_HIDDEN} -> {MACRO_COMMANDER_OUTPUT_SIZE}")
+    print("Final soldier act   : normalized((1-ratio)*micro + ratio*macro)")
     print(f"Global critic      : {HIDDEN1} -> {CRITIC_HIDDEN} -> 1")
     print(f"Soldier rewards    : hit {REWARD_SOLDIER_HIT}, kill {REWARD_SOLDIER_KILL}, "
           f"miss {REWARD_SOLDIER_MISS}, wall {REWARD_SOLDIER_WALL}, "
@@ -2750,7 +3483,10 @@ def train(n_generations=N_GENERATIONS, resume=True):
     print("Reward ownership   : Soldier local -> Soldier Encoder + Soldier Actor")
     print("                     Commander local -> Commander Encoder + Commander Actor")
     print("                     Team win/loss -> Global + both Actors + Critic")
-    print("                     Team win/loss -> encoders BLOCKED (stop-gradient)")
+    print("                     Team win/loss -> encoders BLOCKED; micro heads are masked")
+    print("Tag training        : external command only (not run inside PPO)")
+    print(f"Tag updates/run     : {TAG_UPDATES_PER_RUN}, batch {TAG_BATCH_SIZE}")
+    print(f"Tag walls           : {len(TAG_WALL_LIST)} entries")
     print(f"Warm-up            : 0 -> {WARMUP_MAX_STEPS} steps (not used for PPO)")
     print(f"Damage shaping     : {SHAPING_COEF}")
     print(f"Entropy coef       : {ENTROPY_START} -> {ENTROPY_END}")
@@ -2785,8 +3521,11 @@ def train(n_generations=N_GENERATIONS, resume=True):
             resumed_params = None
             resumed_opt = None
         else:
+            seed_params, _ = load_params(
+                tag_seed_path if (use_tag_seed and generation == start_generation) else latest_elite
+            )
             candidate_params = jax.tree_util.tree_map(
-                lambda a: a.copy(), elite_params
+                lambda a: a.copy(), seed_params
             )
             candidate_opt = optimizer.init(candidate_params)
             first_ppo = 1
@@ -3329,15 +4068,217 @@ def show_replay(generation=None):
     return out_path
 
 # ============================================================
-# ENTRY POINT (Modal用に書き換え)
+# TAG GAME REPLAY
 # ============================================================
 
-# クラウドのGPUで実行するメイン処理
+
+def record_tag_bout(params, initial_state=None, role=0):
+    if initial_state is None:
+        initial_state = reset_tag_one(random.PRNGKey(20260917), jnp.array(role, dtype=jnp.int32))
+
+    state = initial_state
+    xs = [np.asarray(state["x"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]]]
+    zs = [np.asarray(state["z"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]]]
+    dones = []
+    chaser_actions = []
+    runner_actions = []
+    result = 0
+
+    for _ in range(TAG_MAX_STEPS):
+        sf = make_tag_soldier_features(state, jnp.array(role, dtype=jnp.int32))[None, :]
+        cf = make_tag_commander_features(state, jnp.array(role, dtype=jnp.int32))[None, :]
+        sdx, sdz, sat, cdx, cdz = tag_micro_local_action(params, sf, cf)
+        sdx = float(sdx[0]); sdz = float(sdz[0]); sat = float(sat[0])
+        cdx = float(cdx[0]); cdz = float(cdz[0])
+        chaser_actions.append([sdx, sdz, sat])
+        runner_actions.append([cdx, cdz])
+        state, _, _, done, captured = tag_step_one(
+            state, jnp.array(role, dtype=jnp.int32),
+            jnp.array(sdx, dtype=jnp.float32), jnp.array(sdz, dtype=jnp.float32), jnp.array(sat, dtype=jnp.float32),
+            jnp.array(cdx, dtype=jnp.float32), jnp.array(cdz, dtype=jnp.float32),
+        )
+        xs.append(np.asarray(state["x"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]])
+        zs.append(np.asarray(state["z"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]])
+        dones.append(int(done))
+        if bool(done):
+            result = 1 if bool(captured) else 3
+            break
+
+    return {
+        "generation": -1,
+        "role": int(role),
+        "winner_code": int(result),
+        "x": np.asarray(xs, dtype=np.float32),
+        "z": np.asarray(zs, dtype=np.float32),
+        "chaser_actions": np.asarray(chaser_actions, dtype=np.float32),
+        "runner_actions": np.asarray(runner_actions, dtype=np.float32),
+        "end_step": len(chaser_actions),
+        "dt": DT,
+        "field_size": FIELD_SIZE,
+        "terrain_res": TERRAIN_RES,
+        "tag_walls": TAG_WALL_LIST,
+    }
+
+
+def verify_tag_bout(initial_state, role, chaser_actions, runner_actions):
+    state = initial_state
+    xs = [np.asarray(state["x"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]]]
+    zs = [np.asarray(state["z"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]]]
+    for i in range(len(chaser_actions)):
+        ca = chaser_actions[i]
+        ra = runner_actions[i]
+        state, _, _, _, _ = tag_step_one(
+            state, jnp.array(role, dtype=jnp.int32),
+            jnp.array(ca[0], dtype=jnp.float32),
+            jnp.array(ca[1], dtype=jnp.float32),
+            jnp.array(ca[2], dtype=jnp.float32),
+            jnp.array(ra[0], dtype=jnp.float32),
+            jnp.array(ra[1], dtype=jnp.float32),
+        )
+        xs.append(np.asarray(state["x"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]])
+        zs.append(np.asarray(state["z"])[[RED_COMMANDER_INDEX, BLUE_COMMANDER_INDEX, RED_SOLDIER_START, BLUE_SOLDIER_START]])
+    return np.asarray(xs, dtype=np.float32), np.asarray(zs, dtype=np.float32)
+
+
+def save_tag_bout(path, generation, bout, verification_pass=True, max_state_error=0.0):
+    np.savez_compressed(
+        path,
+        generation=np.array(generation, dtype=np.int32),
+        sample_index=np.array(int(bout.get("sample_index", 0)), dtype=np.int32),
+        role=np.array(bout["role"], dtype=np.int32),
+        winner_code=np.array(bout["winner_code"], dtype=np.int32),
+        end_step=np.array(bout["end_step"], dtype=np.int32),
+        dt=np.array(bout["dt"], dtype=np.float32),
+        field_size=np.array(bout["field_size"], dtype=np.float32),
+        terrain_res=np.array(bout["terrain_res"], dtype=np.int32),
+        tag_walls=np.asarray(bout["tag_walls"], dtype=np.float32).reshape((-1, 2)),
+        verification_pass=np.array(1 if verification_pass else 0, dtype=np.int32),
+        max_state_error=np.array(max_state_error, dtype=np.float32),
+        x=bout["x"], z=bout["z"],
+        chaser_actions=bout["chaser_actions"],
+        runner_actions=bout["runner_actions"],
+    )
+    return path
+
+
+def build_tag_replay_html(path, out_path=None):
+    d = np.load(path, allow_pickle=False)
+    generation = int(d["generation"])
+    sample_index = int(d["sample_index"]) if "sample_index" in d else 0
+    role = int(d["role"])
+    winner_code = int(d["winner_code"])
+    end_step = int(d["end_step"])
+    dt = float(d["dt"])
+    field_size = float(d["field_size"])
+    walls_data = d["tag_walls"].astype(np.float32).tolist()
+    x = d["x"].astype(np.float32)
+    z = d["z"].astype(np.float32)
+    ca = d["chaser_actions"].astype(np.float32)
+    ra = d["runner_actions"].astype(np.float32)
+    result_text = "CAUGHT" if winner_code == 1 else "TIMEOUT"
+    verification_pass = bool(int(d["verification_pass"])) if "verification_pass" in d else True
+    max_state_error = float(d["max_state_error"]) if "max_state_error" in d else 0.0
+    chaser_team = "Red" if role == 0 else "Blue"
+    runner_team = "Blue" if role == 0 else "Red"
+    payload = json.dumps({
+        "generation": generation,
+        "role": role,
+        "winner": result_text,
+        "chaserTeam": chaser_team,
+        "runnerTeam": runner_team,
+        "steps": end_step,
+        "dt": dt,
+        "fieldSize": field_size,
+        "walls": walls_data,
+        "x": np.round(x, 4).tolist(),
+        "z": np.round(z, 4).tolist(),
+        "chaserActions": np.round(ca, 3).tolist(),
+        "runnerActions": np.round(ra, 3).tolist(),
+        "attackRange": float(ATTACK_RANGE),
+        "verificationPass": verification_pass,
+        "maxStateError": max_state_error,
+    }, separators=(",", ":"))
+    html = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RTS Tag Game Replay</title><style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#101010;font-family:Arial,Helvetica,sans-serif}#info{position:absolute;left:14px;top:14px;z-index:10;padding:12px 15px;background:rgba(0,0,0,.74);color:#fff;border-radius:8px;line-height:1.5;font-size:14px}#controls{position:absolute;left:14px;bottom:14px;z-index:10;padding:10px 12px;background:rgba(0,0,0,.74);border-radius:8px;color:#fff}button{margin-right:5px;padding:5px 9px;border:0;border-radius:4px;cursor:pointer}#timeline{width:440px;max-width:45vw}.caught{color:#5fd97a;font-weight:bold}.run{color:#ffd95a;font-weight:bold}
+</style></head><body><div id="info"></div><div id="controls"><button id="play">Play</button><button id="pause">Pause</button><button id="reset">Reset</button><button data-speed="0.5">0.5x</button><button data-speed="1">1x</button><button data-speed="2">2x</button><br><br><input id="timeline" type="range" min="0" max="__MAX__" value="0" step="1"><span id="status"></span></div><script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}</script><script type="module">
+import * as THREE from 'three';import {OrbitControls} from 'three/addons/controls/OrbitControls.js';const D=__DATA__;const info=document.getElementById('info'),timeline=document.getElementById('timeline'),status=document.getElementById('status');let t=0,playing=false,speed=1,last=null;const scene=new THREE.Scene();scene.background=new THREE.Color(0x101010);const cam=new THREE.PerspectiveCamera(45,innerWidth/innerHeight,.1,250);cam.position.set(0,18,17);const renderer=new THREE.WebGLRenderer({antialias:true});renderer.setPixelRatio(Math.min(devicePixelRatio||1,2));renderer.setSize(innerWidth,innerHeight);document.body.appendChild(renderer.domElement);const ctl=new OrbitControls(cam,renderer.domElement);ctl.target.set(0,0,0);ctl.update();scene.add(new THREE.HemisphereLight(0xffffff,0x444444,2));scene.add(new THREE.DirectionalLight(0xffffff,1.2));const half=D.fieldSize/2;const ground=new THREE.Mesh(new THREE.PlaneGeometry(D.fieldSize,D.fieldSize),new THREE.MeshStandardMaterial({color:0x303030}));ground.rotation.x=-Math.PI/2;scene.add(ground);scene.add(new THREE.GridHelper(D.fieldSize,D.fieldSize,0x777777,0x444444));for(const p of D.walls){const w=new THREE.Mesh(new THREE.BoxGeometry(1,.7,1),new THREE.MeshStandardMaterial({color:0x777777}));w.position.set(p[0],.35,p[1]);scene.add(w)}const ch=new THREE.Mesh(new THREE.SphereGeometry(.28,20,20),new THREE.MeshStandardMaterial({color:0xff4b4b}));const rn=new THREE.Mesh(new THREE.BoxGeometry(.5,.8,.5),new THREE.MeshStandardMaterial({color:0x4b7bd9}));ch.position.y=.28;rn.position.y=.4;scene.add(ch,rn);function frame(){const raw=t/D.dt,i=Math.min(Math.floor(raw),D.steps),a=i>=D.steps?0:raw-i;const x0=D.x[i],z0=D.z[i],x1=i<D.steps?D.x[i+1]:x0,z1=i<D.steps?D.z[i+1]:z0;return{i,a,xc:x0[D.role===0?2:3]+(x1[D.role===0?2:3]-x0[D.role===0?2:3])*a,zc:z0[D.role===0?2:3]+(z1[D.role===0?2:3]-z0[D.role===0?2:3])*a,xr:x0[D.role===0?1:0]+(x1[D.role===0?1:0]-x0[D.role===0?1:0])*a,zr:z0[D.role===0?1:0]+(z1[D.role===0?1:0]-z0[D.role===0?1:0])*a}}function update(){const f=frame();ch.position.set(f.xc,0,f.zc);rn.position.set(f.xr,0,f.zr);timeline.value=String(f.i);const dist=Math.hypot(f.xc-f.xr,f.zc-f.zr);const cap=f.i>0&&D.chaserActions[f.i-1]&&D.chaserActions[f.i-1][2]>.5;const ver=D.verificationPass?'<span class="caught">Replay verification: PASS</span>':'<span style="color:#ff6a6a;font-weight:bold">Replay verification: FAIL ('+D.maxStateError.toExponential(2)+')</span>';info.innerHTML='<b>Generation '+D.generation+'</b><br>Chaser: <b>'+D.chaserTeam+'</b><br>Runner: <b>'+D.runnerTeam+'</b><br>Time: '+(f.i*D.dt).toFixed(2)+' s<br>Distance: '+dist.toFixed(3)+'<br><span class="run">Runner</span> vs <span class="caught">Chaser</span><br>Result: <b>'+D.winner+'</b><br>Attack output: '+(cap?'ON':'OFF')+'<br>'+ver;status.textContent='Tag Replay | '+(f.i*D.dt).toFixed(2)+' s'}document.getElementById('play').onclick=()=>playing=true;document.getElementById('pause').onclick=()=>playing=false;document.getElementById('reset').onclick=()=>{playing=false;t=0;update()};document.querySelectorAll('button[data-speed]').forEach(b=>b.onclick=()=>speed=parseFloat(b.dataset.speed));timeline.oninput=()=>{playing=false;t=parseInt(timeline.value)*D.dt;update()};addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});function anim(ts){requestAnimationFrame(anim);if(last===null)last=ts;const dt=Math.min(.05,(ts-last)/1000);last=ts;if(playing){t+=dt*speed;if(t>=D.steps*D.dt){t=D.steps*D.dt;playing=false}}update();ctl.update();renderer.render(scene,cam)}update();requestAnimationFrame(anim);
+</script></body></html>"""
+    html=html.replace('__MAX__',str(end_step)).replace('__DATA__',payload)
+    if out_path is None:
+        out_path=os.path.join(
+            TAG_REPLAY_DIR,
+            f'tag_replay_policy_{generation:06d}_bout_{sample_index:03d}.html',
+        )
+    Path(out_path).write_text(html,encoding='utf-8')
+    return out_path, html
+
+
+def tag_bout_filename(policy_number, bout_number):
+    return os.path.join(
+        TAG_BOUT_DIR,
+        f"tag_policy_{int(policy_number):06d}_bout_{int(bout_number):03d}.npz",
+    )
+
+
+def find_latest_tag_bout(policy_number=None, bout_number=None):
+    if policy_number is None:
+        files = sorted(
+            glob.glob(os.path.join(TAG_BOUT_DIR, "tag_policy_*_bout_*.npz")),
+            key=lambda p: (tag_policy_number(p), os.path.basename(p)),
+        )
+        if files:
+            return files[-1]
+        legacy = sorted(
+            glob.glob(os.path.join(TAG_BOUT_DIR, "tag_policy_*_best_bout.npz")),
+            key=tag_policy_number,
+        )
+        return legacy[-1] if legacy else None
+
+    if bout_number is None:
+        bout_number = 0
+    path = tag_bout_filename(policy_number, bout_number)
+    if os.path.exists(path):
+        return path
+
+    if int(bout_number) == 0:
+        legacy = os.path.join(
+            TAG_BOUT_DIR, f"tag_policy_{int(policy_number):06d}_best_bout.npz"
+        )
+        if os.path.exists(legacy):
+            return legacy
+    return None
+
+
+def show_tag_replay(policy_number=None, bout_number=None):
+    path = find_latest_tag_bout(policy_number, bout_number)
+    if path is None:
+        if policy_number is None:
+            raise FileNotFoundError(
+                f"No tag replay found in {os.path.abspath(TAG_BOUT_DIR)}"
+            )
+        raise FileNotFoundError(
+            f"No tag replay found for policy={policy_number}, bout={bout_number}"
+        )
+    out_path, html = build_tag_replay_html(path)
+    try:
+        from IPython.display import display, HTML, IFrame
+        try:
+            display(IFrame(src=os.path.relpath(out_path), width="100%", height=720))
+        except Exception:
+            display(HTML(html))
+    except ImportError:
+        pass
+    return out_path
+
+
+# ============================================================
+# ENTRY POINT : PRODUCTION RTS ONLY
+# ============================================================
+
 @app.function(image=app_image, gpu="A10G", timeout=86400, volumes={"/data": vol})
-def run_training_remotely():
-    # 既存のtrain関数をクラウド上で実行
-    latest = train(n_generations=N_GENERATIONS, resume=True)
-    
+def run_training_remotely(n_generations=N_GENERATIONS):
+    """Production RTS PPO only. Standalone tag training is external."""
+    latest = train(n_generations=int(n_generations), resume=True)
     try:
         replay_generation = LAST_COMPLETED_GENERATION
         path = (
@@ -3345,27 +4286,20 @@ def run_training_remotely():
             if replay_generation is not None
             else show_replay()
         )
-        print("Replay written to (Cloud):", os.path.abspath(path))
-        
-        # 学習完了後、生成されたHTMLファイルのテキストデータを返す（手元に持ってくるため）
+        print("Main replay written to (Cloud):", os.path.abspath(path))
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
-            
     except FileNotFoundError as e:
-        print("Replay skipped:", e)
+        print("Main replay skipped:", e)
         return None
 
-# 手元のPC（ローカル）で動くエントリーポイント
+
 @app.local_entrypoint()
-def main():
-    print("クラウドのGPUに接続して学習を開始します...")
-    
-    # クラウド側の関数を呼び出し、完了するまで待機（ログは手元に流れます）
-    html_content = run_training_remotely.remote()
-    
-    # クラウドから受け取ったHTMLテキストを、手元のPCにファイルとして保存する
+def main(generations: int = N_GENERATIONS):
+    print("クラウドのGPUで本番RTS PPOだけを開始します...")
+    html_content = run_training_remotely.remote(int(generations))
     if html_content:
         local_path = "latest_replay.html"
         with open(local_path, "w", encoding="utf-8") as f:
             f.write(html_content)
-        print(f"手元のPCにリプレイを保存しました: {local_path}")
+        print(f"手元のPCに本番リプレイを保存しました: {local_path}")
