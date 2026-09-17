@@ -127,7 +127,7 @@ REWARD_SOLDIER_MISS = -0.003
 REWARD_SOLDIER_WALL = -0.050
 REWARD_SOLDIER_KILL = 0.050
 REWARD_SOLDIER_APPROACH = 0.005
-REWARD_COMMANDER_WALL = -0.005
+REWARD_COMMANDER_WALL = 0
 REWARD_COMMANDER_HIT_BY_ENEMY = -0.020
 REWARD_COMMANDER_WIN = 4.0
 REWARD_COMMANDER_LOSS = -4.0
@@ -152,7 +152,7 @@ WALL_LIST = [
     [ 0.5,  0.5],
 ]
 
-walls = jnp.array(WALL_LIST, dtype=jnp.float32)
+walls = jnp.asarray(WALL_LIST, dtype=jnp.float32).reshape((-1, 2))
 
 teams = jnp.concatenate([
     jnp.array([0.0, 1.0]),
