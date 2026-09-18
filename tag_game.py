@@ -21,6 +21,9 @@
 #   - No Tag-specific reward is introduced.
 #   - Every game can be replayed later from its .npz; HTML is generated only by
 #     an explicit --replay command and uses the production RTS replay renderer.
+#   - Walls (both interior 2x2 blocks and the top/bottom edge 2x1 blocks) start
+#     at zero and are introduced one at a time, in random order, as commander
+#     kills become reliable.
 # ============================================================
 
 import argparse
@@ -57,9 +60,108 @@ TAG_MUTATION_STRENGTH = 0.06
 TAG_BIAS_MUTATION_STRENGTH = 0.35
 TAG_ATTACK_EXPLORATION_FLOOR = 0.15
 TAG_ATTACK_EXPLORATION_CEIL = 0.85
-TAG_BOUT_KEEP_INTERVAL = 100
 TAG_MAX_STEPS = rts.MAX_STEPS
 TAG_RESULT_EPS = 1e-6
+
+# ------------------------------------------------------------
+# Wall curriculum for the standalone knockout Tag system.
+#
+# All walls -- both the 15 interior 2x2 blocks and the 6 top/bottom edge
+# 2x1 blocks -- are pooled into a single set of candidate blocks. The
+# curriculum starts with ZERO active blocks (a fully open field) and adds
+# one randomly chosen block (interior or edge, no preference) each time
+# commander kills have been reliable for several consecutive generations.
+# ------------------------------------------------------------
+
+TAG_KILL_RATE_THRESHOLD = 0.25
+TAG_KILL_STABLE_GENERATIONS = 3
+TAG_INACTIVE_WALL_SENTINEL = 1000.0
+
+
+def _make_2x2_wall_cells(cx, cz):
+    return (
+        (cx - 0.5, cz - 0.5),
+        (cx - 0.5, cz + 0.5),
+        (cx + 0.5, cz - 0.5),
+        (cx + 0.5, cz + 0.5),
+    )
+
+
+def _make_edge_wall_cells(cx, cz):
+    # 2 cells wide (x direction) x 1 cell high, centered at (cx, cz).
+    return (
+        (cx - 0.5, cz),
+        (cx + 0.5, cz),
+    )
+
+
+# Interior 2x2 blocks (15 total): same 5x3 grid used previously.
+TAG_INTERIOR_WALL_BLOCK_CENTERS = tuple(
+    (float(x), float(z))
+    for z in (-4.0, 0.0, 4.0)
+    for x in (-4.0, 0.0, 4.0)
+)
+
+# Top/bottom edge 2x1 blocks (6 total): same footprint as the old fixed
+# edge walls, but now treated as ordinary curriculum blocks.
+TAG_EDGE_WALL_BLOCK_CENTERS = tuple(
+    (float(x), float(z))
+    for z in (-7.5, 7.5)
+    for x in (-4.0, 0.0, 4.0)
+)
+
+
+def _build_wall_block_definitions():
+    blocks = []
+    for cx, cz in TAG_INTERIOR_WALL_BLOCK_CENTERS:
+        blocks.append({
+            "kind": "interior",
+            "center": (cx, cz),
+            "cells": _make_2x2_wall_cells(cx, cz),
+        })
+    for cx, cz in TAG_EDGE_WALL_BLOCK_CENTERS:
+        blocks.append({
+            "kind": "edge",
+            "center": (cx, cz),
+            "cells": _make_edge_wall_cells(cx, cz),
+        })
+    return tuple(blocks)
+
+
+# Unified candidate pool. Block id is simply the index into this tuple
+# (0..TAG_WALL_BLOCK_COUNT-1), fixed by construction order above.
+TAG_WALL_BLOCKS = _build_wall_block_definitions()
+TAG_WALL_BLOCK_COUNT = len(TAG_WALL_BLOCKS)
+TAG_MAX_PHYSICS_WALL_CELLS = sum(len(b["cells"]) for b in TAG_WALL_BLOCKS)
+
+
+def _build_active_tag_walls(active_wall_ids):
+    """Build fixed-shape physics walls plus compact actual walls for replay."""
+    active = sorted({int(i) for i in active_wall_ids})
+    if any(i < 0 or i >= TAG_WALL_BLOCK_COUNT for i in active):
+        raise ValueError(f"Invalid Tag wall block id(s): {active}")
+
+    actual = []
+    for i in active:
+        actual.extend(TAG_WALL_BLOCKS[i]["cells"])
+
+    physics = np.full(
+        (TAG_MAX_PHYSICS_WALL_CELLS, 2),
+        TAG_INACTIVE_WALL_SENTINEL,
+        dtype=np.float32,
+    )
+    if actual:
+        physics[:len(actual)] = np.asarray(actual, dtype=np.float32)
+    return jnp.asarray(physics), np.asarray(actual, dtype=np.float32).reshape((-1, 2))
+
+
+def _tag_wall_label(wall_id):
+    block = TAG_WALL_BLOCKS[int(wall_id)]
+    x, z = block["center"]
+    tag = "E" if block["kind"] == "edge" else "I"
+    return f"{tag}{int(wall_id):02d}@({x:+.0f},{z:+.0f})"
+
+
 TAG_REPLAY_DIR = LOCAL_BASE_DIR / "tag_replay"
 TAG_BOUT_DIR = LOCAL_BASE_DIR / "tag_bouts"
 TAG_ELITE_DIR = LOCAL_BASE_DIR / "tag_elite"
@@ -87,7 +189,10 @@ def _bout_number(path: str | Path) -> int:
 
 def _latest_local_tag_policy():
     files = list(TAG_ELITE_DIR.glob("tag_policy_*.npz"))
-    return max(files, key=_tag_policy_number) if files else None
+    return (
+        max(files, key=lambda p: (_tag_policy_number(p), p.stat().st_mtime))
+        if files else None
+    )
 
 
 def _latest_local_bout(policy_number=None, bout_number=None):
@@ -101,23 +206,113 @@ def _latest_local_bout(policy_number=None, bout_number=None):
     return max(files, key=lambda p: (_tag_policy_number(p), _bout_number(p)))
 
 
+def _read_policy_npz(path: Path):
+    with np.load(path, allow_pickle=False) as d:
+        raw = {
+            k[len("param_"):]: jnp.asarray(d[k])
+            for k in d.files
+            if k.startswith("param_")
+        }
+        meta = {}
+        if "metadata_json" in d.files:
+            try:
+                meta = json.loads(str(d["metadata_json"]))
+            except Exception:
+                meta = {}
+    return raw, meta
+
+
 def _save_params(path: Path, params, metadata=None):
-    data = {f"param_{k}": np.asarray(v) for k, v in params.items()}
-    if metadata is not None:
-        data["metadata_json"] = np.array(json.dumps(metadata))
-    np.savez(path, **data)
+    # Tag evolution only mutates the production encoder + Micro heads.
+    # Saving the entire production parameter tree made every Tag policy
+    # needlessly large.  Store only the skill-bearing Tag subset.
+    data = {}
+    for k in TAG_ENCODER_KEYS:
+        if k not in params:
+            raise KeyError(f"Missing Tag parameter key: {k}")
+        data[f"param_{k}"] = np.asarray(params[k])
+    meta = dict(metadata or {})
+    meta.update({
+        "format": "tag_sparse_v2",
+        "saved_parameter_keys": list(TAG_ENCODER_KEYS),
+    })
+    data["metadata_json"] = np.array(json.dumps(meta, ensure_ascii=False))
+    np.savez_compressed(path, **data)
     return path
 
 
 def _load_params(path: Path):
-    d = np.load(path, allow_pickle=False)
-    raw = {
-        k[len("param_"):]: jnp.asarray(d[k])
-        for k in d.files
-        if k.startswith("param_")
-    }
+    raw, _meta = _read_policy_npz(path)
+    raw_keys = set(raw)
+    tag_keys = set(TAG_ENCODER_KEYS)
+
+    # Compact Tag policy: reconstruct the full production tree from the
+    # latest compatible Production Elite and overlay the saved Tag weights.
+    if tag_keys.issubset(raw_keys) and not set(rts.required_policy_shapes()).issubset(raw_keys):
+        production = rts.find_latest_elite()
+        if production is None:
+            raise FileNotFoundError(
+                f"Tag policy {path.name} is a sparse Tag policy, but no Production Elite "
+                "is available to provide the untouched parameters."
+            )
+        base, _ = rts.load_params(production)
+        for k in TAG_ENCODER_KEYS:
+            base[k] = raw[k]
+        return base
+
+    # Backward compatibility: older Tag policies stored the full parameter tree.
     params, _ = rts.migrate_policy_params(raw)
     return params
+
+
+def _compact_legacy_tag_policies(remove_legacy=True):
+    files = sorted(TAG_ELITE_DIR.glob("tag_policy_*.npz"), key=_tag_policy_number)
+    converted = 0
+    skipped = 0
+    saved_bytes = 0
+
+    required = set(rts.required_policy_shapes().keys())
+    for path in files:
+        try:
+            raw, meta = _read_policy_npz(path)
+            raw_keys = set(raw)
+            if not required.issubset(raw_keys):
+                skipped += 1
+                continue
+
+            out = {}
+            for k in TAG_ENCODER_KEYS:
+                out[f"param_{k}"] = np.asarray(raw[k])
+            new_meta = dict(meta or {})
+            new_meta.update({
+                "format": "tag_sparse_v2",
+                "saved_parameter_keys": list(TAG_ENCODER_KEYS),
+                "compacted_from_full_policy": True,
+            })
+            out["metadata_json"] = np.array(json.dumps(new_meta, ensure_ascii=False))
+
+            tmp = path.with_name(path.stem + ".compact.tmp.npz")
+            np.savez_compressed(tmp, **out)
+            old_size = path.stat().st_size
+            new_size = tmp.stat().st_size
+            if new_size >= old_size:
+                tmp.unlink(missing_ok=True)
+                skipped += 1
+                continue
+
+            if remove_legacy:
+                os.replace(tmp, path)
+            else:
+                compact_path = path.with_name(path.stem + ".compact.npz")
+                os.replace(tmp, compact_path)
+            converted += 1
+            saved_bytes += old_size - new_size
+        except Exception as e:
+            print(f"  Compact skip {path.name}: {e}")
+
+    print(f"Tag policy compaction : converted={converted}, skipped={skipped}, "
+          f"saved={saved_bytes / (1024 * 1024):.2f} MiB")
+    return converted, skipped, saved_bytes
 
 
 def _clone_params(params):
@@ -261,14 +456,14 @@ def make_tag_initial_state(key, n_soldiers):
 # ============================================================
 
 
-def _micro_world_action(params, state, team, n_soldiers, rng_key):
+def _micro_world_action(params, state, team, n_soldiers, rng_key, terrain_override):
     """Micro-only action using the same stochastic action style as production PPO.
 
     The Macro/attention branches are intentionally excluded.  Direction uses the
     Micro mean plus the production logstd exploration, and attack is sampled from
     the Micro Bernoulli probability rather than thresholded deterministically.
     """
-    obs = rts.make_observation(state, float(team), terrain_override=rts.tag_terrain)[None, :]
+    obs = rts.make_observation(state, float(team), terrain_override=terrain_override)[None, :]
 
     soldier_start = rts.TERRAIN_SIZE
     soldier_end = soldier_start + rts.N_SOLDIERS_TOTAL * rts.SOLDIER_FEATURES
@@ -335,7 +530,7 @@ def _micro_world_action(params, state, team, n_soldiers, rng_key):
 # JIT a single game rollout. n_soldiers is static because it only controls
 # compile-time slicing/masking of action slots.
 @jax.jit(static_argnums=(3,))
-def _rollout_game(params_red, params_blue, initial_state, n_soldiers, game_key):
+def _rollout_game(params_red, params_blue, initial_state, n_soldiers, game_key, physics_tag_walls, tag_terrain):
     """Run one game and return the exact production reward decomposition.
 
     `red_return` / `blue_return` are the same scalar reward definition used by
@@ -355,14 +550,14 @@ def _rollout_game(params_red, params_blue, initial_state, n_soldiers, game_key):
         ) = carry
 
         red_action = _micro_world_action(
-            params_red, state, 0, n_soldiers, random.fold_in(game_key, step_idx * 2)
+            params_red, state, 0, n_soldiers, random.fold_in(game_key, step_idx * 2), tag_terrain
         )
         blue_action = _micro_world_action(
-            params_blue, state, 1, n_soldiers, random.fold_in(game_key, step_idx * 2 + 1)
+            params_blue, state, 1, n_soldiers, random.fold_in(game_key, step_idx * 2 + 1), tag_terrain
         )
 
         nxt, terminal_red, terminal_blue, red_soldier_reward, blue_soldier_reward, red_cmd_reward, blue_cmd_reward, done_step = rts.step_one(
-            state, red_action, blue_action, rts.tag_walls
+            state, red_action, blue_action, physics_tag_walls
         )
 
         red_local = jnp.mean(
@@ -483,8 +678,9 @@ def _rollout_game(params_red, params_blue, initial_state, n_soldiers, game_key):
             & can_move
             & ((jnp.abs(move_dx) + jnp.abs(move_dz)) > 1e-6)
         )
-        desired_wall = rts.wall_blocked(desired_x, desired_z, radius, rts.tag_walls)
-        wall_collision = attempted & desired_wall
+        desired_wall = rts.wall_blocked(desired_x, desired_z, radius, physics_tag_walls)
+        boundary_collision = attempted & (~inside)
+        wall_collision = attempted & (desired_wall | (~inside))
         red_wall_now = jnp.sum(wall_collision[rts.RED_SOLDIER_START:rts.RED_SOLDIER_END]).astype(jnp.float32)
         blue_wall_now = jnp.sum(wall_collision[rts.BLUE_SOLDIER_START:rts.BLUE_SOLDIER_END]).astype(jnp.float32)
         red_cmd_wall_now = wall_collision[rts.RED_COMMANDER_INDEX].astype(jnp.float32)
@@ -645,6 +841,15 @@ def _rollout_game(params_red, params_blue, initial_state, n_soldiers, game_key):
         jnp.where(hps[-1, rts.BLUE_COMMANDER_INDEX] > 0, 2, 4),
     ).astype(jnp.int32)
 
+    red_commander_kill = jnp.any(
+        (hps[:-1, rts.RED_COMMANDER_INDEX] > 0)
+        & (hps[1:, rts.RED_COMMANDER_INDEX] <= 0)
+    )
+    blue_commander_kill = jnp.any(
+        (hps[:-1, rts.BLUE_COMMANDER_INDEX] > 0)
+        & (hps[1:, rts.BLUE_COMMANDER_INDEX] <= 0)
+    )
+
     return {
         "x": xs, "z": zs, "hp": hps, "alive": alives,
         "red_actions": red_actions, "blue_actions": blue_actions,
@@ -654,6 +859,9 @@ def _rollout_game(params_red, params_blue, initial_state, n_soldiers, game_key):
         "red_attack_attempts": red_attack_acc, "blue_attack_attempts": blue_attack_acc,
         "red_hits": red_hit_acc, "blue_hits": blue_hit_acc,
         "red_kills": red_kill_acc, "blue_kills": blue_kill_acc,
+        "red_commander_kill": red_commander_kill,
+        "blue_commander_kill": blue_commander_kill,
+        "commander_kill": red_commander_kill | blue_commander_kill,
         "red_breakdown": red_breakdown, "blue_breakdown": blue_breakdown,
         "final_state": final_state,
     }
@@ -720,7 +928,7 @@ def _format_reward_short(label, reward):
 
 
 
-def _run_match(candidate, opponent, rng, n_soldiers, policy_numbers, bout_start):
+def _run_match(candidate, opponent, rng, n_soldiers, policy_numbers, bout_start, physics_tag_walls, actual_tag_walls):
     wins = {0: 0, 1: 0}
     total_return = {0: 0.0, 1: 0.0}
     total_hp_margin = 0.0
@@ -728,6 +936,8 @@ def _run_match(candidate, opponent, rng, n_soldiers, policy_numbers, bout_start)
     total_hits = {0: 0.0, 1: 0.0}
     total_kills = {0: 0.0, 1: 0.0}
     draws = 0
+    commander_kill_games = 0
+    commander_kill_events = 0
     game_records = []
     reward_totals = {0: {k: 0.0 for k in ("survival", "hit", "kill", "miss", "wall", "approach", "cmdhit", "terminal", "total")},
                      1: {k: 0.0 for k in ("survival", "hit", "kill", "miss", "wall", "approach", "cmdhit", "terminal", "total")}}
@@ -739,7 +949,11 @@ def _run_match(candidate, opponent, rng, n_soldiers, policy_numbers, bout_start)
         game_key = random.fold_in(rng, game_in_match + 1)
         state = make_tag_initial_state(game_key, n_soldiers)
 
-        result = _rollout_game(params_red, params_blue, state, n_soldiers, game_key)
+        tag_terrain = rts.make_terrain_from_walls(physics_tag_walls)
+        result = _rollout_game(
+            params_red, params_blue, state, n_soldiers, game_key,
+            physics_tag_walls, tag_terrain
+        )
         result_np = {k: v for k, v in result.items() if k not in ("final_state", "red_breakdown", "blue_breakdown")}
         raw_result = int(np.asarray(result_np["result"]))
         red_return = float(np.asarray(result_np["red_return"]))
@@ -753,6 +967,11 @@ def _run_match(candidate, opponent, rng, n_soldiers, policy_numbers, bout_start)
         blue_hits = float(np.asarray(result["blue_hits"]))
         red_kills = float(np.asarray(result["red_kills"]))
         blue_kills = float(np.asarray(result["blue_kills"]))
+        red_commander_kill = bool(np.asarray(result["red_commander_kill"]))
+        blue_commander_kill = bool(np.asarray(result["blue_commander_kill"]))
+        commander_kill = red_commander_kill or blue_commander_kill
+        commander_kill_games += int(commander_kill)
+        commander_kill_events += int(red_commander_kill) + int(blue_commander_kill)
         red_breakdown = {k: float(np.asarray(v)) for k, v in result["red_breakdown"].items()}
         blue_breakdown = {k: float(np.asarray(v)) for k, v in result["blue_breakdown"].items()}
 
@@ -823,12 +1042,15 @@ def _run_match(candidate, opponent, rng, n_soldiers, policy_numbers, bout_start)
             "blue_hits": blue_hits,
             "red_kills": red_kills,
             "blue_kills": blue_kills,
+            "red_commander_kill": int(red_commander_kill),
+            "blue_commander_kill": int(blue_commander_kill),
+            "commander_kill": int(commander_kill),
             "red_breakdown": red_breakdown,
             "blue_breakdown": blue_breakdown,
             "winner_team": int(winner_side),
             "result_text": rts.RESULT_TEXT.get(raw_result, "UNKNOWN"),
             "field_walls": np.asarray(rts.WALL_LIST, dtype=np.float32).reshape((-1, 2)),
-            "tag_walls": np.asarray(rts.TAG_WALL_LIST, dtype=np.float32).reshape((-1, 2)),
+            "tag_walls": np.asarray(actual_tag_walls, dtype=np.float32).reshape((-1, 2)),
             "bout_number": bout_number,
         }
         bout["reward_breakdown"] = {0: red_breakdown, 1: blue_breakdown}
@@ -851,6 +1073,9 @@ def _run_match(candidate, opponent, rng, n_soldiers, policy_numbers, bout_start)
         "candidate_kills": total_kills[0],
         "opponent_kills": total_kills[1],
         "draws": draws,
+        "commander_kill_games": commander_kill_games,
+        "commander_kill_events": commander_kill_events,
+        "commander_kill_rate": commander_kill_games / float(TAG_GAMES_PER_MATCH),
         "games": game_records,
         "reward_totals": reward_totals,
     }
@@ -908,7 +1133,7 @@ def _save_bout(bout, policy_number, round_number, match_number, game_number):
         global_input_size=np.array(rts.GLOBAL_INPUT_SIZE, dtype=np.int32),
         action_size=np.array(rts.ACTION_SIZE, dtype=np.int32),
         attack_cooldown=np.array(rts.ATTACK_COOLDOWN, dtype=np.float32),
-        tag_walls=np.asarray(rts.TAG_WALL_LIST, dtype=np.float32).reshape((-1, 2)),
+        tag_walls=np.asarray(bout["tag_walls"], dtype=np.float32).reshape((-1, 2)),
         start_x=bout["start_x"],
         start_z=bout["start_z"],
         start_hp=bout["start_hp"],
@@ -927,6 +1152,11 @@ def _save_bout(bout, policy_number, round_number, match_number, game_number):
         blue_hits=np.array(bout["blue_hits"], dtype=np.float32),
         red_kills=np.array(bout["red_kills"], dtype=np.float32),
         blue_kills=np.array(bout["blue_kills"], dtype=np.float32),
+
+        red_commander_kill=np.array(bout["red_commander_kill"], dtype=np.int32),
+        blue_commander_kill=np.array(bout["blue_commander_kill"], dtype=np.int32),
+        commander_kill=np.array(bout["commander_kill"], dtype=np.int32),
+
         verification_pass=np.array(1, dtype=np.int32),
         max_state_error=np.array(0.0, dtype=np.float32),
         max_hp_error=np.array(0.0, dtype=np.float32),
@@ -970,8 +1200,9 @@ def _initial_seed_policy():
     if production is None:
         return _load_params(tag), f"Tag Elite {tag.name}"
 
-    # Same policy-selection rule used by the production-side helper: whichever
-    # file was written later is treated as the latest skill-bearing seed.
+    # A Tag policy is sparse and is always merged onto the CURRENT Production
+    # Elite inside _load_params().  mtime decides whether that Tag snapshot is
+    # newer than the Production Elite itself.
     try:
         if tag.stat().st_mtime > Path(production).stat().st_mtime:
             return _load_params(tag), f"Tag Elite {tag.name}"
@@ -988,7 +1219,7 @@ def _make_population(seed_params, rng):
     return pop
 
 
-def _generation_tournament(population, policy_numbers, rng, n_soldiers, policy_number, save_bouts):
+def _generation_tournament(population, policy_numbers, rng, n_soldiers, policy_number, save_bouts, physics_tag_walls, actual_tag_walls):
     """Run one 8->4->2->1 knockout and return the champion plus bout count."""
     next_bout = 0
     round_number = 1
@@ -1014,7 +1245,8 @@ def _generation_tournament(population, policy_numbers, rng, n_soldiers, policy_n
             match_key = random.fold_in(rng, round_number * 10000 + match_number)
             match = _run_match(
                 candidate, opponent, match_key, n_soldiers,
-                (candidate_id, opponent_id), next_bout
+                (candidate_id, opponent_id), next_bout,
+                physics_tag_walls, actual_tag_walls
             )
             winner_key = random.fold_in(match_key, 999)
             winner = _match_winner(match, winner_key)
@@ -1036,6 +1268,10 @@ def _generation_tournament(population, policy_numbers, rng, n_soldiers, policy_n
             oo = match["reward_totals"][1]
             print("      " + _format_reward_short(f"P{candidate_id:02d}", rr))
             print("      " + _format_reward_short(f"P{opponent_id:02d}", oo))
+            print(
+                f"      Commander kills: {match['commander_kill_games']}/{TAG_GAMES_PER_MATCH} "
+                f"games ({match['commander_kill_rate'] * 100:.1f}%), events={match['commander_kill_events']}"
+            )
 
             if save_bouts:
                 for game_in_match, bout in enumerate(match["games"]):
@@ -1051,18 +1287,18 @@ def _generation_tournament(population, policy_numbers, rng, n_soldiers, policy_n
 
 
 def _prune_bout_files(current_policy):
-    """Keep only the latest policy's bouts and every 100th policy's bouts."""
+    """Keep only the current Tag generation's bouts."""
     current_policy = int(current_policy)
     removed = 0
     for path in TAG_BOUT_DIR.glob("tag_policy_*_bout_*.npz"):
         number = _tag_policy_number(path)
-        keep = (number == current_policy) or (number % TAG_BOUT_KEEP_INTERVAL == 0)
-        if not keep:
-            try:
-                path.unlink()
-                removed += 1
-            except OSError:
-                pass
+        if number == current_policy:
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
     return removed
 
 
@@ -1093,6 +1329,14 @@ def run_training(updates: int, soldiers: int, sync_remote=False, upload_remote=F
     print(f"Mutation strength     : encoder {TAG_MUTATION_STRENGTH:.3f}, micro-bias {TAG_BIAS_MUTATION_STRENGTH:.3f}")
     print(f"Attack exploration    : {TAG_ATTACK_EXPLORATION_FLOOR:.2f} .. {TAG_ATTACK_EXPLORATION_CEIL:.2f}")
     print(f"Max steps / game      : {TAG_MAX_STEPS}")
+    print(
+        f"Wall curriculum       : {TAG_WALL_BLOCK_COUNT} blocks total "
+        f"({len(TAG_INTERIOR_WALL_BLOCK_CENTERS)} interior 2x2 + "
+        f"{len(TAG_EDGE_WALL_BLOCK_CENTERS)} top/bottom edge 2x1); "
+        f"starts at 0 active blocks; "
+        f"+1 random block after {TAG_KILL_STABLE_GENERATIONS} stable generations at "
+        f"≥{TAG_KILL_RATE_THRESHOLD * 100:.0f}% commander-kill games"
+    )
     print(f"Physics                : main.step_one()")
     print(f"Rewards                : {_production_reward_labels()}")
     print("HTML replay            : only via explicit --replay")
@@ -1100,6 +1344,22 @@ def run_training(updates: int, soldiers: int, sync_remote=False, upload_remote=F
     print()
 
     champion = seed_params
+
+    # Resume the wall curriculum from the latest sparse Tag policy metadata.
+    active_wall_ids = []
+    kill_stable_streak = 0
+    latest_policy_path = _latest_local_tag_policy()
+    if latest_policy_path is not None:
+        try:
+            _, latest_meta = _read_policy_npz(latest_policy_path)
+            active_wall_ids = sorted({
+                int(i) for i in latest_meta.get("active_wall_indices", [])
+                if 0 <= int(i) < TAG_WALL_BLOCK_COUNT
+            })
+            kill_stable_streak = int(latest_meta.get("kill_stable_streak", 0))
+        except Exception:
+            active_wall_ids = []
+            kill_stable_streak = 0
 
     total_t0 = time.time()
     for generation in range(1, updates + 1):
@@ -1110,13 +1370,20 @@ def run_training(updates: int, soldiers: int, sync_remote=False, upload_remote=F
         mutation_deltas = [_parameter_delta(parent_champion, p) for p in population[1:]]
         save_bouts = True
 
+        physics_tag_walls, actual_tag_walls = _build_active_tag_walls(active_wall_ids)
+        active_labels = [_tag_wall_label(i) for i in active_wall_ids]
+
         gen_t0 = time.time()
         print(f"===== EVOLUTION GENERATION {generation}/{updates} | policy {next_policy:06d} =====")
         print(
             f"  Mutations: avg Δ={np.mean(mutation_deltas):.4e}, "
             f"min Δ={np.min(mutation_deltas):.4e}, max Δ={np.max(mutation_deltas):.4e}"
         )
-        print("  Bout files: SAVE current generation; prune all but latest + every 100th")
+        print(
+            f"  Walls: {len(active_wall_ids)}/{TAG_WALL_BLOCK_COUNT} active blocks "
+            f"| active positions={active_labels if active_labels else 'none'}"
+        )
+        print("  Bout files: SAVE current generation only")
         champion_item, generation_bouts = _generation_tournament(
             population,
             ids,
@@ -1124,6 +1391,8 @@ def run_training(updates: int, soldiers: int, sync_remote=False, upload_remote=F
             soldiers,
             next_policy,
             save_bouts,
+            physics_tag_walls,
+            actual_tag_walls,
         )
         champion, champion_local_id = champion_item
         champion_delta = _parameter_delta(parent_champion, champion)
@@ -1146,6 +1415,46 @@ def run_training(updates: int, soldiers: int, sync_remote=False, upload_remote=F
             except Exception:
                 pass
 
+        gen_commander_kill_games = 0
+        gen_commander_kill_events = 0
+        for bout_path in TAG_BOUT_DIR.glob(f"tag_policy_{next_policy:06d}_bout_*.npz"):
+            try:
+                with np.load(bout_path, allow_pickle=False) as d:
+                    gen_commander_kill_games += int(np.asarray(d["commander_kill"]))
+                    gen_commander_kill_events += int(np.asarray(d["red_commander_kill"])) + int(np.asarray(d["blue_commander_kill"]))
+            except Exception:
+                pass
+
+        commander_kill_rate = gen_commander_kill_games / float(max(1, generation_bouts))
+        stable_this_generation = commander_kill_rate >= TAG_KILL_RATE_THRESHOLD
+        if stable_this_generation:
+            kill_stable_streak += 1
+        else:
+            kill_stable_streak = 0
+
+        wall_added = None
+        if (
+            kill_stable_streak >= TAG_KILL_STABLE_GENERATIONS
+            and len(active_wall_ids) < TAG_WALL_BLOCK_COUNT
+        ):
+            remaining = [i for i in range(TAG_WALL_BLOCK_COUNT) if i not in active_wall_ids]
+            add_key = random.fold_in(tour_key, 0xC0FFEE + generation)
+            chosen_pos = int(np.asarray(random.randint(add_key, (), 0, len(remaining))))
+            wall_added = remaining[chosen_pos]
+            active_wall_ids = sorted(active_wall_ids + [wall_added])
+            kill_stable_streak = 0
+            print(
+                f"  WALL CURRICULUM: added {_tag_wall_label(wall_added)} "
+                f"center={TAG_WALL_BLOCKS[wall_added]['center']} "
+                f"after {TAG_KILL_STABLE_GENERATIONS} stable generations"
+            )
+        elif len(active_wall_ids) < TAG_WALL_BLOCK_COUNT:
+            print(
+                f"  WALL CURRICULUM: kill rate={commander_kill_rate * 100:.1f}% "
+                f"(threshold={TAG_KILL_RATE_THRESHOLD * 100:.1f}%) "
+                f"stable={kill_stable_streak}/{TAG_KILL_STABLE_GENERATIONS}; no new wall"
+            )
+
         elapsed = time.time() - gen_t0
         tag_policy_path = TAG_ELITE_DIR / f"tag_policy_{next_policy:06d}.npz"
         _save_params(
@@ -1162,6 +1471,12 @@ def run_training(updates: int, soldiers: int, sync_remote=False, upload_remote=F
                 "champion_local_id": champion_local_id,
                 "reward_definition": _production_reward_labels(),
                 "source_seed": seed_source,
+                "active_wall_indices": list(active_wall_ids),
+                "active_wall_positions": [list(TAG_WALL_BLOCKS[i]["center"]) for i in active_wall_ids],
+                "commander_kill_rate": commander_kill_rate,
+                "commander_kill_events": gen_commander_kill_events,
+                "kill_stable_streak": kill_stable_streak,
+                "wall_added_this_generation": None if wall_added is None else int(wall_added),
             },
         )
 
@@ -1178,15 +1493,14 @@ def run_training(updates: int, soldiers: int, sync_remote=False, upload_remote=F
             f"{update_state} Δ={champion_delta:.4e} | "
             f"Bouts={generation_bouts} | "
             f"atk={gen_atk:.0f} hit={gen_hit:.0f} kill={gen_kill:.0f} draws={gen_draws} | "
+            f"cmdkill={gen_commander_kill_games}/{generation_bouts} ({commander_kill_rate * 100:.1f}%) "
+            f"stable={kill_stable_streak}/{TAG_KILL_STABLE_GENERATIONS} | "
             f"reward Red={gen_reward[0]:+.3f} Blue={gen_reward[1]:+.3f} | "
             f"time={elapsed:.1f}s"
         )
         removed = _prune_bout_files(next_policy)
         print(f"Tag policy saved      : {tag_policy_path}")
-        print(
-            f"Bout retention        : current policy + every {TAG_BOUT_KEEP_INTERVAL}th "
-            f"policy | removed {removed} old bout file(s)"
-        )
+        print(f"Bout retention        : current policy only | removed {removed} old bout file(s)")
         print()
 
         next_policy += 1
@@ -1215,7 +1529,7 @@ def sync_remote_seed_files():
     vol = modal.Volume.from_name(REMOTE_VOLUME_NAME, create_if_missing=True)
     downloaded = 0
     for remote_dir, local_dir, prefix in (
-        (f"/{REMOTE_ROOT}/elite", TAG_ELITE_DIR, "generation_"),
+        (f"/{REMOTE_ROOT}/elite", Path(rts.ELITE_DIR), "generation_"),
         (f"/{REMOTE_ROOT}/tag_elite", TAG_ELITE_DIR, "tag_policy_"),
         (f"/{REMOTE_ROOT}/tag_bouts", TAG_BOUT_DIR, "tag_policy_"),
     ):
@@ -1223,14 +1537,27 @@ def sync_remote_seed_files():
             entries = list(vol.listdir(remote_dir, recursive=False))
         except Exception:
             continue
+        tag_bout_entries = []
         for entry in entries:
             remote_path = str(entry.path)
             name = Path(remote_path).name
             if not name.endswith(".npz") or not name.startswith(prefix):
                 continue
+            if remote_dir.endswith("/tag_bouts"):
+                tag_bout_entries.append((remote_path, name))
+                continue
             data = b"".join(vol.read_file(remote_path))
             (local_dir / name).write_bytes(data)
             downloaded += 1
+        if remote_dir.endswith("/tag_bouts") and tag_bout_entries:
+            latest_policy = max(tag_bout_entries, key=lambda x: _tag_policy_number(x[1]))[0]
+            latest_num = _tag_policy_number(latest_policy)
+            for remote_path, name in tag_bout_entries:
+                if _tag_policy_number(name) != latest_num:
+                    continue
+                data = b"".join(vol.read_file(remote_path))
+                (local_dir / name).write_bytes(data)
+                downloaded += 1
     print(f"Modal seed sync        : {downloaded} file(s)")
 
 
@@ -1248,9 +1575,29 @@ def upload_tag_results():
     if not files:
         print("Modal upload            : no Tag files")
         return
+    # Remove obsolete remote Tag bouts so old every-100th / historical files
+    # do not keep consuming Volume storage after the retention policy changed.
+    local_bout_names = {path.name for path in TAG_BOUT_DIR.glob("*.npz")}
+    try:
+        remote_bout_dir = f"/{REMOTE_ROOT}/tag_bouts"
+        for entry in list(vol.listdir(remote_bout_dir, recursive=False)):
+            remote_path = str(entry.path)
+            name = Path(remote_path).name
+            if name.endswith(".npz") and name.startswith("tag_policy_") and name not in local_bout_names:
+                try:
+                    vol.remove_file(remote_path)
+                except Exception as exc:
+                    print(f"Modal remote bout prune skipped: {remote_path}: {exc}")
+    except Exception as exc:
+        print(f"Modal remote bout listing/prune skipped: {exc}")
+
     with vol.batch_upload(force=True) as batch:
         for path, remote_dir in files:
             batch.put_file(str(path), f"{remote_dir}/{path.name}")
+    try:
+        vol.commit()
+    except Exception:
+        pass
     print(f"Modal Tag upload        : {len(files)} file(s)")
 
 
@@ -1288,7 +1635,12 @@ def main():
     parser.add_argument("--bout", type=int, default=None, help="Bout number within the Tag policy")
     parser.add_argument("--sync", action="store_true", help="Download Tag/production NPZ files from Modal Volume first")
     parser.add_argument("--upload", action="store_true", help="Upload local Tag policy/bouts to Modal Volume after training")
+    parser.add_argument("--compact", action="store_true", help="Compact legacy full-size Tag policies into sparse compressed Tag-only files and exit")
     args = parser.parse_args()
+
+    if args.compact:
+        _compact_legacy_tag_policies(remove_legacy=True)
+        return
 
     if args.replay:
         run_replay(args.policy, args.bout, sync_remote=args.sync)

@@ -183,18 +183,6 @@ walls = jnp.asarray(WALL_LIST, dtype=jnp.float32).reshape((-1, 2))
 # Each entry is one 1x1 wall cell. Four entries make one 2x2 block.
 # 16x16 field -> four 8x8 blocks, with a 2x2 wall at the center of each block.
 TAG_WALL_LIST = [
-    # bottom-left 8x8 block (center = -4, -4)
-    (-4.5, -4.5), (-4.5, -3.5),
-    (-3.5, -4.5), (-3.5, -3.5),
-    # top-left 8x8 block (center = -4, +4)
-    (-4.5,  3.5), (-4.5,  4.5),
-    (-3.5,  3.5), (-3.5,  4.5),
-    # bottom-right 8x8 block (center = +4, -4)
-    ( 3.5, -4.5), ( 3.5, -3.5),
-    ( 4.5, -4.5), ( 4.5, -3.5),
-    # top-right 8x8 block (center = +4, +4)
-    ( 3.5,  3.5), ( 3.5,  4.5),
-    ( 4.5,  3.5), ( 4.5,  4.5),
 ]
 
 tag_walls = jnp.asarray(TAG_WALL_LIST, dtype=jnp.float32).reshape((-1, 2))
@@ -473,7 +461,8 @@ def step_one(state, red_action, blue_action, wall_array=None):
         & ((jnp.abs(move_dx) + jnp.abs(move_dz)) > 1e-6)
     )
     desired_wall_hit = wall_blocked(nx, nz, radius, wall_array)
-    wall_collision = attempted_move & desired_wall_hit
+    boundary_collision = attempted_move & (~inside)
+    wall_collision = attempted_move & (desired_wall_hit | (~inside))
 
     valid_move = inside & (~desired_wall_hit) & (alive > 0) & can_move
 
@@ -2864,17 +2853,80 @@ def find_latest_tag_policy():
     files = glob.glob(os.path.join(TAG_ELITE_DIR, "tag_policy_*.npz"))
     if not files:
         return None
-    return sorted(files, key=tag_policy_number)[-1]
+    # Policy numbers are the primary ordering key.  mtime breaks ties so a
+    # Production->Tag synchronization and a Tag-evolution result can safely
+    # share the same numeric range.
+    return max(files, key=lambda f: (tag_policy_number(f), os.path.getmtime(f)))
+
+
+def _read_tag_policy_sparse(path):
+    """Load a sparse Tag policy file without pretending it is a full Elite."""
+    with np.load(path, allow_pickle=False) as d:
+        raw = {
+            k[len("param_"):]: jnp.asarray(d[k])
+            for k in d.files
+            if k.startswith("param_")
+        }
+        meta = {}
+        if "metadata_json" in d.files:
+            try:
+                meta = json.loads(str(d["metadata_json"]))
+            except Exception:
+                meta = {}
+    return raw, meta
+
+
+def _merge_tag_policy_into_production(production_params, tag_path):
+    """Overlay only TAG_ENCODER_KEYS from a sparse Tag policy onto a full Elite."""
+    raw, meta = _read_tag_policy_sparse(tag_path)
+    missing = [k for k in TAG_ENCODER_KEYS if k not in raw]
+    if missing:
+        raise ValueError(
+            f"Tag policy {os.path.basename(tag_path)} is missing Tag parameter(s): {missing}"
+        )
+    merged = {k: jnp.array(v) for k, v in production_params.items()}
+    for k in TAG_ENCODER_KEYS:
+        merged[k] = raw[k]
+    return merged, meta
+
+
+def _next_tag_policy_number():
+    files = glob.glob(os.path.join(TAG_ELITE_DIR, "tag_policy_*.npz"))
+    if not files:
+        return 1
+    return max(tag_policy_number(f) for f in files) + 1
+
+
+def save_tag_policy_snapshot(params, production_generation, production_elite_path, source="production_elite_sync"):
+    """Persist only the Tag-mutated subset of a Production policy.
+
+    This is deliberately independent of the large full Elite files.  The
+    resulting sparse compressed file can later be merged back onto whatever
+    Production Elite is current.
+    """
+    os.makedirs(TAG_ELITE_DIR, exist_ok=True)
+    number = _next_tag_policy_number()
+    path = os.path.join(TAG_ELITE_DIR, f"tag_policy_{number:06d}.npz")
+    data = {}
+    for k in TAG_ENCODER_KEYS:
+        if k not in params:
+            raise KeyError(f"Missing Tag parameter key while syncing Production Elite: {k}")
+        data[f"param_{k}"] = np.asarray(params[k])
+    metadata = {
+        "format": "tag_sparse_v2",
+        "source": source,
+        "generation": int(production_generation),
+        "production_generation": int(production_generation),
+        "production_elite": os.path.basename(str(production_elite_path)),
+        "saved_parameter_keys": list(TAG_ENCODER_KEYS),
+    }
+    data["metadata_json"] = np.array(json.dumps(metadata, ensure_ascii=False))
+    np.savez_compressed(path, **data)
+    return path
 
 
 def choose_tag_seed_policy(production_elite):
-    """Return the newer of the production Elite and standalone Tag Elite.
-
-    Tag training writes a full parameter tree, but only TAG_ENCODER_KEYS are
-    modified.  A Tag Elite is therefore a safe initialization source for the
-    next production run.  File mtime is used intentionally: once production
-    creates a newer Elite, the old Tag Elite is no longer preferred.
-    """
+    """Return the newer of the full Production Elite and sparse Tag Elite."""
     tag_path = find_latest_tag_policy()
     if tag_path is None:
         return production_elite, "production Elite"
@@ -2886,6 +2938,27 @@ def choose_tag_seed_policy(production_elite):
     except OSError:
         pass
     return production_elite, "production Elite"
+
+
+def load_tag_seed_params(seed_path, production_elite):
+    """Load either a full Production Elite or a sparse Tag overlay."""
+    if os.path.abspath(seed_path) == os.path.abspath(production_elite):
+        return load_params(seed_path), {}
+
+    raw, meta = _read_tag_policy_sparse(seed_path)
+    raw_keys = set(raw)
+    full_keys = set(required_policy_shapes().keys())
+
+    # New Tag format: only TAG_ENCODER_KEYS are stored.
+    if set(TAG_ENCODER_KEYS).issubset(raw_keys) and not full_keys.issubset(raw_keys):
+        base_params, _ = load_params(production_elite)
+        return _merge_tag_policy_into_production(base_params, seed_path)
+
+    # Backward compatibility for old full-size Tag policy files.
+    params, meta2 = load_params(seed_path)
+    if meta2:
+        meta.update(meta2)
+    return params, meta
 
 
 
@@ -2985,6 +3058,16 @@ def train(n_generations=N_GENERATIONS, resume=True):
                         "architecture": "micro_macro_25feat_64_attention2_tag_aux_role_separated",
                     },
                 )
+                try:
+                    synced_tag_path = save_tag_policy_snapshot(
+                        migrated_params,
+                        generation_number(latest_elite),
+                        latest_elite,
+                        source="production_elite_migration_sync",
+                    )
+                    print(f"Tag policy synced    : {os.path.basename(synced_tag_path)}")
+                except Exception as exc:
+                    print(f"Tag policy sync failed: {exc}")
                 print("Persisted migrated Elite:", os.path.basename(latest_elite))
         except Exception as exc:
             print(f"Elite migration persistence skipped: {exc}")
@@ -3078,9 +3161,8 @@ def train(n_generations=N_GENERATIONS, resume=True):
             resumed_params = None
             resumed_opt = None
         else:
-            seed_params, _ = load_params(
-                tag_seed_path if (use_tag_seed and generation == start_generation) else latest_elite
-            )
+            seed_path = tag_seed_path if (use_tag_seed and generation == start_generation) else latest_elite
+            seed_params, _ = load_tag_seed_params(seed_path, latest_elite)
             candidate_params = jax.tree_util.tree_map(
                 lambda a: a.copy(), seed_params
             )
@@ -3390,6 +3472,20 @@ def train(n_generations=N_GENERATIONS, resume=True):
                     "global_input_size": GLOBAL_INPUT_SIZE,
                 },
             )
+
+            # Keep the Tag side synchronized with every NEW Production Elite.
+            # Only Tag-mutated encoder/Micro parameters are copied, so the file
+            # remains tiny and can later be merged onto the current full Elite.
+            try:
+                synced_tag_path = save_tag_policy_snapshot(
+                    candidate_params,
+                    generation,
+                    latest_elite,
+                    source="production_elite_sync",
+                )
+                print(f"Tag policy synced    : {os.path.basename(synced_tag_path)}")
+            except Exception as exc:
+                print(f"Tag policy sync failed: {exc}")
 
         print()
         print("Generation summary")
