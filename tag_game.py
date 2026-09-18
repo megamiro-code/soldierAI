@@ -21,9 +21,6 @@
 #   - No Tag-specific reward is introduced.
 #   - Every game can be replayed later from its .npz; HTML is generated only by
 #     an explicit --replay command and uses the production RTS replay renderer.
-#   - Walls (both interior 2x2 blocks and the top/bottom edge 2x1 blocks) start
-#     at zero and are introduced one at a time, in random order, as commander
-#     kills become reliable.
 # ============================================================
 
 import argparse
@@ -57,24 +54,23 @@ TAG_POPULATION = 8
 TAG_GAMES_PER_MATCH = 8
 TAG_GAMES_PER_SIDE = TAG_GAMES_PER_MATCH // 2
 TAG_MUTATION_STRENGTH = 0.06
-TAG_BIAS_MUTATION_STRENGTH = 0.35
+TAG_BIAS_MUTATION_STRENGTH = 0.20
 TAG_ATTACK_EXPLORATION_FLOOR = 0.15
 TAG_ATTACK_EXPLORATION_CEIL = 0.85
+# Commander-kill reward for the individual soldier selected as the killer.
+# 50 ordinary soldier kills × production soldier KILL reward (0.05) = +2.50.
+TAG_SOLDIER_COMMANDER_KILL_REWARD = float(rts.REWARD_SOLDIER_KILL * 50.0)
 TAG_MAX_STEPS = rts.MAX_STEPS
 TAG_RESULT_EPS = 1e-6
 
-# ------------------------------------------------------------
 # Wall curriculum for the standalone knockout Tag system.
-#
-# All walls -- both the 15 interior 2x2 blocks and the 6 top/bottom edge
-# 2x1 blocks -- are pooled into a single set of candidate blocks. The
-# curriculum starts with ZERO active blocks (a fully open field) and adds
-# one randomly chosen block (interior or edge, no preference) each time
-# commander kills have been reliable for several consecutive generations.
-# ------------------------------------------------------------
-
-TAG_KILL_RATE_THRESHOLD = 0.25
-TAG_KILL_STABLE_GENERATIONS = 3
+# There are exactly 15 possible wall blocks total: 9 interior 2x2 blocks
+# and 6 top/bottom edge 2x1 blocks. The field starts completely open
+# (zero active wall blocks), and blocks are added/removed by the curriculum.
+# Every candidate position preserves the intended 2-cell corridors.
+TAG_KILL_RATE_THRESHOLD = 0.50
+TAG_KILL_STABLE_GENERATIONS = 5
+TAG_KILL_UNSTABLE_GENERATIONS = 5
 TAG_INACTIVE_WALL_SENTINEL = 1000.0
 
 
@@ -87,52 +83,48 @@ def _make_2x2_wall_cells(cx, cz):
     )
 
 
-def _make_edge_wall_cells(cx, cz):
-    # 2 cells wide (x direction) x 1 cell high, centered at (cx, cz).
+def _make_2x1_edge_wall_cells(cx, cz):
+    # Horizontal 2×1 block used only on the top/bottom edge.
     return (
         (cx - 0.5, cz),
         (cx + 0.5, cz),
     )
 
 
-# Interior 2x2 blocks (15 total): same 5x3 grid used previously.
 TAG_INTERIOR_WALL_BLOCK_CENTERS = tuple(
     (float(x), float(z))
     for z in (-4.0, 0.0, 4.0)
     for x in (-4.0, 0.0, 4.0)
 )
 
-# Top/bottom edge 2x1 blocks (6 total): same footprint as the old fixed
-# edge walls, but now treated as ordinary curriculum blocks.
 TAG_EDGE_WALL_BLOCK_CENTERS = tuple(
     (float(x), float(z))
     for z in (-7.5, 7.5)
     for x in (-4.0, 0.0, 4.0)
 )
 
-
-def _build_wall_block_definitions():
-    blocks = []
-    for cx, cz in TAG_INTERIOR_WALL_BLOCK_CENTERS:
-        blocks.append({
+# Fixed construction order: 9 interior blocks first, 6 edge blocks second.
+# All 15 blocks are equally eligible for random curriculum activation.
+TAG_WALL_BLOCKS = tuple(
+    [
+        {
             "kind": "interior",
             "center": (cx, cz),
             "cells": _make_2x2_wall_cells(cx, cz),
-        })
-    for cx, cz in TAG_EDGE_WALL_BLOCK_CENTERS:
-        blocks.append({
+        }
+        for cx, cz in TAG_INTERIOR_WALL_BLOCK_CENTERS
+    ]
+    + [
+        {
             "kind": "edge",
             "center": (cx, cz),
-            "cells": _make_edge_wall_cells(cx, cz),
-        })
-    return tuple(blocks)
-
-
-# Unified candidate pool. Block id is simply the index into this tuple
-# (0..TAG_WALL_BLOCK_COUNT-1), fixed by construction order above.
-TAG_WALL_BLOCKS = _build_wall_block_definitions()
-TAG_WALL_BLOCK_COUNT = len(TAG_WALL_BLOCKS)
-TAG_MAX_PHYSICS_WALL_CELLS = sum(len(b["cells"]) for b in TAG_WALL_BLOCKS)
+            "cells": _make_2x1_edge_wall_cells(cx, cz),
+        }
+        for cx, cz in TAG_EDGE_WALL_BLOCK_CENTERS
+    ]
+)
+TAG_WALL_BLOCK_COUNT = len(TAG_WALL_BLOCKS)  # exactly 15
+TAG_MAX_PHYSICS_WALL_CELLS = sum(len(block["cells"]) for block in TAG_WALL_BLOCKS)
 
 
 def _build_active_tag_walls(active_wall_ids):
@@ -158,10 +150,8 @@ def _build_active_tag_walls(active_wall_ids):
 def _tag_wall_label(wall_id):
     block = TAG_WALL_BLOCKS[int(wall_id)]
     x, z = block["center"]
-    tag = "E" if block["kind"] == "edge" else "I"
-    return f"{tag}{int(wall_id):02d}@({x:+.0f},{z:+.0f})"
-
-
+    prefix = "I" if block["kind"] == "interior" else "E"
+    return f"{prefix}{int(wall_id):02d}@({x:+.1f},{z:+.1f})"
 TAG_REPLAY_DIR = LOCAL_BASE_DIR / "tag_replay"
 TAG_BOUT_DIR = LOCAL_BASE_DIR / "tag_bouts"
 TAG_ELITE_DIR = LOCAL_BASE_DIR / "tag_elite"
@@ -170,6 +160,13 @@ for _d in (TAG_REPLAY_DIR, TAG_BOUT_DIR, TAG_ELITE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 TAG_ENCODER_KEYS = tuple(rts.TAG_ENCODER_KEYS)
+TAG_SOLDIER_KEYS = (
+    "Ws1", "bs1", "Ws2", "bs2",
+    "W_micro_s", "b_micro_s",
+)
+TAG_COMMANDER_KEYS = (
+    "Wc", "bc", "W_micro_c", "b_micro_c",
+)
 
 
 # ============================================================
@@ -319,17 +316,12 @@ def _clone_params(params):
     return {k: jnp.array(v) for k, v in params.items()}
 
 
-def _mutate_params(parent, key, strength=TAG_MUTATION_STRENGTH):
-    """Mutation-only evolution with stronger exploration on Micro action biases.
-
-    Encoder mutations stay relatively small.  Micro head biases are mutated more
-    strongly because b_micro_s[2] directly controls the attack probability; with
-    the previous tiny perturbation it stayed almost exactly at 0.5 and the
-    knockout tournament frequently produced all-timeout ties.
-    """
-    keys = random.split(key, len(TAG_ENCODER_KEYS))
-    child = {k: jnp.array(v) for k, v in parent.items()}
-    for k, kk in zip(TAG_ENCODER_KEYS, keys):
+def _mutate_group_params(parent, keys, key, strength=TAG_MUTATION_STRENGTH):
+    """Mutate one logical skill group (soldier or commander)."""
+    keys = tuple(keys)
+    subkeys = random.split(key, len(keys))
+    child = {k: jnp.array(parent[k]) for k in keys}
+    for k, kk in zip(keys, subkeys):
         p = parent[k]
         noise = random.normal(kk, p.shape, dtype=p.dtype)
         if k in ("b_micro_s", "b_micro_c"):
@@ -341,13 +333,97 @@ def _mutate_params(parent, key, strength=TAG_MUTATION_STRENGTH):
     return child
 
 
-def _parameter_delta(parent, child):
+def _clone_group_params(params, keys):
+    return {k: jnp.array(params[k]) for k in keys}
+
+
+def _group_parameter_delta(parent, child, keys):
     total = 0.0
-    for k in TAG_ENCODER_KEYS:
+    for k in keys:
         d = np.asarray(child[k] - parent[k], dtype=np.float32)
         total += float(np.sum(d * d))
     return float(np.sqrt(total))
 
+
+def _parameter_delta(parent, child):
+    """Backward-compatible full Tag-subset parameter delta."""
+    return _group_parameter_delta(parent, child, TAG_ENCODER_KEYS)
+
+
+def _seed_bundle_from_full_params(params):
+    """Extract the single-soldier seed + commander seed from a production policy."""
+    return {
+        "soldier": _clone_group_params(params, TAG_SOLDIER_KEYS),
+        "commander": _clone_group_params(params, TAG_COMMANDER_KEYS),
+        "logstd_s": jnp.array(params["logstd_s"]),
+        "logstd_c": jnp.array(params["logstd_c"]),
+    }
+
+
+def _bundle_to_sparse_params(bundle):
+    out = {}
+    out.update(bundle["soldier"])
+    out.update(bundle["commander"])
+    return out
+
+
+def _make_team_from_seed(seed_bundle, rng_key, n_soldiers, exact_seed_first=False):
+    """Create one team whose soldiers each have an independent NN clone."""
+    keys = random.split(rng_key, n_soldiers + 1)
+    soldiers = []
+    for i in range(n_soldiers):
+        if exact_seed_first and i == 0:
+            sp = _clone_group_params(seed_bundle["soldier"], TAG_SOLDIER_KEYS)
+        else:
+            sp = _mutate_group_params(seed_bundle["soldier"], TAG_SOLDIER_KEYS, keys[i])
+        soldiers.append(sp)
+
+    if exact_seed_first:
+        commander = _clone_group_params(seed_bundle["commander"], TAG_COMMANDER_KEYS)
+    else:
+        commander = _mutate_group_params(seed_bundle["commander"], TAG_COMMANDER_KEYS, keys[-1])
+
+    return {
+        "soldiers": tuple(soldiers),
+        "commander": commander,
+        "logstd_s": seed_bundle["logstd_s"],
+        "logstd_c": seed_bundle["logstd_c"],
+    }
+
+
+def _team_mutation_deltas(seed_bundle, team):
+    soldier_deltas = [
+        _group_parameter_delta(seed_bundle["soldier"], sp, TAG_SOLDIER_KEYS)
+        for sp in team["soldiers"]
+    ]
+    commander_delta = _group_parameter_delta(
+        seed_bundle["commander"], team["commander"], TAG_COMMANDER_KEYS
+    )
+    return soldier_deltas, commander_delta
+
+
+def _make_population(seed_bundle, rng, n_soldiers):
+    """Create 8 candidate teams; each team has independent soldier NNs."""
+    keys = random.split(rng, TAG_POPULATION)
+    return [
+        _make_team_from_seed(
+            seed_bundle,
+            k,
+            n_soldiers,
+            exact_seed_first=(i == 0),
+        )
+        for i, k in enumerate(keys)
+    ]
+
+
+def _build_next_seed_bundle(best_soldier_params, winning_commander, logstd_s, logstd_c):
+    """Turn the best soldier in the winning team into the next-generation seed."""
+    return {
+        "soldier": _clone_group_params(best_soldier_params, TAG_SOLDIER_KEYS),
+        "commander": _clone_group_params(winning_commander, TAG_COMMANDER_KEYS),
+        "logstd_s": jnp.array(logstd_s),
+        "logstd_c": jnp.array(logstd_c),
+    }
 
 def _production_reward_labels():
     return (
@@ -456,14 +532,15 @@ def make_tag_initial_state(key, n_soldiers):
 # ============================================================
 
 
-def _micro_world_action(params, state, team, n_soldiers, rng_key, terrain_override):
-    """Micro-only action using the same stochastic action style as production PPO.
+def _micro_world_action(team_params, state, team, n_soldiers, rng_key, terrain_override):
+    """Micro action with one independent Soldier NN per active soldier.
 
-    The Macro/attention branches are intentionally excluded.  Direction uses the
-    Micro mean plus the production logstd exploration, and attack is sampled from
-    the Micro Bernoulli probability rather than thresholded deterministically.
+    Commander uses one shared commander NN for the team.  This makes Tag a true
+    micro-skill evolution problem: soldiers on the same team can specialize.
     """
-    obs = rts.make_observation(state, float(team), terrain_override=terrain_override)[None, :]
+    obs = rts.make_observation(
+        state, float(team), terrain_override=terrain_override
+    )[None, :]
 
     soldier_start = rts.TERRAIN_SIZE
     soldier_end = soldier_start + rts.N_SOLDIERS_TOTAL * rts.SOLDIER_FEATURES
@@ -474,53 +551,66 @@ def _micro_world_action(params, state, team, n_soldiers, rng_key, terrain_overri
         1, rts.N_COMMANDERS, rts.COMMANDER_FEATURES
     )
 
-    soldier_h = jnp.tanh(soldier_part @ params["Ws1"] + params["bs1"])
-    soldier_emb = jnp.tanh(soldier_h @ params["Ws2"] + params["bs2"])
-    commander_emb = jnp.tanh(commander_part @ params["Wc"] + params["bc"])
-
-    micro_s_all = soldier_emb @ params["W_micro_s"] + params["b_micro_s"]
-    micro_c_all = commander_emb @ params["W_micro_c"] + params["b_micro_c"]
-
-    if int(team) == 0:
-        own_s = micro_s_all[:, :rts.N_SOLDIERS_PER_TEAM, :]
-        own_c = micro_c_all[:, 0, :]
-    else:
-        own_s = micro_s_all[:, rts.N_SOLDIERS_PER_TEAM:, :]
-        own_c = micro_c_all[:, 1, :]
-
-    s_vec = jnp.tanh(own_s[0, :, :2])
-    s_vec = s_vec / (jnp.linalg.norm(s_vec, axis=-1, keepdims=True) + 1e-8)
-    base_angle = jnp.arctan2(s_vec[:, 1], s_vec[:, 0])
-
-    k_angle, k_attack, k_cmd = random.split(rng_key, 3)
-    logstd = jnp.clip(params["logstd_s"], rts.LOGSTD_MIN, rts.LOGSTD_MAX)
-    angle = base_angle + jnp.exp(logstd) * random.normal(
-        k_angle, (rts.N_SOLDIERS_PER_TEAM,)
-    )
-    dx = jnp.cos(angle)
-    dz = jnp.sin(angle)
-
-    attack_prob_raw = jax.nn.sigmoid(own_s[0, :, 2])
-    # Keep exploration alive during evolution: even a silent attack head has
-    # a chance to discover the production HIT/KILL rewards.
-    attack_prob = (
-        jnp.float32(TAG_ATTACK_EXPLORATION_FLOOR)
-        + jnp.float32(TAG_ATTACK_EXPLORATION_CEIL - TAG_ATTACK_EXPLORATION_FLOOR)
-        * attack_prob_raw
-    )
-    attack = random.bernoulli(k_attack, attack_prob).astype(jnp.float32)
-
-    c_vec = jnp.tanh(own_c[0])
-    c_vec = c_vec / (jnp.linalg.norm(c_vec) + 1e-8)
-    c_angle = jnp.arctan2(c_vec[1], c_vec[0])
-    c_logstd = jnp.clip(params["logstd_c"], rts.LOGSTD_MIN, rts.LOGSTD_MAX)
-    c_angle = c_angle + jnp.exp(c_logstd) * random.normal(k_cmd, ())
-    cdx, cdz = jnp.cos(c_angle), jnp.sin(c_angle)
-
     local_action = jnp.zeros((rts.ACTION_SIZE,), dtype=jnp.float32)
-    local_action = local_action.at[0:3 * n_soldiers:3].set(dx[:n_soldiers])
-    local_action = local_action.at[1:3 * n_soldiers:3].set(dz[:n_soldiers])
-    local_action = local_action.at[2:3 * n_soldiers:3].set(attack[:n_soldiers])
+
+    # Each active soldier gets a completely separate encoder + Micro head.
+    for i in range(n_soldiers):
+        global_i = i if int(team) == 0 else rts.N_SOLDIERS_PER_TEAM + i
+        p = team_params["soldiers"][i]
+        feat = soldier_part[0, global_i]
+        h = jnp.tanh(feat @ p["Ws1"] + p["bs1"])
+        emb = jnp.tanh(h @ p["Ws2"] + p["bs2"])
+        micro = emb @ p["W_micro_s"] + p["b_micro_s"]
+
+        vec = jnp.tanh(micro[:2])
+        vec = vec / (jnp.linalg.norm(vec) + 1e-8)
+        base_angle = jnp.arctan2(vec[1], vec[0])
+
+        k = random.fold_in(rng_key, i)
+        # Production logstd_s is a 100-element vector (one slot per soldier).
+        # This Tag soldier has its own NN, but still uses the corresponding
+        # production exploration slot so the result is scalar.
+        soldier_logstd = jnp.clip(
+            team_params["logstd_s"][global_i],
+            rts.LOGSTD_MIN,
+            rts.LOGSTD_MAX,
+        )
+        angle = base_angle + jnp.exp(soldier_logstd) * random.normal(
+            random.fold_in(k, 1), ()
+        )
+        dx = jnp.cos(angle)
+        dz = jnp.sin(angle)
+
+        attack_prob_raw = jax.nn.sigmoid(micro[2])
+        attack_prob = (
+            jnp.float32(TAG_ATTACK_EXPLORATION_FLOOR)
+            + jnp.float32(TAG_ATTACK_EXPLORATION_CEIL - TAG_ATTACK_EXPLORATION_FLOOR)
+            * attack_prob_raw
+        )
+        attack = random.bernoulli(random.fold_in(k, 2), attack_prob).astype(jnp.float32)
+
+        local_action = local_action.at[3 * i].set(dx)
+        local_action = local_action.at[3 * i + 1].set(dz)
+        local_action = local_action.at[3 * i + 2].set(attack)
+
+    # One commander NN per team; commander is not duplicated per soldier.
+    cp = team_params["commander"]
+    cmd_slot = 0 if int(team) == 0 else 1
+    cmd_feat = commander_part[0, cmd_slot]
+    cmd_h = jnp.tanh(cmd_feat @ cp["Wc"] + cp["bc"])
+    cmd_micro = cmd_h @ cp["W_micro_c"] + cp["b_micro_c"]
+    cvec = jnp.tanh(cmd_micro)
+    cvec = cvec / (jnp.linalg.norm(cvec) + 1e-8)
+    c_angle = jnp.arctan2(cvec[1], cvec[0])
+    commander_logstd = jnp.clip(
+        team_params["logstd_c"],
+        rts.LOGSTD_MIN,
+        rts.LOGSTD_MAX,
+    )
+    c_angle = c_angle + jnp.exp(commander_logstd) * random.normal(
+        random.fold_in(rng_key, 1001), ()
+    )
+    cdx, cdz = jnp.cos(c_angle), jnp.sin(c_angle)
     local_action = local_action.at[rts.SOLDIER_ACTION_SIZE].set(cdx)
     local_action = local_action.at[rts.SOLDIER_ACTION_SIZE + 1].set(cdz)
 
@@ -544,6 +634,9 @@ def _rollout_game(params_red, params_blue, initial_state, n_soldiers, game_key, 
         (
             state, finished, end_step,
             cum_red, cum_blue,
+            red_soldier_score_acc, blue_soldier_score_acc,
+            red_soldier_components_acc, blue_soldier_components_acc,
+            red_commander_components_acc, blue_commander_components_acc,
             red_attack_acc, blue_attack_acc,
             red_hit_acc, blue_hit_acc,
             red_kill_acc, blue_kill_acc,
@@ -609,9 +702,12 @@ def _rollout_game(params_red, params_blue, initial_state, n_soldiers, game_key, 
             & (dist2 <= rts.ATTACK_RANGE ** 2)
             & (~(rts.ALL_UNIT_INDICES[None, :] == all_s[:, None]))
         )
+        target_all = jnp.argmin(jnp.where(valid_target, dist2, 1e9), axis=1)
         has_target = jnp.any(valid_target, axis=1)
         can_attack_all = attack_attempt_all & has_target
         attack_miss_all = attack_attempt_all & (~has_target)
+        target_died_all = (state["hp"] > 0) & (nxt["hp"] <= 0)
+        attacker_kill_all = (can_attack_all & target_died_all[target_all]).astype(jnp.float32)
 
         red_attack_attempt = attack_attempt_all[:rts.N_SOLDIERS_PER_TEAM]
         blue_attack_attempt = attack_attempt_all[rts.N_SOLDIERS_PER_TEAM:]
@@ -648,6 +744,48 @@ def _rollout_game(params_red, params_blue, initial_state, n_soldiers, game_key, 
         blue_kill_now = jnp.sum(
             (blue_enemy_hp_before > 0) & (blue_enemy_hp_after <= 0)
         ).astype(jnp.float32)
+
+        # Give exactly one soldier on each side credit for a commander kill.
+        # When several soldiers attack the commander on the same killing step,
+        # credit the closest eligible attacker to avoid multiplying the reward.
+        red_cmd_died_now = (
+            state["hp"][rts.BLUE_COMMANDER_INDEX] > 0
+        ) & (nxt["hp"][rts.BLUE_COMMANDER_INDEX] <= 0)
+        blue_cmd_died_now = (
+            state["hp"][rts.RED_COMMANDER_INDEX] > 0
+        ) & (nxt["hp"][rts.RED_COMMANDER_INDEX] <= 0)
+
+        red_cmd_attackers = (
+            can_attack_all[:rts.N_SOLDIERS_PER_TEAM]
+            & (target_all[:rts.N_SOLDIERS_PER_TEAM] == rts.BLUE_COMMANDER_INDEX)
+            & red_cmd_died_now
+        )
+        blue_cmd_attackers = (
+            can_attack_all[rts.N_SOLDIERS_PER_TEAM:]
+            & (target_all[rts.N_SOLDIERS_PER_TEAM:] == rts.RED_COMMANDER_INDEX)
+            & blue_cmd_died_now
+        )
+
+        red_cmd_dist2 = dist2[:rts.N_SOLDIERS_PER_TEAM, rts.BLUE_COMMANDER_INDEX]
+        blue_cmd_dist2 = dist2[rts.N_SOLDIERS_PER_TEAM:, rts.RED_COMMANDER_INDEX]
+
+        red_cmd_pick = jnp.argmin(
+            jnp.where(red_cmd_attackers, red_cmd_dist2, jnp.float32(1e9))
+        )
+        blue_cmd_pick = jnp.argmin(
+            jnp.where(blue_cmd_attackers, blue_cmd_dist2, jnp.float32(1e9))
+        )
+
+        red_cmd_credit = (
+            jax.nn.one_hot(red_cmd_pick, rts.N_SOLDIERS_PER_TEAM, dtype=jnp.float32)
+            * jnp.any(red_cmd_attackers).astype(jnp.float32)
+        )
+        blue_cmd_credit = (
+            jax.nn.one_hot(blue_cmd_pick, rts.N_SOLDIERS_PER_TEAM, dtype=jnp.float32)
+            * jnp.any(blue_cmd_attackers).astype(jnp.float32)
+        )
+        red_cmd_kill_reward = TAG_SOLDIER_COMMANDER_KILL_REWARD * red_cmd_credit
+        blue_cmd_kill_reward = TAG_SOLDIER_COMMANDER_KILL_REWARD * blue_cmd_credit
 
         # Wall collision counts use the same pre-separation desired position test
         # as production step_one().
@@ -742,10 +880,26 @@ def _rollout_game(params_red, params_blue, initial_state, n_soldiers, game_key, 
         ) / LOCAL_REWARD_DENOM
         red_approach_reward = red_approach_now / LOCAL_REWARD_DENOM
         blue_approach_reward = blue_approach_now / LOCAL_REWARD_DENOM
-        red_survival_reward = rts.REWARD_COMMANDER_SURVIVAL * nxt["alive"][rts.RED_COMMANDER_INDEX] / LOCAL_REWARD_DENOM
-        blue_survival_reward = rts.REWARD_COMMANDER_SURVIVAL * nxt["alive"][rts.BLUE_COMMANDER_INDEX] / LOCAL_REWARD_DENOM
-        red_cmdhit_reward = rts.REWARD_COMMANDER_HIT_BY_ENEMY * red_cmd_hits_now / LOCAL_REWARD_DENOM
-        blue_cmdhit_reward = rts.REWARD_COMMANDER_HIT_BY_ENEMY * blue_cmd_hits_now / LOCAL_REWARD_DENOM
+        # Raw individual components for readable evolution diagnostics.
+        # Commander-kill reward is intentionally an evolution-only Soldier reward:
+        # it is NOT added to red_step_reward/blue_step_reward, so match winner
+        # selection still follows the production physics/reward definition, while
+        # the winning team's best Soldier receives +2.50 for a credited commander kill.
+        soldier_hit_all = rts.REWARD_SOLDIER_HIT * can_attack_all.astype(jnp.float32)
+        soldier_kill_all = rts.REWARD_SOLDIER_KILL * attacker_kill_all
+        soldier_miss_all = rts.REWARD_SOLDIER_MISS * attack_miss_all.astype(jnp.float32)
+        soldier_wall_all = rts.REWARD_SOLDIER_WALL * wall_collision[rts.ALL_SOLDIER_INDICES].astype(jnp.float32)
+        red_survival_reward_raw = rts.REWARD_COMMANDER_SURVIVAL * nxt["alive"][rts.RED_COMMANDER_INDEX]
+        blue_survival_reward_raw = rts.REWARD_COMMANDER_SURVIVAL * nxt["alive"][rts.BLUE_COMMANDER_INDEX]
+        red_cmdhit_reward_raw = rts.REWARD_COMMANDER_HIT_BY_ENEMY * red_cmd_hits_now
+        blue_cmdhit_reward_raw = rts.REWARD_COMMANDER_HIT_BY_ENEMY * blue_cmd_hits_now
+        red_cmdwall_reward_raw = rts.REWARD_COMMANDER_WALL * red_cmd_wall_now
+        blue_cmdwall_reward_raw = rts.REWARD_COMMANDER_WALL * blue_cmd_wall_now
+
+        red_survival_reward = red_survival_reward_raw / LOCAL_REWARD_DENOM
+        blue_survival_reward = blue_survival_reward_raw / LOCAL_REWARD_DENOM
+        red_cmdhit_reward = red_cmdhit_reward_raw / LOCAL_REWARD_DENOM
+        blue_cmdhit_reward = blue_cmdhit_reward_raw / LOCAL_REWARD_DENOM
 
         active = ~finished
         newly_done = active & done_step
@@ -755,6 +909,30 @@ def _rollout_game(params_red, params_blue, initial_state, n_soldiers, game_key, 
         next_state = jax.tree_util.tree_map(lambda n, o: jnp.where(active, n, o), nxt, state)
         next_finished = finished | done_step
         next_end_step = jnp.where(newly_done, step_idx + 1, end_step)
+        red_soldier_score_now = red_soldier_reward[:n_soldiers] + red_cmd_kill_reward[:n_soldiers]
+        blue_soldier_score_now = blue_soldier_reward[:n_soldiers] + blue_cmd_kill_reward[:n_soldiers]
+        red_components_now = jnp.stack([
+            soldier_hit_all[:n_soldiers], soldier_kill_all[:n_soldiers],
+            red_cmd_kill_reward[:n_soldiers],
+            soldier_miss_all[:n_soldiers], soldier_wall_all[:n_soldiers],
+            approach[:n_soldiers],
+        ], axis=1)
+        blue_components_now = jnp.stack([
+            soldier_hit_all[rts.N_SOLDIERS_PER_TEAM:rts.N_SOLDIERS_PER_TEAM + n_soldiers],
+            soldier_kill_all[rts.N_SOLDIERS_PER_TEAM:rts.N_SOLDIERS_PER_TEAM + n_soldiers],
+            blue_cmd_kill_reward[:n_soldiers],
+            soldier_miss_all[rts.N_SOLDIERS_PER_TEAM:rts.N_SOLDIERS_PER_TEAM + n_soldiers],
+            soldier_wall_all[rts.N_SOLDIERS_PER_TEAM:rts.N_SOLDIERS_PER_TEAM + n_soldiers],
+            approach[rts.N_SOLDIERS_PER_TEAM:rts.N_SOLDIERS_PER_TEAM + n_soldiers],
+        ], axis=1)
+        red_commander_components_now = jnp.stack([red_survival_reward_raw, red_cmdhit_reward_raw, red_cmdwall_reward_raw, terminal_red])
+        blue_commander_components_now = jnp.stack([blue_survival_reward_raw, blue_cmdhit_reward_raw, blue_cmdwall_reward_raw, terminal_blue])
+        next_red_soldier_scores = red_soldier_score_acc + jnp.where(active, red_soldier_score_now, 0.0)
+        next_blue_soldier_scores = blue_soldier_score_acc + jnp.where(active, blue_soldier_score_now, 0.0)
+        next_red_soldier_components = red_soldier_components_acc + jnp.where(active, red_components_now, 0.0)
+        next_blue_soldier_components = blue_soldier_components_acc + jnp.where(active, blue_components_now, 0.0)
+        next_red_commander_components = red_commander_components_acc + jnp.where(active, red_commander_components_now, 0.0)
+        next_blue_commander_components = blue_commander_components_acc + jnp.where(active, blue_commander_components_now, 0.0)
         next_red_attacks = red_attack_acc + jnp.where(active, red_attack_now, 0.0)
         next_blue_attacks = blue_attack_acc + jnp.where(active, blue_attack_now, 0.0)
         next_red_hits = red_hit_acc + jnp.where(active, red_hit_now, 0.0)
@@ -779,6 +957,9 @@ def _rollout_game(params_red, params_blue, initial_state, n_soldiers, game_key, 
         )
         return (
             (next_state, next_finished, next_end_step, cum_red + effective_red, cum_blue + effective_blue,
+             next_red_soldier_scores, next_blue_soldier_scores,
+             next_red_soldier_components, next_blue_soldier_components,
+             next_red_commander_components, next_blue_commander_components,
              next_red_attacks, next_blue_attacks, next_red_hits, next_blue_hits, next_red_kills, next_blue_kills),
             out,
         )
@@ -786,10 +967,19 @@ def _rollout_game(params_red, params_blue, initial_state, n_soldiers, game_key, 
     init = (
         initial_state, jnp.array(False), jnp.int32(TAG_MAX_STEPS),
         jnp.float32(0.0), jnp.float32(0.0),
+        jnp.zeros((n_soldiers,), dtype=jnp.float32),
+        jnp.zeros((n_soldiers,), dtype=jnp.float32),
+        jnp.zeros((n_soldiers, 6), dtype=jnp.float32),
+        jnp.zeros((n_soldiers, 6), dtype=jnp.float32),
+        jnp.zeros((4,), dtype=jnp.float32),
+        jnp.zeros((4,), dtype=jnp.float32),
         jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0),
         jnp.float32(0.0), jnp.float32(0.0),
     )
-    (final_state, _, end_step, cum_red, cum_blue, red_attack_acc, blue_attack_acc, red_hit_acc, blue_hit_acc, red_kill_acc, blue_kill_acc), traj = lax.scan(
+    (final_state, _, end_step, cum_red, cum_blue, red_soldier_score_acc, blue_soldier_score_acc,
+     red_soldier_components_acc, blue_soldier_components_acc,
+     red_commander_components_acc, blue_commander_components_acc,
+     red_attack_acc, blue_attack_acc, red_hit_acc, blue_hit_acc, red_kill_acc, blue_kill_acc), traj = lax.scan(
         body, init, jnp.arange(TAG_MAX_STEPS)
     )
 
@@ -859,6 +1049,12 @@ def _rollout_game(params_red, params_blue, initial_state, n_soldiers, game_key, 
         "red_attack_attempts": red_attack_acc, "blue_attack_attempts": blue_attack_acc,
         "red_hits": red_hit_acc, "blue_hits": blue_hit_acc,
         "red_kills": red_kill_acc, "blue_kills": blue_kill_acc,
+        "red_soldier_scores": red_soldier_score_acc,
+        "blue_soldier_scores": blue_soldier_score_acc,
+        "red_soldier_components": red_soldier_components_acc,
+        "blue_soldier_components": blue_soldier_components_acc,
+        "red_commander_components": red_commander_components_acc,
+        "blue_commander_components": blue_commander_components_acc,
         "red_commander_kill": red_commander_kill,
         "blue_commander_kill": blue_commander_kill,
         "commander_kill": red_commander_kill | blue_commander_kill,
@@ -935,9 +1131,19 @@ def _run_match(candidate, opponent, rng, n_soldiers, policy_numbers, bout_start,
     total_attacks = {0: 0.0, 1: 0.0}
     total_hits = {0: 0.0, 1: 0.0}
     total_kills = {0: 0.0, 1: 0.0}
+    candidate_soldier_scores = np.zeros(n_soldiers, dtype=np.float64)
+    opponent_soldier_scores = np.zeros(n_soldiers, dtype=np.float64)
+    candidate_soldier_components = np.zeros((n_soldiers, 6), dtype=np.float64)
+    opponent_soldier_components = np.zeros((n_soldiers, 6), dtype=np.float64)
+    candidate_commander_components = np.zeros(4, dtype=np.float64)
+    opponent_commander_components = np.zeros(4, dtype=np.float64)
     draws = 0
     commander_kill_games = 0
     commander_kill_events = 0
+    candidate_commander_deaths = 0
+    opponent_commander_deaths = 0
+    candidate_commander_reward = 0.0
+    opponent_commander_reward = 0.0
     game_records = []
     reward_totals = {0: {k: 0.0 for k in ("survival", "hit", "kill", "miss", "wall", "approach", "cmdhit", "terminal", "total")},
                      1: {k: 0.0 for k in ("survival", "hit", "kill", "miss", "wall", "approach", "cmdhit", "terminal", "total")}}
@@ -959,7 +1165,6 @@ def _run_match(candidate, opponent, rng, n_soldiers, policy_numbers, bout_start,
         red_return = float(np.asarray(result_np["red_return"]))
         blue_return = float(np.asarray(result_np["blue_return"]))
         end_step = int(np.asarray(result_np["end_step"]))
-        # Final HP comes from the last trajectory frame.
         final_hp = np.asarray(result_np["hp"])[end_step]
         red_attack_attempts = float(np.asarray(result["red_attack_attempts"]))
         blue_attack_attempts = float(np.asarray(result["blue_attack_attempts"]))
@@ -967,6 +1172,27 @@ def _run_match(candidate, opponent, rng, n_soldiers, policy_numbers, bout_start,
         blue_hits = float(np.asarray(result["blue_hits"]))
         red_kills = float(np.asarray(result["red_kills"]))
         blue_kills = float(np.asarray(result["blue_kills"]))
+        red_soldier_scores_now = np.asarray(result["red_soldier_scores"], dtype=np.float64)
+        blue_soldier_scores_now = np.asarray(result["blue_soldier_scores"], dtype=np.float64)
+        red_soldier_components_now = np.asarray(result["red_soldier_components"], dtype=np.float64)
+        blue_soldier_components_now = np.asarray(result["blue_soldier_components"], dtype=np.float64)
+        red_commander_components_now = np.asarray(result["red_commander_components"], dtype=np.float64)
+        blue_commander_components_now = np.asarray(result["blue_commander_components"], dtype=np.float64)
+        if candidate_is_red:
+            candidate_soldier_scores += red_soldier_scores_now
+            opponent_soldier_scores += blue_soldier_scores_now
+            candidate_soldier_components += red_soldier_components_now
+            opponent_soldier_components += blue_soldier_components_now
+            candidate_commander_components += red_commander_components_now
+            opponent_commander_components += blue_commander_components_now
+        else:
+            candidate_soldier_scores += blue_soldier_scores_now
+            opponent_soldier_scores += red_soldier_scores_now
+            candidate_soldier_components += blue_soldier_components_now
+            opponent_soldier_components += red_soldier_components_now
+            candidate_commander_components += blue_commander_components_now
+            opponent_commander_components += red_commander_components_now
+
         red_commander_kill = bool(np.asarray(result["red_commander_kill"]))
         blue_commander_kill = bool(np.asarray(result["blue_commander_kill"]))
         commander_kill = red_commander_kill or blue_commander_kill
@@ -975,9 +1201,14 @@ def _run_match(candidate, opponent, rng, n_soldiers, policy_numbers, bout_start,
         red_breakdown = {k: float(np.asarray(v)) for k, v in result["red_breakdown"].items()}
         blue_breakdown = {k: float(np.asarray(v)) for k, v in result["blue_breakdown"].items()}
 
-        winner_side = _resolve_game_result(
-            raw_result, red_return, blue_return, final_hp
-        )
+        if candidate_is_red:
+            candidate_commander_deaths += int(red_commander_kill)
+            opponent_commander_deaths += int(blue_commander_kill)
+        else:
+            candidate_commander_deaths += int(blue_commander_kill)
+            opponent_commander_deaths += int(red_commander_kill)
+
+        winner_side = _resolve_game_result(raw_result, red_return, blue_return, final_hp)
         if winner_side < 0:
             draws += 1
         else:
@@ -1042,6 +1273,8 @@ def _run_match(candidate, opponent, rng, n_soldiers, policy_numbers, bout_start,
             "blue_hits": blue_hits,
             "red_kills": red_kills,
             "blue_kills": blue_kills,
+            "red_soldier_scores": red_soldier_scores_now,
+            "blue_soldier_scores": blue_soldier_scores_now,
             "red_commander_kill": int(red_commander_kill),
             "blue_commander_kill": int(blue_commander_kill),
             "commander_kill": int(commander_kill),
@@ -1072,10 +1305,20 @@ def _run_match(candidate, opponent, rng, n_soldiers, policy_numbers, bout_start,
         "opponent_hits": total_hits[1],
         "candidate_kills": total_kills[0],
         "opponent_kills": total_kills[1],
+        "candidate_soldier_scores": candidate_soldier_scores,
+        "opponent_soldier_scores": opponent_soldier_scores,
+        "candidate_soldier_components": candidate_soldier_components,
+        "opponent_soldier_components": opponent_soldier_components,
+        "candidate_commander_components": candidate_commander_components,
+        "opponent_commander_components": opponent_commander_components,
         "draws": draws,
         "commander_kill_games": commander_kill_games,
         "commander_kill_events": commander_kill_events,
         "commander_kill_rate": commander_kill_games / float(TAG_GAMES_PER_MATCH),
+        "candidate_commander_deaths": candidate_commander_deaths,
+        "opponent_commander_deaths": opponent_commander_deaths,
+        "candidate_commander_reward": float(np.sum(candidate_commander_components)),
+        "opponent_commander_reward": float(np.sum(opponent_commander_components)),
         "games": game_records,
         "reward_totals": reward_totals,
     }
@@ -1152,11 +1395,11 @@ def _save_bout(bout, policy_number, round_number, match_number, game_number):
         blue_hits=np.array(bout["blue_hits"], dtype=np.float32),
         red_kills=np.array(bout["red_kills"], dtype=np.float32),
         blue_kills=np.array(bout["blue_kills"], dtype=np.float32),
-
         red_commander_kill=np.array(bout["red_commander_kill"], dtype=np.int32),
         blue_commander_kill=np.array(bout["blue_commander_kill"], dtype=np.int32),
         commander_kill=np.array(bout["commander_kill"], dtype=np.int32),
-
+        red_soldier_scores=np.asarray(bout.get("red_soldier_scores", []), dtype=np.float32),
+        blue_soldier_scores=np.asarray(bout.get("blue_soldier_scores", []), dtype=np.float32),
         verification_pass=np.array(1, dtype=np.int32),
         max_state_error=np.array(0.0, dtype=np.float32),
         max_hp_error=np.array(0.0, dtype=np.float32),
@@ -1211,19 +1454,20 @@ def _initial_seed_policy():
     return _load_params(Path(production)), f"production Elite {Path(production).name}"
 
 
-def _make_population(seed_params, rng):
-    keys = random.split(rng, TAG_POPULATION - 1)
-    pop = [_clone_params(seed_params)]
-    for k in keys:
-        pop.append(_mutate_params(seed_params, k))
-    return pop
-
-
 def _generation_tournament(population, policy_numbers, rng, n_soldiers, policy_number, save_bouts, physics_tag_walls, actual_tag_walls):
-    """Run one 8->4->2->1 knockout and return the champion plus bout count."""
+    """Run one 8->4->2->1 knockout.
+
+    A population member is now a TEAM. Each team has one independent Soldier NN
+    per active soldier. After the final match, the soldier with the highest
+    cumulative Soldier-local reward inside the winning team becomes the parent
+    Micro/Encoder for the next generation.
+    """
     next_bout = 0
     round_number = 1
-    current = list(zip(population, policy_numbers))
+    tournament_cmd_kill_games = 0
+    tournament_cmd_kill_events = 0
+    zero_scores = lambda: np.zeros(n_soldiers, dtype=np.float64)
+    current = [(team, pid, zero_scores()) for team, pid in zip(population, policy_numbers)]
 
     while len(current) > 1:
         if len(current) % 2 != 0:
@@ -1233,7 +1477,7 @@ def _generation_tournament(population, policy_numbers, rng, n_soldiers, policy_n
         new_survivors = []
         total_matches = len(current) // 2
         print(f"  ROUND {round_number}: {total_matches} match(es)")
-        for match_number, ((candidate, candidate_id), (opponent, opponent_id)) in enumerate(
+        for match_number, ((candidate, candidate_id, candidate_scores), (opponent, opponent_id, opponent_scores)) in enumerate(
             zip(current[0::2], current[1::2]), start=1
         ):
             print(
@@ -1248,29 +1492,71 @@ def _generation_tournament(population, policy_numbers, rng, n_soldiers, policy_n
                 (candidate_id, opponent_id), next_bout,
                 physics_tag_walls, actual_tag_walls
             )
+            tournament_cmd_kill_games += int(match["commander_kill_games"])
+            tournament_cmd_kill_events += int(match["commander_kill_events"])
             winner_key = random.fold_in(match_key, 999)
             winner = _match_winner(match, winner_key)
             winner_id = candidate_id if winner == 0 else opponent_id
-            winner_params = candidate if winner == 0 else opponent
+            winner_team = candidate if winner == 0 else opponent
+            winner_scores = (
+                candidate_scores + match["candidate_soldier_scores"]
+                if winner == 0
+                else opponent_scores + match["opponent_soldier_scores"]
+            )
+            winner_match_scores = (
+                match["candidate_soldier_scores"]
+                if winner == 0
+                else match["opponent_soldier_scores"]
+            )
 
+            best_match_idx = int(np.argmax(winner_match_scores))
+            best_match_score = float(winner_match_scores[best_match_idx])
+            best_cum_idx = int(np.argmax(winner_scores))
+            best_cum_score = float(winner_scores[best_cum_idx])
+
+            winner_is_candidate = (winner == 0)
+            winner_soldier_components = (
+                match["candidate_soldier_components"][best_match_idx]
+                if winner_is_candidate else match["opponent_soldier_components"][best_match_idx]
+            )
+            winner_commander_components = (
+                match["candidate_commander_components"]
+                if winner_is_candidate else match["opponent_commander_components"]
+            )
+            winner_cmd_deaths = (
+                match["candidate_commander_deaths"]
+                if winner_is_candidate else match["opponent_commander_deaths"]
+            )
             print(
                 f" -> P{winner_id:02d} | "
                 f"score {match['candidate_wins']}-{match['opponent_wins']} | "
-                f"return {match['candidate_return_margin']:+.3f} | "
-                f"HP {match['candidate_hp_margin']:+.3f} | "
                 f"atk {match['candidate_attacks']:.0f}-{match['opponent_attacks']:.0f} | "
                 f"hit {match['candidate_hits']:.0f}-{match['opponent_hits']:.0f} | "
                 f"kill {match['candidate_kills']:.0f}-{match['opponent_kills']:.0f} | "
-                f"draw {match['draws']}",
+                f"cmdK {match['commander_kill_games']}/{TAG_GAMES_PER_MATCH}",
                 flush=True,
             )
-            rr = match["reward_totals"][0]
-            oo = match["reward_totals"][1]
-            print("      " + _format_reward_short(f"P{candidate_id:02d}", rr))
-            print("      " + _format_reward_short(f"P{opponent_id:02d}", oo))
+            hit_count = int(round(winner_soldier_components[0] / max(1e-12, rts.REWARD_SOLDIER_HIT)))
+            kill_count = int(round(winner_soldier_components[1] / max(1e-12, rts.REWARD_SOLDIER_KILL)))
+            cmdkill_count = int(round(winner_soldier_components[2] / max(1e-12, TAG_SOLDIER_COMMANDER_KILL_REWARD)))
+            miss_count = int(round(abs(winner_soldier_components[3]) / max(1e-12, abs(rts.REWARD_SOLDIER_MISS))))
+            wall_count = int(round(abs(winner_soldier_components[4]) / max(1e-12, abs(rts.REWARD_SOLDIER_WALL))))
+            soldier_total = float(np.sum(winner_soldier_components))
+            commander_total = float(np.sum(winner_commander_components))
             print(
-                f"      Commander kills: {match['commander_kill_games']}/{TAG_GAMES_PER_MATCH} "
-                f"games ({match['commander_kill_rate'] * 100:.1f}%), events={match['commander_kill_events']}"
+                f"      Best S{best_match_idx:02d} {soldier_total:+.3f}: "
+                f"H{hit_count}/+{winner_soldier_components[0]:.3f} "
+                f"K{kill_count}/+{winner_soldier_components[1]:.3f} "
+                f"CK{cmdkill_count}/+{winner_soldier_components[2]:.3f} "
+                f"M{miss_count}/{winner_soldier_components[3]:.3f} "
+                f"W{wall_count}/{winner_soldier_components[4]:.3f} "
+                f"A/{winner_soldier_components[5]:+.3f} || "
+                f"Cmd {commander_total:+.3f}: "
+                f"Surv/{winner_commander_components[0]:+.3f} "
+                f"Hit/{winner_commander_components[1]:+.3f} "
+                f"Wall/{winner_commander_components[2]:+.3f} "
+                f"Term/{winner_commander_components[3]:+.3f} "
+                f"Deaths {winner_cmd_deaths}"
             )
 
             if save_bouts:
@@ -1278,13 +1564,29 @@ def _generation_tournament(population, policy_numbers, rng, n_soldiers, policy_n
                     _save_bout(bout, policy_number, round_number, match_number, game_in_match)
 
             next_bout += len(match["games"])
-            new_survivors.append((winner_params, winner_id))
+            new_survivors.append((winner_team, winner_id, winner_scores))
 
         current = new_survivors
         round_number += 1
 
-    return current[0], next_bout
-
+    champion_team, champion_id, champion_scores = current[0]
+    best_soldier_index = int(np.argmax(champion_scores))
+    best_soldier_score = float(champion_scores[best_soldier_index])
+    best_soldier_params = champion_team["soldiers"][best_soldier_index]
+    return {
+        "team": champion_team,
+        "policy_id": champion_id,
+        "soldier_scores": champion_scores,
+        "best_soldier_index": best_soldier_index,
+        "best_soldier_score": best_soldier_score,
+        "best_soldier_params": best_soldier_params,
+        "commander_params": champion_team["commander"],
+        "logstd_s": champion_team["logstd_s"],
+        "logstd_c": champion_team["logstd_c"],
+        "bouts": next_bout,
+        "commander_kill_games": tournament_cmd_kill_games,
+        "commander_kill_events": tournament_cmd_kill_events,
+    }
 
 def _prune_bout_files(current_policy):
     """Keep only the current Tag generation's bouts."""
@@ -1318,36 +1620,40 @@ def run_training(updates: int, soldiers: int, sync_remote=False, upload_remote=F
 
     latest = _latest_local_tag_policy()
     next_policy = (_tag_policy_number(latest) + 1) if latest else 1
+    seed_bundle = _seed_bundle_from_full_params(seed_params)
+
+    latest = _latest_local_tag_policy()
+    next_policy = (_tag_policy_number(latest) + 1) if latest else 1
     print("============================================")
     print("STANDALONE TAG EVOLUTION")
     print("============================================")
     print(f"Seed                 : {seed_source}")
     print(f"Evolution generations : {updates}")
     print(f"Soldiers / team       : {soldiers}")
-    print(f"Population            : {TAG_POPULATION}")
+    print(f"Population            : {TAG_POPULATION} teams")
     print(f"Games / matchup       : {TAG_GAMES_PER_MATCH} (Red {TAG_GAMES_PER_SIDE} / Blue {TAG_GAMES_PER_SIDE})")
+    print("Soldier policy mode   : independent NN per soldier")
+    print("Parent selection      : best Soldier-local reward in winning team")
     print(f"Mutation strength     : encoder {TAG_MUTATION_STRENGTH:.3f}, micro-bias {TAG_BIAS_MUTATION_STRENGTH:.3f}")
+    print(f"Commander-kill reward : +{TAG_SOLDIER_COMMANDER_KILL_REWARD:.2f} per credited soldier (= 50 soldier kills)")
     print(f"Attack exploration    : {TAG_ATTACK_EXPLORATION_FLOOR:.2f} .. {TAG_ATTACK_EXPLORATION_CEIL:.2f}")
     print(f"Max steps / game      : {TAG_MAX_STEPS}")
     print(
-        f"Wall curriculum       : {TAG_WALL_BLOCK_COUNT} blocks total "
-        f"({len(TAG_INTERIOR_WALL_BLOCK_CENTERS)} interior 2x2 + "
-        f"{len(TAG_EDGE_WALL_BLOCK_CENTERS)} top/bottom edge 2x1); "
-        f"starts at 0 active blocks; "
-        f"+1 random block after {TAG_KILL_STABLE_GENERATIONS} stable generations at "
-        f"≥{TAG_KILL_RATE_THRESHOLD * 100:.0f}% commander-kill games"
+        f"Wall curriculum       : {TAG_WALL_BLOCK_COUNT} total blocks (9 interior 2×2 + 6 edge 2×1); "
+        f"+1 after {TAG_KILL_STABLE_GENERATIONS} stable generations at "
+        f"≥{TAG_KILL_RATE_THRESHOLD * 100:.0f}% commander-kill games; "
+        f"-1 after {TAG_KILL_UNSTABLE_GENERATIONS} unstable generations"
     )
-    print(f"Physics                : main.step_one()")
+    print("Physics                : main.step_one()")
     print(f"Rewards                : {_production_reward_labels()}")
     print("HTML replay            : only via explicit --replay")
     print("Rendering              : production build_replay_html()")
     print()
 
-    champion = seed_params
-
-    # Resume the wall curriculum from the latest sparse Tag policy metadata.
+    # Resume wall curriculum and keep the current soldier-seed policy.
     active_wall_ids = []
     kill_stable_streak = 0
+    kill_unstable_streak = 0
     latest_policy_path = _latest_local_tag_policy()
     if latest_policy_path is not None:
         try:
@@ -1357,34 +1663,43 @@ def run_training(updates: int, soldiers: int, sync_remote=False, upload_remote=F
                 if 0 <= int(i) < TAG_WALL_BLOCK_COUNT
             })
             kill_stable_streak = int(latest_meta.get("kill_stable_streak", 0))
+            kill_unstable_streak = int(latest_meta.get("kill_unstable_streak", 0))
         except Exception:
             active_wall_ids = []
             kill_stable_streak = 0
+            kill_unstable_streak = 0
 
     total_t0 = time.time()
     for generation in range(1, updates + 1):
         master_key, pop_key, tour_key = random.split(master_key, 3)
-        population = _make_population(champion, pop_key)
+        population = _make_population(seed_bundle, pop_key, soldiers)
         ids = list(range(TAG_POPULATION))
-        parent_champion = champion
-        mutation_deltas = [_parameter_delta(parent_champion, p) for p in population[1:]]
-        save_bouts = True
 
+        # Mutation statistics are now measured across all independent soldiers
+        # in all non-seed candidate teams.
+        all_soldier_deltas = []
+        all_commander_deltas = []
+        for team in population[1:]:
+            sd, cd = _team_mutation_deltas(seed_bundle, team)
+            all_soldier_deltas.extend(sd)
+            all_commander_deltas.append(cd)
+
+        save_bouts = True
         physics_tag_walls, actual_tag_walls = _build_active_tag_walls(active_wall_ids)
         active_labels = [_tag_wall_label(i) for i in active_wall_ids]
 
         gen_t0 = time.time()
         print(f"===== EVOLUTION GENERATION {generation}/{updates} | policy {next_policy:06d} =====")
         print(
-            f"  Mutations: avg Δ={np.mean(mutation_deltas):.4e}, "
-            f"min Δ={np.min(mutation_deltas):.4e}, max Δ={np.max(mutation_deltas):.4e}"
+            f"  mutation Δ: soldier {np.mean(all_soldier_deltas):.3f} | "
+            f"commander {np.mean(all_commander_deltas):.3f}"
         )
         print(
-            f"  Walls: {len(active_wall_ids)}/{TAG_WALL_BLOCK_COUNT} active blocks "
-            f"| active positions={active_labels if active_labels else 'none'}"
+            f"  walls: {len(active_wall_ids)}/{TAG_WALL_BLOCK_COUNT} | "
+            f"{','.join(active_labels) if active_labels else 'none'}"
         )
-        print("  Bout files: SAVE current generation only")
-        champion_item, generation_bouts = _generation_tournament(
+
+        tournament = _generation_tournament(
             population,
             ids,
             tour_key,
@@ -1394,11 +1709,24 @@ def run_training(updates: int, soldiers: int, sync_remote=False, upload_remote=F
             physics_tag_walls,
             actual_tag_walls,
         )
-        champion, champion_local_id = champion_item
-        champion_delta = _parameter_delta(parent_champion, champion)
+
+        champion_local_id = int(tournament["policy_id"])
+        best_soldier_index = int(tournament["best_soldier_index"])
+        best_soldier_score = float(tournament["best_soldier_score"])
+        next_seed_bundle = _build_next_seed_bundle(
+            tournament["best_soldier_params"],
+            tournament["commander_params"],
+            tournament["logstd_s"],
+            tournament["logstd_c"],
+        )
+        seed_delta = _group_parameter_delta(
+            seed_bundle["soldier"],
+            next_seed_bundle["soldier"],
+            TAG_SOLDIER_KEYS,
+        )
+        seed_bundle = next_seed_bundle
 
         # Read the current generation's saved bouts and summarize actual combat.
-        # This makes zero-attack / zero-hit generations immediately visible.
         gen_atk = gen_hit = gen_kill = 0.0
         gen_reward = {0: 0.0, 1: 0.0}
         gen_draws = 0
@@ -1415,24 +1743,29 @@ def run_training(updates: int, soldiers: int, sync_remote=False, upload_remote=F
             except Exception:
                 pass
 
-        gen_commander_kill_games = 0
-        gen_commander_kill_events = 0
-        for bout_path in TAG_BOUT_DIR.glob(f"tag_policy_{next_policy:06d}_bout_*.npz"):
-            try:
-                with np.load(bout_path, allow_pickle=False) as d:
-                    gen_commander_kill_games += int(np.asarray(d["commander_kill"]))
-                    gen_commander_kill_events += int(np.asarray(d["red_commander_kill"])) + int(np.asarray(d["blue_commander_kill"]))
-            except Exception:
-                pass
-
-        commander_kill_rate = gen_commander_kill_games / float(max(1, generation_bouts))
+        # Authoritative in-memory commander-kill totals. Bout files are storage/replay
+        # artifacts and must never determine the curriculum decision.
+        gen_commander_kill_games = int(tournament["commander_kill_games"])
+        gen_commander_kill_events = int(tournament["commander_kill_events"])
+        commander_kill_rate = gen_commander_kill_games / float(max(1, tournament["bouts"]))
         stable_this_generation = commander_kill_rate >= TAG_KILL_RATE_THRESHOLD
+        wall_added = None
+        wall_removed = None
+
         if stable_this_generation:
-            kill_stable_streak += 1
+            kill_stable_streak = min(
+                kill_stable_streak + 1,
+                TAG_KILL_STABLE_GENERATIONS,
+            )
+            kill_unstable_streak = 0
         else:
             kill_stable_streak = 0
+            kill_unstable_streak = min(
+                kill_unstable_streak + 1,
+                TAG_KILL_UNSTABLE_GENERATIONS,
+            )
 
-        wall_added = None
+        # Add one random wall after stable commander kills.
         if (
             kill_stable_streak >= TAG_KILL_STABLE_GENERATIONS
             and len(active_wall_ids) < TAG_WALL_BLOCK_COUNT
@@ -1443,23 +1776,49 @@ def run_training(updates: int, soldiers: int, sync_remote=False, upload_remote=F
             wall_added = remaining[chosen_pos]
             active_wall_ids = sorted(active_wall_ids + [wall_added])
             kill_stable_streak = 0
+            kill_unstable_streak = 0
             print(
                 f"  WALL CURRICULUM: added {_tag_wall_label(wall_added)} "
                 f"center={TAG_WALL_BLOCKS[wall_added]['center']} "
                 f"after {TAG_KILL_STABLE_GENERATIONS} stable generations"
             )
+
+        # Remove one random active wall after a long failure streak. This is kept
+        # intentionally because the user may run with very few soldiers: fewer
+        # soldiers + more walls can otherwise make the task too hard to recover.
+        elif (
+            kill_unstable_streak >= TAG_KILL_UNSTABLE_GENERATIONS
+            and len(active_wall_ids) > 0
+        ):
+            remove_key = random.fold_in(tour_key, 0xDECADE + generation)
+            chosen_pos = int(np.asarray(random.randint(remove_key, (), 0, len(active_wall_ids))))
+            wall_removed = active_wall_ids[chosen_pos]
+            active_wall_ids = [i for i in active_wall_ids if i != wall_removed]
+            kill_stable_streak = 0
+            kill_unstable_streak = 0
+            print(
+                f"  WALL CURRICULUM: removed {_tag_wall_label(wall_removed)} "
+                f"center={TAG_WALL_BLOCKS[wall_removed]['center']} "
+                f"after {TAG_KILL_UNSTABLE_GENERATIONS} unstable generations"
+            )
+
         elif len(active_wall_ids) < TAG_WALL_BLOCK_COUNT:
+            tail = ""
+            if len(active_wall_ids) == 0 and kill_unstable_streak >= TAG_KILL_UNSTABLE_GENERATIONS:
+                tail = " | no wall to remove"
             print(
                 f"  WALL CURRICULUM: kill rate={commander_kill_rate * 100:.1f}% "
                 f"(threshold={TAG_KILL_RATE_THRESHOLD * 100:.1f}%) "
-                f"stable={kill_stable_streak}/{TAG_KILL_STABLE_GENERATIONS}; no new wall"
+                f"stable={kill_stable_streak}/{TAG_KILL_STABLE_GENERATIONS} "
+                f"unstable={kill_unstable_streak}/{TAG_KILL_UNSTABLE_GENERATIONS}"
+                f"{tail}"
             )
 
         elapsed = time.time() - gen_t0
         tag_policy_path = TAG_ELITE_DIR / f"tag_policy_{next_policy:06d}.npz"
         _save_params(
             tag_policy_path,
-            champion,
+            _bundle_to_sparse_params(seed_bundle),
             {
                 "source": "knockout_tag_evolution",
                 "generation": generation,
@@ -1469,34 +1828,44 @@ def run_training(updates: int, soldiers: int, sync_remote=False, upload_remote=F
                 "games_per_match": TAG_GAMES_PER_MATCH,
                 "mutation_strength": TAG_MUTATION_STRENGTH,
                 "champion_local_id": champion_local_id,
+                "best_soldier_index": best_soldier_index,
+                "best_soldier_reward": best_soldier_score,
+                "reward_selection": "highest cumulative Soldier-local reward in winning team",
+                "commander_kill_reward": TAG_SOLDIER_COMMANDER_KILL_REWARD,
                 "reward_definition": _production_reward_labels(),
                 "source_seed": seed_source,
                 "active_wall_indices": list(active_wall_ids),
                 "active_wall_positions": [list(TAG_WALL_BLOCKS[i]["center"]) for i in active_wall_ids],
+                                "commander_kill_games": gen_commander_kill_games,
                 "commander_kill_rate": commander_kill_rate,
                 "commander_kill_events": gen_commander_kill_events,
+                "curriculum_game_count": int(tournament["bouts"]),
                 "kill_stable_streak": kill_stable_streak,
+                "kill_unstable_streak": kill_unstable_streak,
                 "wall_added_this_generation": None if wall_added is None else int(wall_added),
+                "wall_removed_this_generation": None if wall_removed is None else int(wall_removed),
             },
         )
 
-        # Generation summary is emitted on every generation and stays visible.
-        update_state = "UPDATED" if champion_delta > 1e-10 else "UNCHANGED"
         if gen_atk <= 0.0:
             print("  WARNING: zero attack attempts this generation.")
         elif gen_hit <= 0.0:
             print("  WARNING: attacks occurred, but zero HITs this generation.")
+        if gen_commander_kill_events > gen_commander_kill_games:
+            print(
+                f"  Commander kills: {gen_commander_kill_events} events in "
+                f"{gen_commander_kill_games} games (multiple commander deaths occurred in some games)."
+            )
+        curriculum_flag = (
+            f"stable {kill_stable_streak}/{TAG_KILL_STABLE_GENERATIONS}"
+            f" / unstable {kill_unstable_streak}/{TAG_KILL_UNSTABLE_GENERATIONS}"
+        )
         print(
-            f"Generation {generation:4d}/{updates} DONE | "
-            f"Champion=P{champion_local_id:02d} | "
-            f"Policy={next_policy:06d} | "
-            f"{update_state} Δ={champion_delta:.4e} | "
-            f"Bouts={generation_bouts} | "
-            f"atk={gen_atk:.0f} hit={gen_hit:.0f} kill={gen_kill:.0f} draws={gen_draws} | "
-            f"cmdkill={gen_commander_kill_games}/{generation_bouts} ({commander_kill_rate * 100:.1f}%) "
-            f"stable={kill_stable_streak}/{TAG_KILL_STABLE_GENERATIONS} | "
-            f"reward Red={gen_reward[0]:+.3f} Blue={gen_reward[1]:+.3f} | "
-            f"time={elapsed:.1f}s"
+            f"Generation {generation:03d} | parent P{champion_local_id:02d}/S{best_soldier_index:02d} "
+            f"reward={best_soldier_score:+.3f} | Δ={seed_delta:.3f} | "
+            f"atk/hit/kill={gen_atk:.0f}/{gen_hit:.0f}/{gen_kill:.0f} | "
+            f"cmdK={gen_commander_kill_games}/{tournament['bouts']} ({commander_kill_rate * 100:.0f}%) | "
+            f"walls={len(active_wall_ids)} | {curriculum_flag} | {elapsed:.1f}s"
         )
         removed = _prune_bout_files(next_policy)
         print(f"Tag policy saved      : {tag_policy_path}")
