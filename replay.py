@@ -45,7 +45,7 @@ def main():
         "--generation", "-g",
         type=int,
         default=None,
-        help="World number to replay. Omit for the latest saved generation.",
+        help="Generation number to replay. Omit for the latest saved generation.",
     )
     parser.add_argument(
         "--list", "-l",
